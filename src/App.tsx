@@ -425,17 +425,9 @@ export default function App() {
         {/* Zone 3: Primary Action */}
         <div className="flex items-center gap-2 shrink-0">
           <button
-            onClick={handleFullReset}
-            className="px-3 py-2 text-xs font-semibold text-slate-300 hover:text-white bg-slate-800/90 hover:bg-slate-700/90 border border-slate-700/80 rounded-lg transition-colors flex items-center gap-1.5 shadow-sm active:scale-95 cursor-pointer"
-            title="Reset seluruh pengujian ke kondisi awal (0) sebelum audit"
-          >
-            <RotateCcw className="w-3.5 h-3.5 text-slate-400" />
-            <span className="hidden sm:inline">Reset Pengujian</span>
-          </button>
-          <button
             onClick={() => triggerAudit(inputCode)}
             disabled={isAuditing}
-            className="px-3.5 py-2 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-500 rounded-lg transition-colors flex items-center gap-1.5 shadow-sm disabled:opacity-50 cursor-pointer"
+            className="px-4 py-2 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-500 rounded-lg transition-colors flex items-center gap-1.5 shadow-sm disabled:opacity-50 cursor-pointer"
           >
             {isAuditing ? (
               <>
