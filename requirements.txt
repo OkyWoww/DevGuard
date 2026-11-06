@@ -1,0 +1,3 @@
+# DevGuard Python Dependencies
+# Explicit pinning per specifications
+google-genai>=2.30.1

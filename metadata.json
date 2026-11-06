@@ -1,0 +1,6 @@
+{
+  "name": "DevGuard",
+  "description": "Automated adversarial code review harness powered by Google GenAI Interactions API (gemini-3.8-flash) with empirical SQLite test verification.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
