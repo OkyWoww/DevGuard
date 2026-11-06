@@ -5,6 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
+    "audit": "tsx src/cli.ts",
+    "audit:ci": "tsx src/cli.ts --ci",
     "build": "vite build",
     "start": "tsx server.ts",
     "preview": "vite preview",
