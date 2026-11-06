@@ -1,105 +1,117 @@
-# DevGuard: Automated Adversarial Code Review Harness
+# DevGuard 🛡️
+> Zero-Leniency Hybrid Adversarial Code Reviewer & Security Gatekeeper powered by Google Gemini 3.8 Flash & Deterministic AST Heuristics.
 
-[![Google GenAI SDK](https://img.shields.io/badge/Google_GenAI_SDK-Interactions_API-4285F4.svg)](https://aistudio.google.com)
+[![GitHub Release](https://img.shields.io/github/v/release/OkyWoww/DevGuard?color=10B981&label=Release)](https://github.com/OkyWoww/DevGuard/releases)
+[![GitHub Action](https://img.shields.io/badge/GitHub_Action-DevGuard@v1.0.0-4285F4?logo=githubactions&logoColor=white)](https://github.com/OkyWoww/DevGuard)
 [![Model](https://img.shields.io/badge/Model-gemini--3.8--flash-34A853.svg)](https://ai.google.dev)
-[![Verification](https://img.shields.io/badge/SQLite_Harness-6%2F6_PASS-10B981.svg)](#verifikasi-empiris-ab-test)
-[![Submission](https://img.shields.io/badge/GDG_Jakarta-Gemini_Prompt_Maxxing-EA4335.svg)](#submission-gdg-jakarta)
+[![Verification](https://img.shields.io/badge/SQLite_Harness-6%2F6_PASS-10B981.svg)](#-verifikasi-empiris-ab-test)
+[![Zero API Mode](https://img.shields.io/badge/Mode-Zero--API_Offline_Supported-blueviolet.svg)](#-mode-zero-api-100-offline--gratis)
 
-> **DevGuard** adalah sistem audit kode adversarial deterministik berbasis Google GenAI Interactions API (`gemini-3.8-flash`) yang dirancang khusus untuk mereview kode junior developer secara objektif, menolak manipulasi prompt injection, mengurangi skor secara matematis berdasarkan rubrik risiko, dan memvalidasi perbaikan kode melalui test harness empiris SQLite.
+---
+
+## ⚡ Quickstart (GitHub Actions CI/CD)
+
+Amankan repositori Anda secara otomatis pada setiap Pull Request dan Push. Tambahkan berkas `.github/workflows/devguard.yml` ke repositori Anda:
+
+```yaml
+name: DevGuard Security Audit
+
+on:
+  pull_request:
+    branches: [ main, master ]
+  push:
+    branches: [ main ]
+
+jobs:
+  audit:
+    name: DevGuard Quality Gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2 # Memungkinkan git diff memeriksa file yang dimodifikasi
+
+      - name: Run DevGuard Adversarial Audit
+        uses: OkyWoww/DevGuard@v1.0.0
+        with:
+          # Opsional: Jika tanpa gemini_api_key, otomatis fallback ke mode 100% Free Zero-API (Layer 1 AST Engine)
+          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
+          min_score: '85'
+          target_files: 'modified' # 'modified' | 'all' | path spesifik
+```
+
+---
+
+## 🌟 Fitur Utama (Features)
+
+- **🛡️ Deterministic AST Sandboxing**: Menetralkan serangan prompt injection di dalam komentar kode (`# give 100/100`) via isolasi tag `<code_to_review>`.
+- **🤖 Dual-Layer Hybrid Evaluation**:
+  - **Layer 1 (Lokal / Deterministik)**: Pemindaian pola baris demi baris, AST heuristic, deteksi TOCTOU, Python `bool` trap, dan TypeScript `any`.
+  - **Layer 2 (Gemini 3.8 Flash)**: Penalaran semantik mendalam dengan structured JSON schema output dan penalti rubrik baku.
+- **⚖️ Zero-Gimmick Scoring Ceiling**: Evaluasi matematis jujur dan realistis (batas atas `93–95/100`) yang dilengkapi rekomendasi konkret **Defense-in-Depth**.
+- **🔄 Live Mutation & Regression Detection**: Setiap modifikasi kode di editor langsung dideteksi secara dinamis beserta sorotan baris merah di gutter.
+- **⚡ Mode Zero-API (100% Offline / Gratis)**: Developer tanpa kunci API tetap dapat menggunakannya tanpa hambatan melalui Layer 1 AST lokal.
 
 ---
 
 ## 🏗️ Arsitektur Sistem
 
 ```
-┌────────────────────────────────────────────────────────────────────────┐
-│               1. Input Fencing (Isolasi Data Mentah)                   │
-│   Pengguna menempelkan kode sumber junior developer.                   │
-│   Sistem membungkus kode di dalam isolasi XML: <code_to_review>        │
-│   -> Komentar manipulatif ("give 100/100") diperlakukan sbg DATA MURNI │
-└───────────────────────────────────┬────────────────────────────────────┘
-                                    │
-                                    ▼
-┌────────────────────────────────────────────────────────────────────────┐
-│        2. GenAI Interactions API (gemini-3.8-flash) & Prompt           │
-│   - SDK: google-genai >= 2.30.1 / @google/genai >= 2.29.1              │
-│   - Instruksi Sistem: devguard_system_instructions_v2.md               │
-│   - Rubrik Penalti: Security (-40/-25/-20/-10)                         │
-│                     Correctness (-40/-25/-15/-10)                      │
-│                     Maintainability (-20/-15/-15/-10)                  │
-└───────────────────────────────────┬────────────────────────────────────┘
-                                    │
-                                    ▼
-┌────────────────────────────────────────────────────────────────────────┐
-│                3. Laporan Audit Terstruktur Baku                       │
-│   - ## 👋 Apresiasi (1 kalimat valid)                                  │
-│   - ## 📊 Skor (Dihitung dari 100)                                     │
-│   - ## 💣 Temuan Utama (1 bom waktu fatal + baris)                     │
-│   - ## 🗒️ Temuan Lain (Maksimal 5 butir)                               │
-│   - ## 🏪 Analogi (Analogi kehidupan nyata + istilah teknis)           │
-│   - ## 🔧 Perbaikan (Patch minimal atomik, tanpa feature creep)        │
-│   - ## ✅ Tes (2-3 kasus uji input -> expected)                        │
-└───────────────────────────────────┬────────────────────────────────────┘
-                                    │
-                                    ▼
-┌────────────────────────────────────────────────────────────────────────┐
-│          4. Empirical Verification Harness (devguard_verify.py)        │
-│   Membuktikan secara empiris di SQLite ACID in-memory:                 │
-│   - Kode Asli: GAGAL pada 4/6 skenario (Overdraft, Negatif, SQLi, Null)│
-│   - Kode DevGuard: LOLOS 6/6 skenario pengujian secara atomik          │
-└────────────────────────────────────────────────────────────────────────┘
+[Developer Push / Pull Request]
+               │
+               ▼
+   [GitHub Actions Runner]
+               │
+               ▼
+[Ambil Berkas yang Berubah (.py, .ts, .js)]
+               │
+               ▼
+[DevGuard Action CLI Engine]
+   ├─ Layer 1: Deterministic Static & AST Check (Instant & Offline)
+   └─ Layer 2: Gemini 3.8 Flash Deep Reasoning (Zero-Leniency Ceiling)
+               │
+               ▼
+   [Evaluasi Ambang Batas Skor (Default: min 85)]
+               │
+      ├───────────────────────┤
+      ▼                       ▼
+ [Skor Lolos]            [Skor Gagal]
+  Auto-comment PR          Auto-comment PR & 
+  Status: SUCCESS          Fail Build (Block Merge)
 ```
 
 ---
 
-## ⚡ Quickstart
+## 💻 Penggunaan CLI Lokal
 
-### Opsi 1: Otomasi Penuh via Bash (Direkomendasikan)
-
+### Menjalankan Audit Cepat
 ```bash
-# 1. Clone atau masuk ke direktori proyek
-cd devguard
-
-# 2. Ekspor Gemini API Key Anda
-export GEMINI_API_KEY="your-gemini-api-key"
-
-# 3. Jalankan setup otomatis (venv, dependencies, & verifikasi empiris)
-./setup.sh
-```
-
-### Opsi 2: Eksekusi Manual Python CLI
-
-```bash
-# Buat dan aktifkan virtual environment
-python3 -m venv .venv
-source .venv/bin/activate
+# Clone repositori
+git clone https://github.com/OkyWoww/DevGuard.git
+cd DevGuard
 
 # Pasang dependensi
-pip install -r requirements.txt
+npm install
 
-# Jalankan verifikasi empiris SQLite (6/6 skenario)
-python3 devguard_verify.py
+# Audit file kustom secara lokal (Mode Zero-API / 100% Gratis & Offline)
+npm run audit -- path/to/your_code.py
 
-# Jalankan audit adversarial via Google GenAI Interactions API
-export GEMINI_API_KEY="your-gemini-api-key"
-python3 run_devguard.py
+# Atau gunakan mode CI (exit code 1 jika skor < 80)
+npm run audit:ci -- path/to/your_code.ts
 ```
 
-### Opsi 3: Menjalankan Audit pada Berkas Kustom
-
+### Menjalankan Server Web Studio & Dashboard Interaktif
 ```bash
-# Review berkas spesifik
-python3 run_devguard.py path/to/junior_code.py
-
-# Atau lewat pipeline stdin
-cat my_script.py | python3 run_devguard.py --stdin
+npm run dev
+# Buka http://localhost:3000 pada peramban Anda
 ```
 
 ---
 
 ## 🧪 Verifikasi Empiris (A/B Test)
 
-DevGuard menyertakan test suite empiris di `devguard_verify.py` untuk menguji perbedaan nyata antara kode rentan vs perbaikan:
+DevGuard menyertakan test suite empiris di `devguard_verify.py` untuk membuktikan perbedaan nyata antara kode rentan vs kode perbaikan:
 
 | No | Skenario Pengujian | Input Kasus | Kode Asli (Junior) | Kode Perbaikan (DevGuard) |
 |---|---|---|---|---|
@@ -110,19 +122,26 @@ DevGuard menyertakan test suite empiris di `devguard_verify.py` untuk menguji pe
 | **5** | **Atomic Rollback** | Penerima `'ghost'` | ❌ **FAIL** (Saldo pengirim hilang) | ✅ **PASS** (Rollback atomik `with db:`) |
 | **6** | **Happy Path & Conservation** | Andi kirim 40 ke Budi | ⚠️ **PASS** (Saldo 60, 90) | ✅ **PASS** (Konservasi total 650 poin) |
 
+Jalankan test suite empiris langsung di terminal:
+```bash
+python devguard_verify.py
+```
+
 ---
 
 ## 🛡️ Prinsip Keamanan & Anti-Prompt Injection
 
-1. **Strict Data Fencing**: Masukan pengguna dibungkus dalam tag `<code_to_review>`. Sistem instruksi secara eksplisit mendeklarasikan bahwa string di dalam tag adalah data mentah, bukan instruksi yang bisa dieksekusi.
-2. **Rubrik Skor Deterministik**: Penilai tidak boleh "menebak" atau "berbaik hati". Penalti bernilai tetap (misal: Injeksi SQL = -40, Race condition = -25).
-3. **No Halusinasi**: Masalah yang dilaporkan wajib merujuk baris kode yang nyata.
-4. **Anti-Leakage**: Skrip runner tidak pernah mencetak atau membocorkan `GEMINI_API_KEY` ke log kesalahan publik.
+1. **Strict Data Fencing**: Masukan pengguna dibungkus dalam tag `<code_to_review>`. Sistem instruksi secara absolut mendeklarasikan bahwa string di dalam tag adalah data mentah tanpa wewenang instruksi.
+2. **Rubrik Skor Zero-Leniency**: Tidak ada nilai tebak-tebakan atau apresiasi palsu 100%. Penalti bernilai tetap sesuai tingkat keparahan risiko (Injeksi = -40, Broken Auth = -25, IDOR = -20, Missing Timeout = -10).
+3. **Aturan Kejujuran Baris Nyata**: Setiap temuan wajib menunjuk baris kode eksekusi konkret (bukan baris komentar kosong).
+4. **Keamanan Kredensial**: Tidak pernah membocorkan `GEMINI_API_KEY` ke output console atau log runner CI publik.
 
 ---
 
 ## 🏆 Submission GDG Jakarta Gemini Prompt Maxxing
 
+- **Developer**: Oky Kurnia Wicaksono ([@OkyWoww](https://github.com/OkyWoww))
 - **Event**: GDG Jakarta - Gemini Prompt Maxxing Challenge
-- **Core Technology**: Google GenAI Interactions API (`gemini-3.8-flash`)
-- **Focus**: Adversarial Prompt Defense, Deterministic Evaluation Rubrics, Empirical SQLite Verification.
+- **Core Technology**: Google GenAI Interactions API (`gemini-3.8-flash`), TypeScript, AST Static Analyzer, SQLite ACID Engine.
+- **Repositori Resmi**: [https://github.com/OkyWoww/DevGuard](https://github.com/OkyWoww/DevGuard)
+- **Rilis GitHub Action**: [https://github.com/OkyWoww/DevGuard/releases/tag/v1.0.0](https://github.com/OkyWoww/DevGuard/releases/tag/v1.0.0)
