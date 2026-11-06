@@ -44,3 +44,7 @@ runs:
         GITHUB_TOKEN: ${{ github.token }}
       run: |
         npx --prefix ${{ github.action_path }} tsx ${{ github.action_path }}/src/cli.ts
+
+branding:
+  icon: 'shield'
+  color: 'blue'
