@@ -1,0 +1,46 @@
+name: 'DevGuard Adversarial Code Auditor'
+description: 'Zero-Leniency Hybrid Code Review & Security Gatekeeper powered by Gemini 3.8 Flash'
+author: 'Oky Kurnia Wicaksono'
+
+inputs:
+  gemini_api_key:
+    description: 'Google Gemini API Key for Layer-2 adversarial reasoning (Optional: fallback to 100% Free Zero-API mode if omitted)'
+    required: false
+    default: ''
+  min_score:
+    description: 'Minimum Overall Guard score required to pass CI (default: 85)'
+    required: false
+    default: '85'
+  target_files:
+    description: 'Target files to audit: "modified" for git diff, "all" for whole codebase, or a specific path'
+    required: false
+    default: 'modified'
+
+outputs:
+  overall_score:
+    description: 'The average Overall Guard score calculated across audited files'
+  audit_status:
+    description: 'PASS or FAIL status for branch merge eligibility'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up Node.js Environment
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+
+    - name: Install DevGuard Dependencies
+      shell: bash
+      run: |
+        npm --prefix ${{ github.action_path }} install --omit=dev
+
+    - name: Run DevGuard CLI Audit Gate
+      shell: bash
+      env:
+        GEMINI_API_KEY: ${{ inputs.gemini_api_key }}
+        DEVGUARD_MIN_SCORE: ${{ inputs.min_score }}
+        DEVGUARD_TARGET: ${{ inputs.target_files }}
+        GITHUB_TOKEN: ${{ github.token }}
+      run: |
+        npx --prefix ${{ github.action_path }} tsx ${{ github.action_path }}/src/cli.ts

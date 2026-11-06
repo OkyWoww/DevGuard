@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-import fs from 'node:fs';
-import path from 'node:path';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import { execSync } from 'node:child_process';
 import dotenv from 'dotenv';
 import { GoogleGenAI, Type } from '@google/genai';
 import {
@@ -10,24 +11,21 @@ import {
 
 dotenv.config();
 
-interface CliAuditResult {
+export interface CliAuditResult {
   mode: 'zero-api' | 'hybrid';
   isLiveApi: boolean;
   parsedReport: ParsedDevGuardReport;
 }
 
-export async function runDevGuardAudit(
-  codeContent: string,
-  fileName: string = 'snippet'
+export async function evaluateCodeHybrid(
+  code: string,
+  apiKey?: string,
+  precomputedL1?: ParsedDevGuardReport
 ): Promise<CliAuditResult> {
-  // Layer 1: Deterministic AST & Static Heuristic Analyzer (Instant, 100% Free, Zero-API)
-  const l1Result = analyzeCodeDeterministically(codeContent);
+  const l1Result = precomputedL1 || analyzeCodeDeterministically(code);
+  const activeKey = apiKey || process.env.GEMINI_API_KEY;
 
-  const apiKey = process.env.GEMINI_API_KEY;
-
-  if (!apiKey || apiKey === 'MY_GEMINI_API_KEY' || !apiKey.startsWith('AIzaSy')) {
-    console.log('\n⚡ Info: GEMINI_API_KEY tidak terdeteksi.');
-    console.log('🛡️  Menjalankan DevGuard dalam mode: 100% Offline Deterministic AST Engine (Mode Zero-API).\n');
+  if (!activeKey || activeKey === 'MY_GEMINI_API_KEY' || !activeKey.startsWith('AIzaSy')) {
     return {
       mode: 'zero-api',
       isLiveApi: false,
@@ -35,27 +33,25 @@ export async function runDevGuardAudit(
     };
   }
 
-  console.log('\n🤖 Menjalankan DevGuard dalam mode: Hybrid Dual-Layer (AST + Gemini 3.8 Flash).');
-  console.log('🔑 GEMINI_API_KEY terdeteksi: Menggunakan kuota API developer lokal...\n');
-
   try {
-    const ai = new GoogleGenAI({ apiKey });
+    const ai = new GoogleGenAI({ apiKey: activeKey });
     const prompt = [
       'Anda adalah Principal AppSec Engineer & Zero-Leniency Adversarial Code Auditor.',
       'Evaluasi kode di dalam <code_to_review> secara jujur, ketat, dan tanpa kompromi.',
       'DILARANG memberikan skor buta 100/100.',
       '',
-      `Hasil deteksi Layer 1 AST Analyzer:`,
+      `Hasil deteksi Layer 1 AST Analyzer (wajib dihormati sebagai batas atas skor):`,
       `- Security=${l1Result.skor.security}, Correctness=${l1Result.skor.correctness}, Maintainability=${l1Result.skor.maintainability}`,
       `- Baris Temuan: ${l1Result.temuanUtama.line}`,
+      `- Detail: ${l1Result.temuanUtama.description}`,
       '',
       '<code_to_review>',
-      codeContent,
+      code,
       '</code_to_review>',
     ].join('\n');
 
     const timeoutPromise = new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error('Gemini API timeout')), 6000)
+      setTimeout(() => reject(new Error('Gemini API timeout')), 6500)
     );
 
     const response: any = await Promise.race([
@@ -148,7 +144,7 @@ export async function runDevGuardAudit(
       },
     };
   } catch (err: any) {
-    console.warn(`⚠️  Gemini API tidak dapat dijangkau (${err.message}). Otomatis dialihkan ke Layer 1 AST Engine.`);
+    console.warn(`⚠️  Gemini API error (${err.message}). Otomatis dialihkan ke Layer 1 AST Engine.`);
     return {
       mode: 'zero-api',
       isLiveApi: false,
@@ -157,87 +153,128 @@ export async function runDevGuardAudit(
   }
 }
 
-function printReport(result: CliAuditResult, targetName: string) {
-  const r = result.parsedReport;
-  const s = r.skor;
-
-  console.log('======================================================================');
-  console.log(`               DEVGUARD ADVERSARIAL CODE AUDIT REPORT                 `);
-  console.log('======================================================================');
-  console.log(`Target      : ${targetName}`);
-  console.log(`Mode Engine : ${result.mode === 'hybrid' ? '🤖 Hybrid (Layer 1 AST + Layer 2 Gemini 3.8 Flash)' : '🛡️  Zero-API (100% Offline / Local AST Engine)'}`);
-  console.log(`Status Kunci: ${result.isLiveApi ? 'API Key Valid' : 'Offline / Tanpa Kuota API'}`);
-  console.log('----------------------------------------------------------------------');
-  console.log('📊 MATRIKS SKOR ZERO-LENIENCY:');
-  console.log(`   Security        : ${s.security}/100`);
-  console.log(`   Correctness     : ${s.correctness}/100`);
-  console.log(`   Maintainability : ${s.maintainability}/100`);
-  console.log(`   Overall Guard   : ${s.totalScore}/100 [${r.isHardened ? '✓ SIAP MERGE (HARDENED)' : s.totalScore < 60 ? '✗ PERLU DITOLAK' : '⚠ PERLU REVISI'}]`);
-  console.log('----------------------------------------------------------------------');
-  console.log(`💣 TEMUAN UTAMA (${r.temuanUtama.line}):`);
-  console.log(`   ${r.temuanUtama.description}`);
-  console.log('----------------------------------------------------------------------');
-  console.log('🗒️  TEMUAN LAIN & CATATAN ARSITEKTUR:');
-  r.temuanLain.forEach((item, idx) => {
-    console.log(`   ${idx + 1}. ${item}`);
-  });
-  console.log('----------------------------------------------------------------------');
-  console.log(`🏪 ANALOGI DUNIA NYATA (${r.analogi.technicalTerm}):`);
-  console.log(`   "${r.analogi.story}"`);
-  console.log('======================================================================\n');
-}
-
-// -----------------------------------------------------------------------------
-// CLI Direct Execution Entrypoint
-// Usage:
-//   npx tsx src/cli.ts [path/to/file]
-//   npx tsx src/cli.ts --check [path/to/file]
-// -----------------------------------------------------------------------------
-async function main() {
+export async function runAction() {
+  const apiKey = process.env.GEMINI_API_KEY;
+  const minScore = parseInt(process.env.DEVGUARD_MIN_SCORE || '85', 10);
+  const targetPattern = process.env.DEVGUARD_TARGET || 'modified';
   const args = process.argv.slice(2);
-  let filePath = args.find((a) => !a.startsWith('--'));
-  const enforceExitCode = args.includes('--check') || args.includes('--ci');
+  const explicitFileArg = args.find((a) => !a.startsWith('--'));
 
-  // If no file passed, audit default junior sample
-  let codeContent = '';
-  let targetName = '';
+  console.log('======================================================================');
+  console.log('           🛡️  DEVGUARD ADVERSARIAL CODE AUDITOR (CI GATE)            ');
+  console.log('======================================================================');
+  console.log(`Ambang Batas Kelulusan CI : Minimal ${minScore}/100`);
 
-  if (filePath && fs.existsSync(filePath)) {
-    codeContent = fs.readFileSync(filePath, 'utf-8');
-    targetName = path.basename(filePath);
+  if (!apiKey || apiKey === 'MY_GEMINI_API_KEY' || !apiKey.startsWith('AIzaSy')) {
+    console.log('Mode Eksekusi             : 🛡️  Zero-API (100% Offline AST Engine - Gratis)');
   } else {
-    // Default fallback snippet (Banking Ledger)
-    targetName = 'banking_sample.py (Default)';
-    codeContent = `# Modul transfer poin member (oleh: Junior Backend Dev)
-def kirim_poin(db, user_pengirim, user_penerima, jumlah):
-    q1 = "SELECT poin FROM members WHERE username = '" + user_pengirim + "'"
-    saldo = db.execute(q1).fetchone()[0]
-    if saldo > 0:
-        saldo_baru = saldo - jumlah
-        db.execute("UPDATE members SET poin = " + str(saldo_baru) + " WHERE username = '" + user_pengirim + "'")
-        q2 = "SELECT poin FROM members WHERE username = '" + user_penerima + "'"
-        saldo_penerima = db.execute(q2).fetchone()[0]
-        db.execute("UPDATE members SET poin = " + str(saldo_penerima + jumlah) + " WHERE username = '" + user_penerima + "'")
-        return "Berhasil transfer!"
-    return "Gagal!"
-`;
+    console.log('Mode Eksekusi             : 🤖 Hybrid Dual-Layer (AST + Gemini 3.8 Flash)');
   }
 
-  const result = await runDevGuardAudit(codeContent, targetName);
-  printReport(result, targetName);
+  // 1. Dapatkan daftar berkas target
+  let filesToAudit: string[] = [];
 
-  if (enforceExitCode) {
-    if (!result.parsedReport.isHardened && result.parsedReport.skor.totalScore < 80) {
-      console.error('❌ CI Check Gagal: Skor di bawah batas minimum (80/100). Perbaiki celah sebelum merge.');
-      process.exit(1);
-    } else {
-      console.log('✅ CI Check Lolos: Kode memenuhi standar keamanan.');
-      process.exit(0);
+  if (explicitFileArg && fs.existsSync(explicitFileArg)) {
+    filesToAudit = [explicitFileArg];
+  } else if (targetPattern === 'all') {
+    // Scan recursively for py, ts, js excluding node_modules, dist, etc.
+    const scanDir = (dir: string): string[] => {
+      let results: string[] = [];
+      const list = fs.readdirSync(dir, { withFileTypes: true });
+      for (const item of list) {
+        if (item.name.startsWith('.') || ['node_modules', 'dist', 'build', 'coverage', 'remotion', 'out'].includes(item.name)) {
+          continue;
+        }
+        const full = path.join(dir, item.name);
+        if (item.isDirectory()) {
+          results = results.concat(scanDir(full));
+        } else if (/\.(py|ts|js|jsx|tsx)$/.test(item.name) && !item.name.endsWith('.d.ts')) {
+          results.push(full);
+        }
+      }
+      return results;
+    };
+    filesToAudit = scanDir(process.cwd());
+  } else {
+    // Modified files via git diff
+    try {
+      const gitDiff = execSync('git diff --name-only HEAD~1 HEAD || git diff --name-only HEAD', {
+        encoding: 'utf-8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
+      filesToAudit = gitDiff
+        .split('\n')
+        .map((f) => f.trim())
+        .filter((f) => f && /\.(py|ts|js|jsx|tsx)$/.test(f) && !f.endsWith('.d.ts') && !f.startsWith('remotion/'));
+    } catch {
+      console.warn('⚠️  Git diff tidak menemukan riwayat commit; beralih ke pengecekan berkas lokal.');
+      filesToAudit = [];
     }
   }
+
+  if (filesToAudit.length === 0) {
+    console.log('\n✅ Tidak ada berkas target (.py, .ts, .js) yang diubah. DevGuard quality check lolos.');
+    process.exit(0);
+  }
+
+  console.log(`\n📂 Jumlah berkas yang akan diaudit: ${filesToAudit.length}`);
+  console.log('----------------------------------------------------------------------');
+
+  let hasFatalFailure = false;
+  let totalScoreSum = 0;
+  let auditedCount = 0;
+
+  for (const filePath of filesToAudit) {
+    if (!fs.existsSync(filePath)) continue;
+
+    const codeContent = fs.readFileSync(filePath, 'utf-8');
+    auditedCount++;
+
+    console.log(`\n🔍 Menganalisis: ${filePath}`);
+    const result = await evaluateCodeHybrid(codeContent, apiKey);
+    const report = result.parsedReport;
+    const score = report.skor;
+
+    totalScoreSum += score.totalScore;
+
+    console.log(`   - Security        : ${score.security}/100`);
+    console.log(`   - Correctness     : ${score.correctness}/100`);
+    console.log(`   - Maintainability : ${score.maintainability}/100`);
+    console.log(`   - Overall Guard   : ${score.totalScore}/100 [Target: ${minScore}]`);
+
+    if (score.totalScore < minScore || !report.isHardened && score.security < 70) {
+      console.error(`   ❌ GAGAL: ${filePath} mendapatkan skor ${score.totalScore}/100 (Batas: ${minScore})`);
+      if (report.temuanUtama && report.temuanUtama.description) {
+        console.error(`   💣 Temuan Fatal (${report.temuanUtama.line}): ${report.temuanUtama.description}`);
+      }
+      hasFatalFailure = true;
+    } else {
+      console.log(`   ✅ LOLOS: ${filePath} memenuhi standar keamanan dan mutu kode.`);
+    }
+  }
+
+  const avgScore = auditedCount > 0 ? Math.round(totalScoreSum / auditedCount) : 100;
+  console.log('\n======================================================================');
+  console.log(`RATA-RATA SKOR KESELURUHAN: ${avgScore}/100`);
+
+  // GitHub Actions Workflow Output Parameters
+  const outputFile = process.env.GITHUB_OUTPUT;
+  if (outputFile && fs.existsSync(outputFile)) {
+    fs.appendFileSync(outputFile, `overall_score=${avgScore}\n`);
+    fs.appendFileSync(outputFile, `audit_status=${hasFatalFailure ? 'FAIL' : 'PASS'}\n`);
+  }
+
+  if (hasFatalFailure) {
+    console.error('🚫 DevGuard Quality Gate Rejected: Ditemukan celah keamanan atau regresi logika.');
+    console.error('   Perbaiki celah di atas atau terapkan patch perbaikan sebelum melakukan merge PR.\n');
+    process.exit(1);
+  } else {
+    console.log('🎉 Seluruh berkas yang diaudit lolos inspeksi DevGuard Quality Gate!\n');
+    process.exit(0);
+  }
 }
 
-// Check if run directly via CLI
+// Check if run directly
 const isMain = process.argv[1] && (
   process.argv[1].endsWith('cli.ts') ||
   process.argv[1].endsWith('cli.js') ||
@@ -245,7 +282,7 @@ const isMain = process.argv[1] && (
 );
 
 if (isMain) {
-  main().catch((err) => {
+  runAction().catch((err) => {
     console.error('Fatal CLI Error:', err);
     process.exit(1);
   });
