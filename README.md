@@ -2,7 +2,7 @@
 > Zero-Leniency Hybrid Adversarial Code Reviewer & Security Gatekeeper powered by Google Gemini 3.8 Flash & Deterministic AST Heuristics.
 
 [![GitHub Release](https://img.shields.io/github/v/release/OkyWoww/DevGuard?color=10B981&label=Release)](https://github.com/OkyWoww/DevGuard/releases)
-[![GitHub Action](https://img.shields.io/badge/GitHub_Action-DevGuard@v1.0.0-4285F4?logo=githubactions&logoColor=white)](https://github.com/OkyWoww/DevGuard)
+[![GitHub Action](https://img.shields.io/badge/GitHub_Action-DevGuard@v1.1.0-4285F4?logo=githubactions&logoColor=white)](https://github.com/OkyWoww/DevGuard)
 [![Model](https://img.shields.io/badge/Model-gemini--3.8--flash-34A853.svg)](https://ai.google.dev)
 [![Verification](https://img.shields.io/badge/SQLite_Harness-6%2F6_PASS-10B981.svg)](#-verifikasi-empiris-ab-test)
 [![Zero API Mode](https://img.shields.io/badge/Mode-Zero--API_Offline_Supported-blueviolet.svg)](#-mode-zero-api-100-offline--gratis)
@@ -36,7 +36,7 @@ jobs:
           fetch-depth: 2 # Memungkinkan git diff memeriksa file yang dimodifikasi
 
       - name: Run DevGuard Adversarial Audit
-        uses: OkyWoww/DevGuard@v1.0.0
+        uses: OkyWoww/DevGuard@v1.1.0
         with:
           # Opsional: Jika tanpa gemini_api_key, otomatis fallback ke mode 100% Free Zero-API (Layer 1 AST Engine)
           gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
@@ -147,4 +147,4 @@ python devguard_verify.py
 - **Event**: GDG Jakarta - Gemini Prompt Maxxing Challenge
 - **Core Technology**: Google GenAI Interactions API (`gemini-3.8-flash`), TypeScript, AST Static Analyzer, SQLite ACID Engine.
 - **Repositori Resmi**: [https://github.com/OkyWoww/DevGuard](https://github.com/OkyWoww/DevGuard)
-- **Rilis GitHub Action**: [https://github.com/OkyWoww/DevGuard/releases/tag/v1.0.0](https://github.com/OkyWoww/DevGuard/releases/tag/v1.0.0)
+- **Rilis GitHub Action**: [https://github.com/OkyWoww/DevGuard/releases/tag/v1.1.0](https://github.com/OkyWoww/DevGuard/releases/tag/v1.1.0)

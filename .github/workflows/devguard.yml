@@ -1,0 +1,27 @@
+name: DevGuard Security Audit
+
+on:
+  pull_request:
+    branches: [ main, master ]
+  push:
+    branches: [ main ]
+
+jobs:
+  audit:
+    name: DevGuard Quality Gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write # Mengizinkan DevGuard menulis laporan otomatis di PR
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2 # Memungkinkan git diff memeriksa file yang dimodifikasi
+
+      - name: Run DevGuard Adversarial Audit
+        uses: ./
+        with:
+          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
+          min_score: '85'
+          target_files: 'modified'
