@@ -24,7 +24,6 @@ jobs:
         id: devguard
         uses: ./
         with:
-          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
           min_score: '85'
           target_files: 'modified'
 
