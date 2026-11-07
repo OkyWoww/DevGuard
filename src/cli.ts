@@ -187,7 +187,14 @@ export async function runAction() {
       let results: string[] = [];
       const list = fs.readdirSync(dir, { withFileTypes: true });
       for (const item of list) {
-        if (item.name.startsWith('.') || ['node_modules', 'dist', 'build', 'coverage', 'remotion', 'out'].includes(item.name)) {
+        if (
+          item.name.startsWith('.') ||
+          ['node_modules', 'dist', 'build', 'coverage', 'remotion', 'out'].includes(item.name) ||
+          item.name.includes('.test.') ||
+          item.name.includes('.spec.') ||
+          item.name === 'devguardAnalyzer.ts' ||
+          item.name === 'devguard_verify.py'
+        ) {
           continue;
         }
         const full = path.join(dir, item.name);
@@ -210,7 +217,17 @@ export async function runAction() {
       filesToAudit = gitDiff
         .split('\n')
         .map((f) => f.trim())
-        .filter((f) => f && /\.(py|ts|js|jsx|tsx)$/.test(f) && !f.endsWith('.d.ts') && !f.startsWith('remotion/'));
+        .filter(
+          (f) =>
+            f &&
+            /\.(py|ts|js|jsx|tsx)$/.test(f) &&
+            !f.endsWith('.d.ts') &&
+            !f.startsWith('remotion/') &&
+            !f.includes('.test.') &&
+            !f.includes('.spec.') &&
+            !f.endsWith('devguardAnalyzer.ts') &&
+            !f.endsWith('devguard_verify.py')
+        );
     } catch {
       console.warn('⚠️  Git diff tidak menemukan riwayat commit; beralih ke pengecekan berkas lokal.');
       filesToAudit = [];
