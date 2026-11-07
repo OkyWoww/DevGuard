@@ -19,8 +19,13 @@ inputs:
 outputs:
   overall_score:
     description: 'The average Overall Guard score calculated across audited files'
+    value: ${{ steps.audit_gate.outputs.overall_score }}
   audit_status:
     description: 'PASS or FAIL status for branch merge eligibility'
+    value: ${{ steps.audit_gate.outputs.audit_status }}
+  sarif_file:
+    description: 'Path to generated SARIF v2.1.0 report file (devguard-results.sarif)'
+    value: ${{ steps.audit_gate.outputs.sarif_file }}
 
 runs:
   using: 'composite'
@@ -36,6 +41,7 @@ runs:
         npm --prefix ${{ github.action_path }} install --omit=dev
 
     - name: Run DevGuard CLI Audit Gate
+      id: audit_gate
       shell: bash
       env:
         GEMINI_API_KEY: ${{ inputs.gemini_api_key }}

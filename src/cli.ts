@@ -10,6 +10,7 @@ import {
 } from './devguardAnalyzer.js';
 import { postPullRequestComment } from './githubCommenter.js';
 import type { FileAuditSummary } from './githubCommenter.js';
+import { generateSarifReport } from './sarifGenerator.js';
 
 dotenv.config();
 
@@ -218,6 +219,14 @@ export async function runAction() {
 
   if (filesToAudit.length === 0) {
     console.log('\n✅ Tidak ada berkas target (.py, .ts, .js) yang diubah. DevGuard quality check lolos.');
+    const sarifFile = process.env.DEVGUARD_SARIF_OUTPUT || 'devguard-results.sarif';
+    generateSarifReport([], sarifFile);
+    const outputFile = process.env.GITHUB_OUTPUT;
+    if (outputFile && fs.existsSync(outputFile)) {
+      fs.appendFileSync(outputFile, `overall_score=100\n`);
+      fs.appendFileSync(outputFile, `audit_status=PASS\n`);
+      fs.appendFileSync(outputFile, `sarif_file=${sarifFile}\n`);
+    }
     process.exit(0);
   }
 
@@ -282,6 +291,14 @@ export async function runAction() {
 
   // Comment before process.exit so the report is posted on both pass and failure.
   await postPullRequestComment(summaries, minScore, engineMode);
+
+  // Generate SARIF v2.1.0 report before process.exit so findings are always exported
+  const sarifFile = process.env.DEVGUARD_SARIF_OUTPUT || 'devguard-results.sarif';
+  generateSarifReport(summaries, sarifFile);
+
+  if (outputFile && fs.existsSync(outputFile)) {
+    fs.appendFileSync(outputFile, `sarif_file=${sarifFile}\n`);
+  }
 
   if (hasFatalFailure) {
     console.error('🚫 DevGuard Quality Gate Rejected: Ditemukan celah keamanan atau regresi logika.');

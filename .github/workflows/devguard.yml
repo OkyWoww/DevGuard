@@ -13,6 +13,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: write # Mengizinkan DevGuard menulis laporan otomatis di PR
+      security-events: write # Mengizinkan upload temuan SARIF ke GitHub Code Scanning
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -20,8 +21,15 @@ jobs:
           fetch-depth: 2 # Memungkinkan git diff memeriksa file yang dimodifikasi
 
       - name: Run DevGuard Adversarial Audit
+        id: devguard
         uses: ./
         with:
           gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
           min_score: '85'
           target_files: 'modified'
+
+      - name: Upload DevGuard SARIF Report to GitHub Code Scanning
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: devguard-results.sarif

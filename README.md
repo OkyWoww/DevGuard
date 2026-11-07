@@ -3,6 +3,7 @@
 
 [![GitHub Release](https://img.shields.io/github/v/release/OkyWoww/DevGuard?color=10B981&label=Release)](https://github.com/OkyWoww/DevGuard/releases)
 [![GitHub Action](https://img.shields.io/badge/GitHub_Action-DevGuard@v1.1.0-4285F4?logo=githubactions&logoColor=white)](https://github.com/OkyWoww/DevGuard)
+[![SARIF v2.1.0](https://img.shields.io/badge/SARIF-v2.1.0_Code_Scanning-FF69B4.svg)](https://docs.github.com/en/code-security/code-scanning)
 [![Model](https://img.shields.io/badge/Model-gemini--3.8--flash-34A853.svg)](https://ai.google.dev)
 [![Verification](https://img.shields.io/badge/SQLite_Harness-6%2F6_PASS-10B981.svg)](#-verifikasi-empiris-ab-test)
 [![Zero API Mode](https://img.shields.io/badge/Mode-Zero--API_Offline_Supported-blueviolet.svg)](#-mode-zero-api-100-offline--gratis)
@@ -28,7 +29,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      pull-requests: write # Mengizinkan DevGuard menulis laporan otomatis di PR
+      pull-requests: write # Mengizinkan DevGuard menulis sticky comment otomatis di PR
+      security-events: write # Mengizinkan upload temuan SARIF ke GitHub Code Scanning
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -36,12 +38,19 @@ jobs:
           fetch-depth: 2 # Memungkinkan git diff memeriksa file yang dimodifikasi
 
       - name: Run DevGuard Adversarial Audit
+        id: devguard
         uses: OkyWoww/DevGuard@v1.1.0
         with:
           # Opsional: Jika tanpa gemini_api_key, otomatis fallback ke mode 100% Free Zero-API (Layer 1 AST Engine)
           gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
           min_score: '85'
           target_files: 'modified' # 'modified' | 'all' | path spesifik
+
+      - name: Upload DevGuard SARIF Report to GitHub Code Scanning
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: devguard-results.sarif
 ```
 
 ---
@@ -55,6 +64,7 @@ jobs:
 - **⚖️ Zero-Gimmick Scoring Ceiling**: Evaluasi matematis jujur dan realistis (batas atas `93–95/100`) yang dilengkapi rekomendasi konkret **Defense-in-Depth**.
 - **🔄 Live Mutation & Regression Detection**: Setiap modifikasi kode di editor langsung dideteksi secara dinamis beserta sorotan baris merah di gutter.
 - **⚡ Mode Zero-API (100% Offline / Gratis)**: Developer tanpa kunci API tetap dapat menggunakannya tanpa hambatan melalui Layer 1 AST lokal.
+- **📊 SARIF v2.1.0 & GitHub Code Scanning Native**: Ekspor temuan otomatis ke format OASIS SARIF v2.1.0 (`devguard-results.sarif`) dengan pemetaan aturan `DG001` (Error), `DG002` (Warning), dan `DG003` (Gate Failure) yang terintegrasi langsung ke tab **Security > Code Scanning Alerts** GitHub via `github/codeql-action/upload-sarif@v3`.
 
 ---
 
