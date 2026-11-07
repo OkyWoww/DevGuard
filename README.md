@@ -26,6 +26,9 @@ jobs:
   audit:
     name: DevGuard Quality Gate
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write # Mengizinkan DevGuard menulis laporan otomatis di PR
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
