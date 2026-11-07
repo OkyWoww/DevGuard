@@ -281,7 +281,7 @@ export function analyzeCodeDeterministically(code: string): ParsedDevGuardReport
   const isSqlDomain = /(?:SELECT\s+|UPDATE\s+members|INSERT\s+INTO|DELETE\s+FROM|sqlite3|db\.execute|kirim_poin)/i.test(codeWithoutComments);
   const isPingDomain = /(?:ping_host|ping\s+-c|subprocess\.run|os\.system|ipaddress\.ip_address)/i.test(codeWithoutComments) && !isSqlDomain;
   const isAuthDomain = /(?:JWT_SECRET|jsonwebtoken|jwt\.verify|billingService|\/api\/users\/:id\/billing)/i.test(codeWithoutComments) && !isSqlDomain;
-  const isFileDomain = /(?:downloadReport|public\/reports|readFileSync|fs\.promises\.readFile|fs\.readFile|path\.basename|path\.join)/i.test(codeWithoutComments) && !isSqlDomain;
+  const isFileDomain = /(?:downloadReport|public\/reports|req\.query\.file|res\.download|res\.sendFile)/i.test(codeWithoutComments) && !isSqlDomain;
   const isCartDomain = /(?:calculateTotal|discountCode|VIP100|SERVER_PRICE_CATALOG|items\[i\]\.price|item\.quantity)/i.test(codeWithoutComments) && !isSqlDomain;
 
   const isPython = isSqlDomain || isPingDomain || /\bdef\s+\w+\s*\(|\bimport\s+\w+|\braise\s+ValueError/i.test(codeWithoutComments);
