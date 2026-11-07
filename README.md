@@ -80,7 +80,7 @@ jobs:
       ├───────────────────────┤
       ▼                       ▼
  [Skor Lolos]            [Skor Gagal]
-  Auto-comment PR          Auto-comment PR & 
+  Auto-comment PR          Auto-comment PR &
   Status: SUCCESS          Fail Build (Block Merge)
 ```
 
@@ -135,7 +135,7 @@ python devguard_verify.py
 ## 🛡️ Prinsip Keamanan & Anti-Prompt Injection
 
 1. **Strict Data Fencing**: Masukan pengguna dibungkus dalam tag `<code_to_review>`. Sistem instruksi secara absolut mendeklarasikan bahwa string di dalam tag adalah data mentah tanpa wewenang instruksi.
-2. **Rubrik Skor Zero-Leniency**: Tidak ada nilai tebak-tebakan atau apresiasi palsu 100%. Penalti bernilai tetap sesuai tingkat keparahan risiko (Injeksi = -40, Broken Auth = -25, IDOR = -20, Missing Timeout = -10).
+2. **Rubrik Skor Zero-Leniency**: Tidak ada nilai tebak-tebakan atau apresiasi palsu 100%. Penalti bernilai tetap sesuai tingkat keparahan risiko (Injeksi = -40, Broken Auth = -25, IDOR = -20, Misuse = -15).
 3. **Aturan Kejujuran Baris Nyata**: Setiap temuan wajib menunjuk baris kode eksekusi konkret (bukan baris komentar kosong).
 4. **Keamanan Kredensial**: Tidak pernah membocorkan `GEMINI_API_KEY` ke output console atau log runner CI publik.
 

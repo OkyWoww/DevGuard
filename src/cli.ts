@@ -8,6 +8,8 @@ import {
   analyzeCodeDeterministically,
   ParsedDevGuardReport,
 } from './devguardAnalyzer.js';
+import { postPullRequestComment } from './githubCommenter.js';
+import type { FileAuditSummary } from './githubCommenter.js';
 
 dotenv.config();
 
@@ -159,13 +161,15 @@ export async function runAction() {
   const targetPattern = process.env.DEVGUARD_TARGET || 'modified';
   const args = process.argv.slice(2);
   const explicitFileArg = args.find((a) => !a.startsWith('--'));
+  const engineMode: 'HYBRID' | 'OFFLINE_AST' =
+    apiKey && apiKey !== 'MY_GEMINI_API_KEY' && apiKey.startsWith('AIzaSy') ? 'HYBRID' : 'OFFLINE_AST';
 
   console.log('======================================================================');
   console.log('           🛡️  DEVGUARD ADVERSARIAL CODE AUDITOR (CI GATE)            ');
   console.log('======================================================================');
   console.log(`Ambang Batas Kelulusan CI : Minimal ${minScore}/100`);
 
-  if (!apiKey || apiKey === 'MY_GEMINI_API_KEY' || !apiKey.startsWith('AIzaSy')) {
+  if (engineMode === 'OFFLINE_AST') {
     console.log('Mode Eksekusi             : 🛡️  Zero-API (100% Offline AST Engine - Gratis)');
   } else {
     console.log('Mode Eksekusi             : 🤖 Hybrid Dual-Layer (AST + Gemini 3.8 Flash)');
@@ -223,6 +227,7 @@ export async function runAction() {
   let hasFatalFailure = false;
   let totalScoreSum = 0;
   let auditedCount = 0;
+  const summaries: FileAuditSummary[] = [];
 
   for (const filePath of filesToAudit) {
     if (!fs.existsSync(filePath)) continue;
@@ -234,15 +239,26 @@ export async function runAction() {
     const result = await evaluateCodeHybrid(codeContent, apiKey);
     const report = result.parsedReport;
     const score = report.skor;
+    const passed = !(score.totalScore < minScore || (!report.isHardened && score.security < 70));
 
     totalScoreSum += score.totalScore;
+    summaries.push({
+      filePath,
+      security: score.security,
+      correctness: score.correctness,
+      maintainability: score.maintainability,
+      overall: score.totalScore,
+      passed,
+      fatalFlaws: !passed && report.temuanUtama.description ? [report.temuanUtama.description] : [],
+      defenseInDepth: report.residualNotes || [],
+    });
 
     console.log(`   - Security        : ${score.security}/100`);
     console.log(`   - Correctness     : ${score.correctness}/100`);
     console.log(`   - Maintainability : ${score.maintainability}/100`);
     console.log(`   - Overall Guard   : ${score.totalScore}/100 [Target: ${minScore}]`);
 
-    if (score.totalScore < minScore || !report.isHardened && score.security < 70) {
+    if (!passed) {
       console.error(`   ❌ GAGAL: ${filePath} mendapatkan skor ${score.totalScore}/100 (Batas: ${minScore})`);
       if (report.temuanUtama && report.temuanUtama.description) {
         console.error(`   💣 Temuan Fatal (${report.temuanUtama.line}): ${report.temuanUtama.description}`);
@@ -263,6 +279,9 @@ export async function runAction() {
     fs.appendFileSync(outputFile, `overall_score=${avgScore}\n`);
     fs.appendFileSync(outputFile, `audit_status=${hasFatalFailure ? 'FAIL' : 'PASS'}\n`);
   }
+
+  // Comment before process.exit so the report is posted on both pass and failure.
+  await postPullRequestComment(summaries, minScore, engineMode);
 
   if (hasFatalFailure) {
     console.error('🚫 DevGuard Quality Gate Rejected: Ditemukan celah keamanan atau regresi logika.');
