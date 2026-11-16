@@ -209,7 +209,7 @@ DevGuard tracks detector precision, recall, and known evasion gaps transparently
 
 ### Automated Corpus Report (`npm run corpus:report`)
 
-- **Commit Short SHA:** `82c2622`
+- **Commit Short SHA:** `09bae24`
 - **Date:** `2026-11-16`
 - **Total Cases:** `n = 61` (`TP = 24`, `TN = 19`, `EVASION = 18`)
 
@@ -259,8 +259,8 @@ npm test
 # 4. Regenerate labeled corpus Markdown summary
 npm run corpus:report
 
-# 5. Run DevGuard self-audit locally
-npx tsx src/cli.ts src/devguardAnalyzer.ts src/cli.ts src/githubCommenter.ts src/sarifGenerator.ts
+# 5. Run DevGuard self-audit locally (zero-install Node 22 native TypeScript loader)
+node --experimental-strip-types src/loader.mjs src/devguardAnalyzer.ts src/cli.ts src/githubCommenter.ts src/sarifGenerator.ts
 ```
 
 ---
