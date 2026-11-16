@@ -1,6 +1,6 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import type { InlineFinding } from './devguardAnalyzer.js';
+import { redactSecretsPreservingLayout, type InlineFinding } from './devguardAnalyzer.js';
 
 export interface FileAuditSummary {
   filePath: string;
@@ -99,13 +99,13 @@ export async function postPullRequestComment(
       if (summary.fatalFlaws.length > 0) {
         detailsSection += '**💣 Celah Keamanan / Logika Terdeteksi:**\n';
         summary.fatalFlaws.forEach((flaw) => {
-          detailsSection += `- ❌ ${flaw}\n`;
+          detailsSection += `- ❌ ${redactSecretsPreservingLayout(flaw)}\n`;
         });
       }
       if (summary.defenseInDepth.length > 0) {
         detailsSection += '\n**🛡️ Catatan Defense-in-Depth (Alasan Skor Tidak 100/100):**\n';
         summary.defenseInDepth.forEach((note) => {
-          detailsSection += `- ⚠️ ${note}\n`;
+          detailsSection += `- ⚠️ ${redactSecretsPreservingLayout(note)}\n`;
         });
       }
     }
@@ -190,9 +190,10 @@ export async function postInlineReviewComments(summaries: FileAuditSummary[]): P
 
     for (const finding of summary.inlineFindings) {
       const targetLine = Math.max(1, finding.line);
-      let body = `🛡️ **[DevGuard ${finding.ruleId}]** (${finding.severity.toUpperCase()}): ${finding.message}`;
+      const safeMessage = redactSecretsPreservingLayout(finding.message);
+      let body = `🛡️ **[DevGuard ${finding.ruleId}]** (${finding.severity.toUpperCase()}): ${safeMessage}`;
       if (finding.suggestion) {
-        body += `\n\n\`\`\`suggestion\n${finding.suggestion}\n\`\`\``;
+        body += `\n\n\`\`\`suggestion\n${redactSecretsPreservingLayout(finding.suggestion)}\n\`\`\``;
       }
       pending.push({ path: normalizedPath, line: targetLine, body, ruleId: finding.ruleId });
     }

@@ -1,5 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import { redactSecretsPreservingLayout } from './devguardAnalyzer.js';
 import type { FileAuditSummary } from './githubCommenter.js';
 
 export interface SarifFindingLocation {
@@ -43,7 +44,7 @@ function createSarifResult(
   return {
     ruleId,
     level,
-    message: { text },
+    message: { text: redactSecretsPreservingLayout(text) },
     locations: [
       {
         physicalLocation: {

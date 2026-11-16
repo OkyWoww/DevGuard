@@ -18,9 +18,13 @@ import {
   DG007_PROVIDER_PATTERNS,
   detectHardcodedSecrets,
   detectMissingTimeoutsAndLoops,
+  findResidualSecretLikeTokens,
+  prepareRedactedCodeForLlm,
+  redactSecretsPreservingLayout,
+  type PrepareLlmOptions,
 } from './rules/secretAndResilienceRules.js';
 
-export type { AuditAnalyzeOptions, DevGuardRuleId, InlineFinding };
+export type { AuditAnalyzeOptions, DevGuardRuleId, InlineFinding, PrepareLlmOptions };
 export {
   DG007_PROVIDER_PATTERNS,
   POPULAR_NPM_PACKAGES,
@@ -32,6 +36,9 @@ export {
   detectMissingTimeoutsAndLoops,
   detectNonAtomicBalanceMutations,
   detectSwallowedExceptions,
+  findResidualSecretLikeTokens,
+  prepareRedactedCodeForLlm,
+  redactSecretsPreservingLayout,
 };
 
 export interface ParsedScores {
@@ -1369,6 +1376,11 @@ export function analyzeCodeDeterministically(
     .map((t, idx) => `${idx + 1}. ${t.title}: Input ${t.input} -> Hasil yang diharapkan: ${t.expected}`)
     .join('\n');
 
+  const safeRemediationCode =
+    !isSelfAnalyzerModule && dg007FlaggedLines.size > 0
+      ? redactSecretsPreservingLayout(remediationCode)
+      : remediationCode;
+
   const rawMarkdown = `## 👋 Apresiasi
 ${apresiasi}
 
@@ -1391,7 +1403,7 @@ ${story} Istilah teknis: ${technicalTerm}.
 ${remediationSummary}
 
 \`\`\`${language}
-${remediationCode}
+${safeRemediationCode}
 \`\`\`
 
 ## ✅ Tes
@@ -1419,7 +1431,7 @@ ${tesMarkdown}`;
       technicalTerm,
     },
     perbaikan: {
-      code: remediationCode,
+      code: safeRemediationCode,
       language,
       summary: remediationSummary,
     },

@@ -9,6 +9,9 @@ import { fileURLToPath } from 'node:url';
 
 import {
   analyzeCodeDeterministically,
+  findResidualSecretLikeTokens,
+  prepareRedactedCodeForLlm,
+  redactSecretsPreservingLayout,
   type AuditAnalyzeOptions,
 } from '../src/devguardAnalyzer.js';
 import { evaluateCodeHybrid } from '../src/cli.js';
@@ -985,6 +988,282 @@ test('14. sarifGenerator registers DG001-DG008 and core module self-audit passes
         `${relPath} self-audit score ${report.skor.totalScore}/100 must be >= 85`
       );
     }
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('15. redactSecretsPreservingLayout preserves exact UTF-16 length and LF/CRLF/tab indices across PEM, URI, JWT, and emoji', () => {
+  const fakeGemini = 'AIza' + 'SyD-9k8L7m6N5p4Q3r2S1t0U9v8W7x6Y5z4';
+  const fakeJwt = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.' + 'eyJ1c2VySWQiOiIxMjM0NTY3ODkwIn0.' + 'SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c';
+  const dbPass = 'Sup3rSecretPass99';
+  const pemBody = 'MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7';
+  const input = [
+    `// Banner 🚀🔐`,
+    `\tconst gemini = "${fakeGemini}";\r`,
+    `\tconst pgUrl = "postgresql://admin:${dbPass}@db.internal:5432/app";`,
+    `\tconst token = "${fakeJwt}";\r`,
+    `\tconst pem = \`-----BEGIN PRIVATE KEY-----`,
+    `${pemBody}\r`,
+    `-----END PRIVATE KEY-----\`;`,
+    `const ok = "🚀 safe";`,
+  ].join('\n');
+
+  const redacted = redactSecretsPreservingLayout(input);
+
+  assert.equal(redacted.length, input.length, 'Expected exact UTF-16 length preservation');
+  assert.equal(redacted.split('\n').length, input.split('\n').length, 'Expected identical LF line count');
+
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i];
+    if (ch === '\n' || ch === '\r' || ch === '\t') {
+      assert.equal(redacted[i], ch, `Control character at index ${i} must remain at exact offset`);
+    }
+  }
+
+  assert.ok(!redacted.includes(fakeGemini), 'Gemini key must be redacted');
+  assert.ok(!redacted.includes(dbPass), 'DB password must be redacted');
+  assert.ok(!redacted.includes(fakeJwt), 'JWT must be redacted');
+  assert.ok(!redacted.includes(pemBody), 'PEM private key body must be redacted');
+  assert.ok(redacted.includes('🚀'), 'Emoji surrogate pair outside secrets must remain intact');
+  assert.ok(redacted.includes('postgresql://admin:'), 'Non-secret URI host/user should remain visible');
+});
+
+test('16. prepareRedactedCodeForLlm aborts fail-closed when synthetic high-entropy residual token survives redaction', () => {
+  // Variable name intentionally non-secret so DG007 redactor skips it and residual gate catches it
+  const codeWithUnlabeledSecret = [
+    'export function buildConfig() {',
+    '  const opaqueRoutingBlob = "K9mP2xQ7vN4wR8zL3jF6hT1cB5yD0gA_sE+uV=";',
+    '  return { opaqueRoutingBlob };',
+    '}',
+  ].join('\n');
+
+  const residuals = findResidualSecretLikeTokens(codeWithUnlabeledSecret);
+  assert.ok(residuals.length >= 1, 'Independent residual scanner must detect surviving high-entropy token');
+  assert.ok(!residuals.join(' ').includes('K9mP2x'), 'Residual descriptors must not echo raw token characters');
+
+  const gateResult = prepareRedactedCodeForLlm('src/config/routing.ts', codeWithUnlabeledSecret);
+  assert.equal(gateResult.aborted, true);
+  assert.equal(gateResult.safeCode, '');
+});
+
+test('17. prepareRedactedCodeForLlm fails closed when redaction throws an unexpected error', () => {
+  const gateResult = prepareRedactedCodeForLlm('src/app.ts', 'export const x = 1;', {
+    redactFn: () => {
+      throw new Error('Simulated redaction crash');
+    },
+  });
+
+  assert.equal(gateResult.aborted, true);
+  assert.equal(gateResult.safeCode, '');
+  assert.match(gateResult.reason || '', /fail-closed/i);
+});
+
+test('18. Sensitive filenames (.env.production, server.pem, id_rsa) immediately abort Layer 2 transmission without calling fetch', async () => {
+  const sensitivePaths = [
+    '.env.production',
+    'config/.env',
+    '.ENV.LOCAL',
+    'certs/server.pem',
+    'certs/client.p12',
+    'certs/ archive.PFX',
+    'tls/private.KEY',
+    'tls/ca.crt',
+    '/home/ci/.ssh/id_rsa',
+    'keys/id_ed25519',
+    'keys/id_ecdsa',
+    'keys/id_ecdsa.pub',
+  ];
+  for (const sensitivePath of sensitivePaths) {
+    const res = prepareRedactedCodeForLlm(sensitivePath, 'export const safeFlag = true;');
+    assert.equal(res.aborted, true, `Expected ${sensitivePath} to abort immediately`);
+    assert.equal(res.safeCode, '');
+  }
+
+  const origFetch = globalThis.fetch;
+  let fetchCalls = 0;
+  globalThis.fetch = (async () => {
+    fetchCalls++;
+    throw new Error('fetch must not be called when Layer 2 aborts');
+  }) as typeof globalThis.fetch;
+
+  try {
+    const fakeApiKey = 'AIzaSy' + 'SimulatedFormatKeyForGateTest123';
+    const sensitiveHybrid = await evaluateCodeHybrid('export const x = 1;', fakeApiKey, undefined, '.ENV.LOCAL');
+    assert.equal(sensitiveHybrid.mode, 'zero-api');
+    assert.equal(sensitiveHybrid.isLiveApi, false);
+    assert.equal(sensitiveHybrid.layer2Status, 'Skipped: Redaction Abort');
+
+    const residualCode = 'export const payload = "K9mP2xQ7vN4wR8zL3jF6hT1cB5yD0gA_sE+uV=";';
+    const residualHybrid = await evaluateCodeHybrid(residualCode, fakeApiKey, undefined, 'src/residual.ts');
+    assert.equal(residualHybrid.mode, 'zero-api');
+    assert.equal(residualHybrid.isLiveApi, false);
+    assert.equal(residualHybrid.layer2Status, 'Skipped: Redaction Abort');
+
+    assert.equal(fetchCalls, 0, 'globalThis.fetch must never be invoked when Layer 2 aborts');
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test('19. Planted secret never leaks raw substring in DG007 message, suggestion, SARIF JSON, or PR comments', async () => {
+  const plantedSecret = 'AIza' + 'SyD-9k8L7m6N5p4Q3r2S1t0U9v8W7x6Y5z4';
+  const source = [
+    `const GEMINI_KEY = "${plantedSecret}";`,
+    'export const getGeminiKey = () => GEMINI_KEY;',
+  ].join('\n');
+
+  const report = analyzeCodeDeterministically(source, { filePath: 'src/ai/client.ts' });
+  const dg007 = (report.inlineFindings || []).find((f) => f.ruleId === 'DG007');
+  assert.ok(dg007, 'Expected DG007 finding on planted secret');
+  assert.ok(!dg007.message.includes(plantedSecret), 'DG007 message must never contain raw secret');
+  assert.ok(dg007.message.includes('AIza****'), 'DG007 message should display masked prefix only');
+  assert.ok(
+    dg007.message.includes('CRITICAL: Rotate/revoke this credential immediately. Replacing it in a new commit does not remove it from Git history.'),
+    'DG007 message must append mandatory Git history rotation warning'
+  );
+  assert.ok(!(dg007.suggestion || '').includes(plantedSecret), 'DG007 suggestion must never contain raw secret');
+  assert.ok(!report.temuanUtama.description.includes(plantedSecret), 'temuanUtama must never contain raw secret');
+  assert.ok(!report.perbaikan.code.includes(plantedSecret), 'remediation code must never contain raw secret');
+  assert.ok(!report.rawMarkdown.includes(plantedSecret), 'rawMarkdown must never contain raw secret');
+
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-secret-redact-'));
+  const postedBodies: string[] = [];
+  const server = http.createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on('data', (c: Buffer) => chunks.push(c));
+    req.on('end', () => {
+      const raw = Buffer.concat(chunks).toString('utf-8');
+      if (raw) postedBodies.push(raw);
+      res.writeHead(req.method === 'GET' ? 200 : 201, { 'Content-Type': 'application/json' });
+      res.end(req.method === 'GET' ? '[]' : JSON.stringify({ id: 501 }));
+    });
+  });
+
+  const prevEnv = {
+    GITHUB_TOKEN: process.env.GITHUB_TOKEN,
+    GITHUB_REPOSITORY: process.env.GITHUB_REPOSITORY,
+    GITHUB_EVENT_PATH: process.env.GITHUB_EVENT_PATH,
+    GITHUB_API_URL: process.env.GITHUB_API_URL,
+  };
+
+  try {
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const addr = server.address() as { port: number };
+    const eventPath = path.join(tempDir, 'event.json');
+    fs.writeFileSync(eventPath, JSON.stringify({ pull_request: { number: 105 } }), 'utf-8');
+
+    const summary: FileAuditSummary = {
+      filePath: 'src/ai/client.ts',
+      security: report.skor.security,
+      correctness: report.skor.correctness,
+      maintainability: report.skor.maintainability,
+      overall: report.skor.totalScore,
+      passed: false,
+      fatalFlaws: [report.temuanUtama.description],
+      defenseInDepth: report.residualNotes || [],
+      inlineFindings: report.inlineFindings,
+    };
+
+    const sarifPath = path.join(tempDir, 'redacted.sarif');
+    generateSarifReport([summary], sarifPath);
+    const sarifRaw = fs.readFileSync(sarifPath, 'utf-8');
+    assert.ok(!sarifRaw.includes(plantedSecret), 'SARIF output must never contain raw secret');
+    assert.ok(sarifRaw.includes('CRITICAL: Rotate/revoke this credential immediately'), 'SARIF must preserve rotation warning');
+
+    process.env.GITHUB_TOKEN = 'test-token';
+    process.env.GITHUB_REPOSITORY = 'OkyWoww/DevGuard';
+    process.env.GITHUB_EVENT_PATH = eventPath;
+    process.env.GITHUB_API_URL = `http://127.0.0.1:${addr.port}`;
+
+    await postPullRequestComment([summary], 85, 'OFFLINE_AST');
+    await postInlineReviewComments([summary]);
+
+    const joinedPosts = postedBodies.join('\n');
+    assert.ok(postedBodies.length >= 2, 'Expected both PR summary comment and inline review posts');
+    assert.ok(!joinedPosts.includes(plantedSecret), 'PR summary and inline review comments must never contain raw secret');
+
+    const cliDist = path.join(BUILD_ROOT, 'src', 'cli.js');
+    const leakedFilePath = path.join(tempDir, 'leaked.ts');
+    const cliSarifPath = path.join(tempDir, 'cli-redacted.sarif');
+    fs.writeFileSync(leakedFilePath, source, 'utf-8');
+    const cliOut = spawnSync(process.execPath, [cliDist, leakedFilePath], {
+      cwd: REPO_ROOT,
+      encoding: 'utf-8',
+      env: {
+        ...process.env,
+        GEMINI_API_KEY: '',
+        DEVGUARD_SARIF_OUTPUT: cliSarifPath,
+        GITHUB_TOKEN: '',
+        GITHUB_EVENT_PATH: '',
+      },
+    });
+    assert.equal(cliOut.status, 1, 'Expected CLI to reject leaked secret fixture');
+    const cliCombined = `${cliOut.stdout}\n${cliOut.stderr}`;
+
+    const forbiddenSlices = [
+      plantedSecret,
+      plantedSecret.slice(4, 12),
+      plantedSecret.slice(12, 20),
+      plantedSecret.slice(-10),
+    ];
+    const channels: Array<[string, string]> = [
+      ['dg007.message', dg007.message],
+      ['dg007.suggestion', dg007.suggestion || ''],
+      ['report.rawMarkdown', report.rawMarkdown],
+      ['sarifRaw', sarifRaw],
+      ['prCommentBodies', joinedPosts],
+      ['cliOutput', cliCombined],
+    ];
+    for (const [channelName, text] of channels) {
+      for (const slice of forbiddenSlices) {
+        assert.ok(!text.includes(slice), `${channelName} must not leak secret slice "${slice}"`);
+      }
+    }
+  } finally {
+    process.env.GITHUB_TOKEN = prevEnv.GITHUB_TOKEN;
+    process.env.GITHUB_REPOSITORY = prevEnv.GITHUB_REPOSITORY;
+    process.env.GITHUB_EVENT_PATH = prevEnv.GITHUB_EVENT_PATH;
+    process.env.GITHUB_API_URL = prevEnv.GITHUB_API_URL;
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('20. When Layer 2 redaction aborts, Layer 1 findings still drive the CLI exit code accurately', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-abort-cli-'));
+  try {
+    const cliDist = path.join(BUILD_ROOT, 'src', 'cli.js');
+    const vulnPath = path.join(tempDir, 'secretAndEval.ts');
+    const sarifOut = path.join(tempDir, 'abort-out.sarif');
+
+    // Includes both a high-entropy unredacted blob (triggers Layer 2 abort) and eval RCE (triggers Layer 1 exit code 1)
+    fs.writeFileSync(
+      vulnPath,
+      [
+        'export function run(cmd: string) {',
+        '  const opaqueSeed = "K9mP2xQ7vN4wR8zL3jF6hT1cB5yD0gA_sE+uV=";',
+        '  return eval(cmd + opaqueSeed.length);',
+        '}',
+      ].join('\n'),
+      'utf-8'
+    );
+
+    const cliRun = spawnSync(process.execPath, [cliDist, vulnPath], {
+      cwd: REPO_ROOT,
+      encoding: 'utf-8',
+      env: {
+        ...process.env,
+        GEMINI_API_KEY: 'AIzaSy' + 'SimulatedValidFormatKeyForAbortTest1',
+        DEVGUARD_SARIF_OUTPUT: sarifOut,
+        GITHUB_TOKEN: '',
+        GITHUB_EVENT_PATH: '',
+      },
+    });
+
+    assert.equal(cliRun.status, 1, `Expected CLI to exit with code 1 from Layer 1 despite Layer 2 abort; stderr=${cliRun.stderr}`);
+    assert.ok(fs.existsSync(sarifOut), 'Expected SARIF output even when Layer 2 aborted');
+    assert.match(cliRun.stderr + cliRun.stdout, /fail-closed abort/i, 'Expected fail-closed abort warning notice');
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }

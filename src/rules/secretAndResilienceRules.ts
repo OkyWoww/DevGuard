@@ -1,4 +1,5 @@
 import {
+  analyzeLexicalStructure,
   calculateShannonEntropy,
   type ExtractedStringLiteral,
   type InlineFinding,
@@ -25,9 +26,310 @@ const DG007_SENSITIVE_IDENT_RE =
 const DG007_DUMMY_RE =
   /(?:YOUR_|REPLACE_ME|PLACEHOLDER|CHANGEME|INSERT_|DUMMY|SAMPLE|EXAMPLE|TEST_KEY|MOCK_|FAKE_|^sk_test_|^pk_test_|^pk_live_|_HERE\b)/i;
 
+const DG007_ROTATION_WARNING =
+  'CRITICAL: Rotate/revoke this credential immediately. Replacing it in a new commit does not remove it from Git history.';
+
+const PEM_PRIVATE_KEY_RE =
+  /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g;
+const CREDENTIALED_DB_URI_RE =
+  /(?:postgres(?:ql)?|mongodb(?:\+srv)?|redis|mysql):\/\/[^/\s:@]+:([^@\s]+)@/gi;
+const JWT_TOKEN_RE =
+  /\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g;
+
 function toUpperSnakeEnvName(identifier: string): string {
   const leaf = identifier.includes('.') ? identifier.split('.').pop()! : identifier;
   return leaf.replace(/([a-z0-9])([A-Z])/g, '$1_$2').toUpperCase();
+}
+
+function maskSecretPreview(secret: string): string {
+  if (secret.length <= 4) return '*'.repeat(secret.length);
+  return secret.slice(0, 4) + '*'.repeat(secret.length - 4);
+}
+
+function maskSpanPreservingLayout(chars: string[], start: number, end: number): void {
+  const safeStart = Math.max(0, start);
+  const safeEnd = Math.min(chars.length, end);
+  for (let i = safeStart; i < safeEnd; i++) {
+    const ch = chars[i];
+    if (ch !== '\n' && ch !== '\r' && ch !== '\t') {
+      chars[i] = '*';
+    }
+  }
+}
+
+interface EvaluatedSecretMatch {
+  envVarName: string;
+  detectionDetail: string;
+  lineStartOffset: number;
+  rawLine: string;
+}
+
+function evaluateSecretLiteral(
+  rawCode: string,
+  rawLines: string[],
+  lit: ExtractedStringLiteral
+): EvaluatedSecretMatch | null {
+  if (lit.hasInterpolation) return null;
+
+  const lineStartOffset = rawCode.lastIndexOf('\n', lit.startOffset - 1) + 1;
+  const rawLine = rawLines[lit.line - 1] ?? '';
+
+  if (/\bRegExp\s*\(/i.test(rawLine)) return null;
+  const val = lit.value;
+  if (val.length < 20 || val.startsWith('data:')) return null;
+
+  const prefixBeforeLiteral = rawCode.slice(lineStartOffset, lit.startOffset);
+  const assignMatch = prefixBeforeLiteral.match(
+    /(?:^|[\s,{;(])(?:(?:export\s+)?(?:const|let|var)\s+|(?:public|private|readonly)\s+)?([A-Za-z_$][A-Za-z0-9_$.]*)\s*(?::\s*[^=]+)?[:=]\s*$/
+  );
+  const assignedIdent = assignMatch?.[1];
+  const leafIdent = assignedIdent?.includes('.') ? assignedIdent.split('.').pop() : assignedIdent;
+
+  let matchedProvider: { label: string; envFallback: string } | undefined;
+  if (!DG007_DUMMY_RE.test(val)) {
+    for (const pat of DG007_PROVIDER_PATTERNS) {
+      if (pat.re.test(val)) {
+        matchedProvider = { label: pat.label, envFallback: pat.envFallback };
+        break;
+      }
+    }
+  }
+
+  const readsEnv = /\b(?:process\.env\.|import\.meta\.env\.|Deno\.env\.get\s*\()/i.test(rawLine);
+
+  if (matchedProvider) {
+    return {
+      envVarName: assignedIdent ? toUpperSnakeEnvName(assignedIdent) : matchedProvider.envFallback,
+      detectionDetail: `Hardcoded ${matchedProvider.label} (${maskSecretPreview(val)}) terdeteksi pada baris ${lit.line}.`,
+      lineStartOffset,
+      rawLine,
+    };
+  }
+
+  if (
+    !readsEnv &&
+    val.length <= 256 &&
+    !/\s/.test(val) &&
+    !/^(?:https?|wss?):\/\//i.test(val) &&
+    !/^(?:\.{0,2}\/)/.test(val) &&
+    !DG007_DUMMY_RE.test(val) &&
+    !/^(.)\1{5,}$/.test(val) &&
+    !/^(?:x+|0+|12345|abcde)/i.test(val) &&
+    leafIdent &&
+    DG007_SENSITIVE_IDENT_RE.test(leafIdent)
+  ) {
+    const entropy = calculateShannonEntropy(val);
+    if (entropy >= 3.8) {
+      return {
+        envVarName: toUpperSnakeEnvName(leafIdent),
+        detectionDetail: `Kredensial ber-entropi tinggi (${maskSecretPreview(val)}, ${entropy.toFixed(2)} bits/char) ditugaskan ke '${leafIdent}' secara hardcoded pada baris ${lit.line}.`,
+        lineStartOffset,
+        rawLine,
+      };
+    }
+  }
+
+  return null;
+}
+
+function maskKnownTokensOnly(input: string): string {
+  const chars = input.split('');
+  for (const pat of DG007_PROVIDER_PATTERNS) {
+    const globalRe = new RegExp(pat.re.source, 'g');
+    for (const m of input.matchAll(globalRe)) {
+      if (m.index !== undefined) maskSpanPreservingLayout(chars, m.index, m.index + m[0].length);
+    }
+  }
+  return chars.join('');
+}
+
+/**
+ * Redacts hardcoded provider secrets, high-entropy credentials, PEM private keys,
+ * credentialed database URIs, and JWTs with `*` while preserving exact UTF-16 `.length`
+ * and keeping every `\n`, `\r`, and `\t` at its exact index.
+ */
+export function redactSecretsPreservingLayout(code: string): string {
+  if (typeof code !== 'string') {
+    throw new TypeError('redactSecretsPreservingLayout requires a string');
+  }
+  const chars = code.split('');
+
+  try {
+    // 1. PEM private key blocks
+    for (const m of code.matchAll(PEM_PRIVATE_KEY_RE)) {
+      if (m.index !== undefined) {
+        maskSpanPreservingLayout(chars, m.index, m.index + m[0].length);
+      }
+    }
+
+    // 2. Credentialed DB URI passwords (group 1 between ':' and '@')
+    for (const m of code.matchAll(CREDENTIALED_DB_URI_RE)) {
+      if (m.index !== undefined && m[1]) {
+        const passEnd = m.index + m[0].length - 1; // index of '@'
+        const passStart = passEnd - m[1].length;
+        maskSpanPreservingLayout(chars, passStart, passEnd);
+      }
+    }
+
+    // 3. JSON Web Tokens (JWT)
+    for (const m of code.matchAll(JWT_TOKEN_RE)) {
+      if (m.index !== undefined) {
+        maskSpanPreservingLayout(chars, m.index, m.index + m[0].length);
+      }
+    }
+
+    // 4. Known DG007 provider prefixes anywhere in text (except RegExp(...) scanner definitions)
+    const lines = code.split('\n');
+    for (const pat of DG007_PROVIDER_PATTERNS) {
+      const globalRe = new RegExp(pat.re.source, 'g');
+      for (const m of code.matchAll(globalRe)) {
+        if (m.index === undefined) continue;
+        const lineIdx = code.slice(0, m.index).split('\n').length - 1;
+        const lineText = lines[lineIdx] ?? '';
+        if (/\bRegExp\s*\(/.test(lineText) || /\/[^\n/]*\\b/.test(lineText)) continue;
+        maskSpanPreservingLayout(chars, m.index, m.index + m[0].length);
+      }
+    }
+
+    // 5. Specific high-entropy secret string literals (only the matched secret literal value)
+    const lexical = analyzeLexicalStructure(code, false);
+    for (const lit of lexical.stringLiterals) {
+      if (evaluateSecretLiteral(code, lines, lit) && lit.endOffset > lit.startOffset + 2) {
+        maskSpanPreservingLayout(chars, lit.startOffset + 1, lit.endOffset - 1);
+      }
+    }
+  } catch {
+    return chars.join('');
+  }
+
+  return chars.join('');
+}
+
+const COMMON_FILE_EXT_RE =
+  /\.(?:ts|tsx|js|jsx|mjs|cjs|json|md|png|jpe?g|svg|gif|webp|css|scss|html|py|yml|yaml|sarif|txt|lock)$/i;
+
+function countCharClasses(token: string): number {
+  let classes = 0;
+  if (/[A-Z]/.test(token)) classes++;
+  if (/[a-z]/.test(token)) classes++;
+  if (/[0-9]/.test(token)) classes++;
+  if (/[+/_=-]/.test(token)) classes++;
+  return classes;
+}
+
+/**
+ * Independent fail-closed residual secret scanner that must NOT reuse `DG007_PROVIDER_PATTERNS`.
+ * Returns masked location descriptors only (`residual-high-entropy-token@line:N`), never raw tokens.
+ */
+export function findResidualSecretLikeTokens(code: string): string[] {
+  if (typeof code !== 'string') {
+    throw new TypeError('findResidualSecretLikeTokens requires a string');
+  }
+
+  const residuals: string[] = [];
+  const seen = new Set<string>();
+  const addResidual = (kind: string, line: number): void => {
+    const descriptor = `${kind}@line:${line}`;
+    if (!seen.has(descriptor)) {
+      seen.add(descriptor);
+      residuals.push(descriptor);
+    }
+  };
+
+  // Strip comments (keeping newlines intact) without masking string literals
+  const commentStripped = code
+    .replace(/\/\*[\s\S]*?\*\//g, (block) => block.replace(/[^\n]/g, ' '))
+    .replace(/(^|[^:\\])\/\/[^\n]*/g, (_full, prefix: string) => `${prefix}`);
+
+  const lines = commentStripped.split('\n');
+  const candidateTokenRe = /[A-Za-z0-9+/_=-]{24,256}/g;
+  const residualPemRe = /-----BEGIN\s+[A-Z0-9 ]*PRIVATE KEY-----/i;
+  const residualUriCredRe = /:\/\/[^/\s:@]+:[^@\s*]+@/;
+
+  for (let idx = 0; idx < lines.length; idx++) {
+    const lineNum = idx + 1;
+    const lineText = lines[idx];
+
+    if (residualPemRe.test(lineText)) {
+      addResidual('residual-pem-header', lineNum);
+    }
+    if (residualUriCredRe.test(lineText)) {
+      addResidual('residual-uri-credential', lineNum);
+    }
+
+    for (const m of lineText.matchAll(candidateTokenRe)) {
+      if (m.index === undefined) continue;
+      const tok = m[0];
+      const before = lineText.slice(Math.max(0, m.index - 24), m.index);
+
+      // Exclude HTTP URLs, data:* base64 URIs, and source/asset file paths
+      if (/(?:https?:\/\/[^\s]*|data:[^\s]*base64,)$/i.test(before) || /^https?/i.test(tok)) continue;
+      if (tok.includes('/') && COMMON_FILE_EXT_RE.test(tok)) continue;
+      if (countCharClasses(tok) < 3) continue;
+
+      const entropy = calculateShannonEntropy(tok);
+      if (entropy >= 4.2) {
+        addResidual('residual-high-entropy-token', lineNum);
+      }
+    }
+  }
+
+  return residuals;
+}
+
+const SENSITIVE_BASENAME_PATTERNS: ReadonlyArray<RegExp> = [
+  /^\.env(\..+)?$/i,
+  /\.(pem|key|p12|pfx|crt)$/i,
+  /^id_(rsa|ed25519|ecdsa)(\..+)?$/i,
+];
+
+export interface PrepareLlmOptions {
+  redactFn?: (source: string) => string;
+}
+
+/**
+ * Fail-closed Pre-LLM verification gate. Blocks sensitive filenames, redacts secrets,
+ * verifies zero surviving DG007 or residual high-entropy tokens, and aborts on any error.
+ */
+export function prepareRedactedCodeForLlm(
+  filePath: string,
+  code: string,
+  options?: PrepareLlmOptions
+): { safeCode: string; aborted: boolean; reason?: string } {
+  const normalizedPath = typeof filePath === 'string' ? filePath.replace(/\\/g, '/') : '';
+  const baseName = normalizedPath.split('/').pop() || '';
+
+  if (SENSITIVE_BASENAME_PATTERNS.some((re) => re.test(baseName))) {
+    return { safeCode: '', aborted: true, reason: 'Sensitive filename blocked' };
+  }
+
+  try {
+    if (typeof code !== 'string') {
+      throw new TypeError('Source code for LLM must be a string');
+    }
+
+    const redact = options?.redactFn ?? redactSecretsPreservingLayout;
+    const redacted = redact(code);
+    if (typeof redacted !== 'string') {
+      throw new TypeError('Redactor did not return a string');
+    }
+
+    const redactedLines = redacted.split('\n');
+    const lexical = analyzeLexicalStructure(redacted, false);
+    const verifyFindings: LineFinding[] = [];
+    const verifyInline: InlineFinding[] = [];
+
+    detectHardcodedSecrets(redacted, redactedLines, lexical.stringLiterals, verifyFindings, verifyInline);
+    const residuals = findResidualSecretLikeTokens(redacted);
+
+    if (verifyFindings.length > 0 || verifyInline.length > 0 || residuals.length > 0) {
+      return { safeCode: '', aborted: true, reason: 'Residual secret check triggered fail-closed abort' };
+    }
+
+    return { safeCode: redacted, aborted: false };
+  } catch {
+    return { safeCode: '', aborted: true, reason: 'Residual secret check triggered fail-closed abort' };
+  }
 }
 
 /** DG007: Detects hardcoded provider-prefixed secrets and high-entropy credential assignments. */
@@ -45,68 +347,20 @@ export function detectHardcodedSecrets(
 
   try {
     for (const lit of stringLiterals) {
-      if (flaggedLines.has(lit.line) || lit.hasInterpolation) continue;
-
-      const lineStartOffset = rawCode.lastIndexOf('\n', lit.startOffset - 1) + 1;
-      const rawLine = rawLines[lit.line - 1] ?? '';
-
-      if (/\bRegExp\s*\(/i.test(rawLine)) continue;
-      const val = lit.value;
-      if (val.length < 20 || val.startsWith('data:')) continue;
-
-      const prefixBeforeLiteral = rawCode.slice(lineStartOffset, lit.startOffset);
-      const assignMatch = prefixBeforeLiteral.match(
-        /(?:^|[\s,{;(])(?:(?:export\s+)?(?:const|let|var)\s+|(?:public|private|readonly)\s+)?([A-Za-z_$][A-Za-z0-9_$.]*)\s*(?::\s*[^=]+)?[:=]\s*$/
-      );
-      const assignedIdent = assignMatch?.[1];
-      const leafIdent = assignedIdent?.includes('.') ? assignedIdent.split('.').pop() : assignedIdent;
-
-      let matchedProvider: { label: string; envFallback: string } | undefined;
-      if (!DG007_DUMMY_RE.test(val)) {
-        for (const pat of DG007_PROVIDER_PATTERNS) {
-          if (pat.re.test(val)) {
-            matchedProvider = { label: pat.label, envFallback: pat.envFallback };
-            break;
-          }
-        }
-      }
-
-      const readsEnv = /\b(?:process\.env\.|import\.meta\.env\.|Deno\.env\.get\s*\()/i.test(rawLine);
-
-      let detectionDetail: string | undefined;
-      let envVarName = assignedIdent ? toUpperSnakeEnvName(assignedIdent) : 'API_SECRET_KEY';
-
-      if (matchedProvider) {
-        detectionDetail = `Hardcoded ${matchedProvider.label} terdeteksi pada baris ${lit.line}.`;
-        envVarName = assignedIdent ? toUpperSnakeEnvName(assignedIdent) : matchedProvider.envFallback;
-      } else if (
-        !readsEnv &&
-        val.length <= 256 &&
-        !/\s/.test(val) &&
-        !/^(?:https?|wss?):\/\//i.test(val) &&
-        !/^(?:\.{0,2}\/)/.test(val) &&
-        !DG007_DUMMY_RE.test(val) &&
-        !/^(.)\1{5,}$/.test(val) &&
-        !/^(?:x+|0+|12345|abcde)/i.test(val) &&
-        leafIdent &&
-        DG007_SENSITIVE_IDENT_RE.test(leafIdent)
-      ) {
-        const entropy = calculateShannonEntropy(val);
-        if (entropy >= 3.8) {
-          detectionDetail = `Kredensial ber-entropi tinggi (${entropy.toFixed(2)} bits/char) ditugaskan ke '${leafIdent}' secara hardcoded pada baris ${lit.line}.`;
-          envVarName = toUpperSnakeEnvName(leafIdent);
-        }
-      }
-
-      if (!detectionDetail) continue;
+      if (flaggedLines.has(lit.line)) continue;
+      const evaluated = evaluateSecretLiteral(rawCode, rawLines, lit);
+      if (!evaluated) continue;
 
       flaggedLines.add(lit.line);
+      const { envVarName, detectionDetail, lineStartOffset, rawLine } = evaluated;
       const colStart = lit.startOffset - lineStartOffset;
       const colEnd = lit.endLine === lit.line ? lit.endOffset - lineStartOffset : rawLine.length;
       const suggestion =
-        rawLine.slice(0, colStart) + `process.env.${envVarName} ?? ''` + rawLine.slice(colEnd);
+        maskKnownTokensOnly(rawLine.slice(0, colStart)) +
+        `process.env.${envVarName} ?? ''` +
+        maskKnownTokensOnly(rawLine.slice(colEnd));
 
-      const msg = `${detectionDetail} Pindahkan secret ke environment variable (process.env.${envVarName}) dan segera rotasi kunci jika pernah tercommit.`;
+      const msg = `${detectionDetail} Pindahkan secret ke environment variable (process.env.${envVarName}). ${DG007_ROTATION_WARNING}`;
       findings.push({
         line: lit.line,
         category: 'security',

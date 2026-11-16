@@ -3,10 +3,11 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { execSync } from 'node:child_process';
 import { builtinModules } from 'node:module';
-import dotenv from 'dotenv';
 import { GoogleGenAI, Type } from '@google/genai';
 import {
   analyzeCodeDeterministically,
+  prepareRedactedCodeForLlm,
+  redactSecretsPreservingLayout,
   ParsedDevGuardReport,
 } from './devguardAnalyzer.js';
 import {
@@ -16,7 +17,31 @@ import {
 import type { FileAuditSummary } from './githubCommenter.js';
 import { generateSarifReport } from './sarifGenerator.js';
 
-dotenv.config();
+function loadDotEnvIfPresent(): void {
+  try {
+    const envPath = path.resolve(process.cwd(), '.env');
+    if (!fs.existsSync(envPath)) return;
+    const raw = fs.readFileSync(envPath, 'utf-8');
+    for (const line of raw.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const eqIdx = trimmed.indexOf('=');
+      if (eqIdx <= 0) continue;
+      const key = trimmed.slice(0, eqIdx).trim();
+      let value = trimmed.slice(eqIdx + 1).trim();
+      if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+        value = value.slice(1, -1);
+      }
+      if (key && process.env[key] === undefined) {
+        process.env[key] = value;
+      }
+    }
+  } catch {
+    return;
+  }
+}
+
+loadDotEnvIfPresent();
 
 function writeGitHubOutput(outputFile: string | undefined, key: string, value: string | number): void {
   if (!outputFile || !fs.existsSync(outputFile)) return;
@@ -28,8 +53,11 @@ function writeGitHubOutput(outputFile: string | undefined, key: string, value: s
 export interface CliAuditResult {
   mode: 'zero-api' | 'hybrid';
   isLiveApi: boolean;
+  layer2Status?: string;
   parsedReport: ParsedDevGuardReport;
 }
+
+let loggedRedactedTransmissionNotice = false;
 
 function resolveNearestPackageDependencies(filePath: string): Set<string> | undefined {
   try {
@@ -75,8 +103,25 @@ export async function evaluateCodeHybrid(
     return {
       mode: 'zero-api',
       isLiveApi: false,
+      layer2Status: 'Skipped: Offline AST Only',
       parsedReport: l1Result,
     };
+  }
+
+  const redactionGate = prepareRedactedCodeForLlm(filePath || 'input.ts', code);
+  if (redactionGate.aborted) {
+    console.warn(`🛡️  Layer 2 dilewati (fail-closed abort pada ${filePath || 'input'}): ${redactionGate.reason}`);
+    return {
+      mode: 'zero-api',
+      isLiveApi: false,
+      layer2Status: 'Skipped: Redaction Abort',
+      parsedReport: l1Result,
+    };
+  }
+
+  if (!loggedRedactedTransmissionNotice) {
+    console.log('ℹ️  Layer 2 Gemini aktif: kode sumber yang telah diredaksi dikirim ke Gemini API untuk evaluasi semantik.');
+    loggedRedactedTransmissionNotice = true;
   }
 
   try {
@@ -89,10 +134,10 @@ export async function evaluateCodeHybrid(
       `Hasil deteksi Layer 1 AST Analyzer (wajib dihormati sebagai batas atas skor):`,
       `- Security=${l1Result.skor.security}, Correctness=${l1Result.skor.correctness}, Maintainability=${l1Result.skor.maintainability}`,
       `- Baris Temuan: ${l1Result.temuanUtama.line}`,
-      `- Detail: ${l1Result.temuanUtama.description}`,
+      `- Detail: ${redactSecretsPreservingLayout(l1Result.temuanUtama.description)}`,
       '',
       '<code_to_review>',
-      code,
+      redactionGate.safeCode,
       '</code_to_review>',
     ].join('\n');
 
@@ -149,7 +194,8 @@ export async function evaluateCodeHybrid(
       timeoutPromise,
     ])) as { text?: string };
 
-    const geminiData = JSON.parse((response.text || '').trim());
+    const rawResponseText = redactSecretsPreservingLayout((response.text || '').trim());
+    const geminiData = JSON.parse(rawResponseText);
 
     // Ceilings enforced by Layer 1 zero-leniency rubric
     const reconciledSecurity = Math.min(l1Result.skor.security, geminiData.skor?.security ?? 100);
@@ -157,44 +203,50 @@ export async function evaluateCodeHybrid(
     const reconciledMaintainability = Math.min(l1Result.skor.maintainability, geminiData.skor?.maintainability ?? 100);
     const reconciledTotal = Math.round((reconciledSecurity + reconciledCorrectness + reconciledMaintainability) / 3);
 
+    const redactList = (items?: string[]): string[] | undefined =>
+      items?.length ? items.map((s) => redactSecretsPreservingLayout(String(s))) : undefined;
+
     return {
       mode: 'hybrid',
       isLiveApi: true,
+      layer2Status: 'Executed: Redacted',
       parsedReport: {
         ...l1Result,
-        apresiasi: geminiData.apresiasi || l1Result.apresiasi,
+        apresiasi: geminiData.apresiasi ? redactSecretsPreservingLayout(String(geminiData.apresiasi)) : l1Result.apresiasi,
         skor: {
           security: reconciledSecurity,
-          securityDeductions: geminiData.skor?.securityDeductions?.length
-            ? geminiData.skor.securityDeductions
-            : l1Result.skor.securityDeductions,
+          securityDeductions: redactList(geminiData.skor?.securityDeductions) || l1Result.skor.securityDeductions,
           correctness: reconciledCorrectness,
-          correctnessDeductions: geminiData.skor?.correctnessDeductions?.length
-            ? geminiData.skor.correctnessDeductions
-            : l1Result.skor.correctnessDeductions,
+          correctnessDeductions: redactList(geminiData.skor?.correctnessDeductions) || l1Result.skor.correctnessDeductions,
           maintainability: reconciledMaintainability,
-          maintainabilityDeductions: geminiData.skor?.maintainabilityDeductions?.length
-            ? geminiData.skor.maintainabilityDeductions
-            : l1Result.skor.maintainabilityDeductions,
+          maintainabilityDeductions:
+            redactList(geminiData.skor?.maintainabilityDeductions) || l1Result.skor.maintainabilityDeductions,
           totalScore: reconciledTotal,
         },
         temuanUtama: {
           line: l1Result.temuanUtama.line !== '-' ? l1Result.temuanUtama.line : (geminiData.temuanUtama?.line || '-'),
-          description: geminiData.temuanUtama?.description || l1Result.temuanUtama.description,
+          description: geminiData.temuanUtama?.description
+            ? redactSecretsPreservingLayout(String(geminiData.temuanUtama.description))
+            : l1Result.temuanUtama.description,
         },
-        temuanLain: geminiData.temuanLain?.length ? geminiData.temuanLain : l1Result.temuanLain,
+        temuanLain: redactList(geminiData.temuanLain) || l1Result.temuanLain,
         analogi: {
-          story: geminiData.analogi?.story || l1Result.analogi.story,
-          technicalTerm: geminiData.analogi?.technicalTerm || l1Result.analogi.technicalTerm,
+          story: geminiData.analogi?.story
+            ? redactSecretsPreservingLayout(String(geminiData.analogi.story))
+            : l1Result.analogi.story,
+          technicalTerm: geminiData.analogi?.technicalTerm
+            ? redactSecretsPreservingLayout(String(geminiData.analogi.technicalTerm))
+            : l1Result.analogi.technicalTerm,
         },
       },
     };
   } catch (err: unknown) {
-    const errMsg = err instanceof Error ? err.message : String(err);
+    const errMsg = redactSecretsPreservingLayout(err instanceof Error ? err.message : String(err));
     console.warn(`⚠️  Gemini API error (${errMsg}). Otomatis dialihkan ke Layer 1 AST Engine.`);
     return {
       mode: 'zero-api',
       isLiveApi: false,
+      layer2Status: 'Skipped: Gemini API Error Fallback',
       parsedReport: l1Result,
     };
   }
@@ -341,8 +393,11 @@ export async function runAction() {
       maintainability: score.maintainability,
       overall: score.totalScore,
       passed,
-      fatalFlaws: !passed && report.temuanUtama.description ? [report.temuanUtama.description] : [],
-      defenseInDepth: report.residualNotes || [],
+      fatalFlaws:
+        !passed && report.temuanUtama.description
+          ? [redactSecretsPreservingLayout(report.temuanUtama.description)]
+          : [],
+      defenseInDepth: (report.residualNotes || []).map((n) => redactSecretsPreservingLayout(n)),
       inlineFindings: report.inlineFindings,
     });
 
@@ -354,7 +409,9 @@ export async function runAction() {
     if (!passed) {
       console.error(`   ❌ GAGAL: ${filePath} mendapatkan skor ${score.totalScore}/100 (Batas: ${minScore})`);
       if (report.temuanUtama && report.temuanUtama.description) {
-        console.error(`   💣 Temuan Fatal (${report.temuanUtama.line}): ${report.temuanUtama.description}`);
+        console.error(
+          `   💣 Temuan Fatal (${report.temuanUtama.line}): ${redactSecretsPreservingLayout(report.temuanUtama.description)}`
+        );
       }
       hasFatalFailure = true;
     } else {
