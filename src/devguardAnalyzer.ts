@@ -294,7 +294,7 @@ function calculateTotal(items, discountCode) {
 };
 
 // =============================================================================
-// LAYER 1: DETERMINISTIC STATIC PATTERN & AST HEURISTIC ANALYZER
+// LAYER 1: DETERMINISTIC SINGLE-PASS LEXICAL & HEURISTIC ENGINE
 // Evaluates the exact live code string line-by-line on every single audit run.
 // =============================================================================
 
@@ -1297,7 +1297,7 @@ export function analyzeCodeDeterministically(
   let temuanUtamaDesc = '';
   if (!hasSevereVuln && verifiedMitigations.length > 0) {
     temuanUtamaDesc =
-      `Mitigasi utama terverifikasi pada AST/kode aktif: ${verifiedMitigations.join(' ')} ` +
+      `Mitigasi utama terverifikasi pada Single-Pass Lexical & Heuristic Engine / kode aktif: ${verifiedMitigations.join(' ')} ` +
       (findings.length > 0
         ? `Namun sesuai audit zero-leniency, skor disesuaikan (${totalScore}/100) karena catatan arsitektural tingkat produksi: ${findings.map((f) => f.shortReason).join('; ')}.`
         : '');

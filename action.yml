@@ -1,5 +1,5 @@
 name: 'DevGuard Adversarial Code Auditor'
-description: 'Zero-Leniency Hybrid Code Review & Security Gatekeeper powered by Gemini 3.8 Flash'
+description: 'Zero-Leniency Hybrid Code Review & Security Gatekeeper (Single-Pass Lexical & Heuristic Engine + Gemini 3.8 Flash)'
 author: 'Oky Kurnia Wicaksono'
 
 inputs:
@@ -33,12 +33,7 @@ runs:
     - name: Set up Node.js Environment
       uses: actions/setup-node@v4
       with:
-        node-version: '20'
-
-    - name: Install DevGuard Dependencies
-      shell: bash
-      run: |
-        npm --prefix ${{ github.action_path }} install --omit=dev
+        node-version: '22'
 
     - name: Run DevGuard CLI Audit Gate
       id: audit_gate
@@ -49,7 +44,15 @@ runs:
         DEVGUARD_TARGET: ${{ inputs.target_files }}
         GITHUB_TOKEN: ${{ github.token }}
       run: |
-        npx --prefix ${{ github.action_path }} tsx ${{ github.action_path }}/src/cli.ts
+        TARGET_ARGS=()
+        if [ -n "${DEVGUARD_TARGET:-}" ] && [ "${DEVGUARD_TARGET}" != "modified" ] && [ "${DEVGUARD_TARGET}" != "all" ]; then
+          TARGET_ARGS+=("${DEVGUARD_TARGET}")
+        fi
+        if node --experimental-strip-types -e "" >/dev/null 2>&1; then
+          node --experimental-strip-types "${{ github.action_path }}/src/cli.ts" "${TARGET_ARGS[@]}"
+        else
+          npx --yes tsx "${{ github.action_path }}/src/cli.ts" "${TARGET_ARGS[@]}"
+        fi
 
 branding:
   icon: 'shield'

@@ -628,7 +628,7 @@ export default function App() {
                 <div className="bg-[#0E1424] border border-slate-800 rounded-xl p-12 flex flex-col items-center justify-center min-h-[460px] text-center">
                   <RefreshCw className="w-8 h-8 text-emerald-400 animate-spin mb-4" />
                   <h3 className="text-base font-semibold text-white mb-1">
-                    Menganalisis Kode Secara Adversarial (Layer 1 AST + Layer 2 Gemini)...
+                    Menganalisis Kode Secara Adversarial (Layer 1 Single-Pass Lexical & Heuristic Engine + Layer 2 Gemini)...
                   </h3>
                   <p className="text-xs text-slate-400 max-w-sm">
                     Memeriksa sink berbahaya, kondisi balapan TOCTOU, keamanan tipe, serta menghitung penalti rubrik zero-leniency.
@@ -866,7 +866,7 @@ export default function App() {
                           {auditReport.verifiedMitigations && auditReport.verifiedMitigations.length > 0 && (
                             <div className="bg-[#070B13] border border-emerald-500/25 rounded-lg p-3">
                               <span className="text-[11px] font-semibold text-emerald-300 block mb-1.5">
-                                1. Mitigasi Kode & AST Terverifikasi:
+                                1. Mitigasi Kode & Single-Pass Lexical & Heuristic Engine Terverifikasi:
                               </span>
                               <ul className="space-y-1.5">
                                 {auditReport.verifiedMitigations.map((m, idx) => (

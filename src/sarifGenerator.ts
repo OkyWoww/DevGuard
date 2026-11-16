@@ -83,7 +83,7 @@ export function generateSarifReport(
       text: 'Critical security vulnerability or exploitable logic flaw detected by DevGuard.'
     },
     fullDescription: {
-      text: 'DevGuard Hybrid Auditor identified a deterministic AST sink, TOCTOU race condition, type bypass, or critical security risk that violates the quality gate.'
+      text: 'DevGuard Hybrid Auditor identified a deterministic Single-Pass Lexical & Heuristic sink, TOCTOU race condition, type bypass, or critical security risk that violates the quality gate.'
     },
     defaultConfiguration: { level: 'error' },
     properties: {
@@ -298,7 +298,7 @@ export function generateSarifReport(
           driver: {
             name: 'DevGuard Adversarial Code Auditor',
             informationUri: 'https://github.com/OkyWoww/DevGuard',
-            version: '1.2.0',
+            version: '1.2.1',
             rules: Array.from(rulesMap.values())
           }
         },

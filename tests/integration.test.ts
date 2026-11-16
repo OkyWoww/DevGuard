@@ -2201,6 +2201,29 @@ test('30. SARIF output includes exact security-severity ratings (DG001-DG008), P
         }
       }
     }
+
+    const stripTypesSarif = path.join(tempDir, 'strip-types.sarif');
+    const stripRun = spawnSync(
+      process.execPath,
+      ['--experimental-strip-types', path.join(REPO_ROOT, 'src', 'cli.ts'), path.join(REPO_ROOT, 'src', 'devguardAnalyzer.ts')],
+      {
+        cwd: REPO_ROOT,
+        encoding: 'utf-8',
+        env: {
+          ...process.env,
+          GEMINI_API_KEY: '',
+          GITHUB_ACTIONS: '',
+          GITHUB_EVENT_PATH: '',
+          DEVGUARD_SARIF_OUTPUT: stripTypesSarif,
+        },
+      }
+    );
+    assert.equal(
+      stripRun.status,
+      0,
+      `Expected node --experimental-strip-types src/cli.ts src/devguardAnalyzer.ts to exit 0, stderr: ${stripRun.stderr}`
+    );
+    assert.ok(fs.existsSync(stripTypesSarif), 'Expected SARIF output from direct --experimental-strip-types run');
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }

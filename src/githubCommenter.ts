@@ -45,7 +45,7 @@ export function formatLayer2StatusLabel(status?: string, mode?: 'HYBRID' | 'OFFL
     if (status.startsWith('Layer 2 (Gemini):')) return status;
     if (status === 'Verified' || status === 'Executed: Redacted') return 'Layer 2 (Gemini): Verified';
     if (status === 'Skipped: Offline') return 'Layer 2 (Gemini): Skipped [Offline]';
-    if (status === 'Skipped: No API Key' || status === 'Skipped: Offline AST Only') {
+    if (status === 'Skipped: No API Key' || status.startsWith('Skipped: Offline')) {
       return 'Layer 2 (Gemini): Skipped [No API Key]';
     }
     if (status === 'Skipped: Fork PR') return 'Layer 2 (Gemini): Skipped [Fork PR]';
@@ -146,8 +146,8 @@ export async function postPullRequestComment(
   const allPassed = summaries.every((summary) => summary.passed);
   const badgeStatus = allPassed ? '✅ PASSED (READY TO MERGE)' : '🚫 REJECTED (SECURITY GATE FAILED)';
   const engineLabel = mode === 'HYBRID'
-    ? 'Hybrid Dual-Layer (Deterministic AST + Gemini 3.8 Flash)'
-    : '100% Offline Deterministic AST Engine';
+    ? 'Hybrid Dual-Layer (Single-Pass Lexical & Heuristic Engine + Gemini 3.8 Flash)'
+    : '100% Offline Single-Pass Lexical & Heuristic Engine';
 
   const headerStatuses = Array.from(
     new Set(summaries.map((s) => formatLayer2StatusLabel(s.layer2Status, mode)))

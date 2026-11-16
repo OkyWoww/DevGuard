@@ -2,20 +2,56 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { execFileSync, execSync } from 'node:child_process';
-import { builtinModules } from 'node:module';
-import {
+import * as nodeModule from 'node:module';
+import { fileURLToPath } from 'node:url';
+import type { ParsedDevGuardReport } from './devguardAnalyzer.js';
+import type { FileAuditSummary, PrEnvironmentInfo } from './githubCommenter.js';
+
+const { builtinModules } = nodeModule;
+
+// Enable direct zero-compile execution (`node --experimental-strip-types src/cli.ts`)
+// by resolving relative `./*.js` specifiers to sibling `./*.ts` files when running from source.
+const registerHooksFn = (
+  nodeModule as unknown as {
+    registerHooks?: (hooks: {
+      resolve?: (
+        specifier: string,
+        context: { parentURL?: string },
+        nextResolve: (spec: string, ctx: { parentURL?: string }) => unknown
+      ) => unknown;
+    }) => void;
+  }
+).registerHooks;
+
+if (typeof registerHooksFn === 'function') {
+  registerHooksFn({
+    resolve(specifier, context, nextResolve) {
+      try {
+        return nextResolve(specifier, context);
+      } catch (err) {
+        if (specifier.startsWith('.') && specifier.endsWith('.js') && context.parentURL) {
+          const tsUrl = new URL(specifier.slice(0, -3) + '.ts', context.parentURL);
+          if (fs.existsSync(fileURLToPath(tsUrl))) {
+            return nextResolve(tsUrl.href, context);
+          }
+        }
+        throw err;
+      }
+    },
+  });
+}
+
+const {
   analyzeCodeDeterministically,
   prepareRedactedCodeForLlm,
   redactSecretsPreservingLayout,
-  ParsedDevGuardReport,
-} from './devguardAnalyzer.js';
-import {
+} = await import('./devguardAnalyzer.js');
+const {
   detectPrEnvironment,
   postInlineReviewComments,
   postPullRequestComment,
-} from './githubCommenter.js';
-import type { FileAuditSummary, PrEnvironmentInfo } from './githubCommenter.js';
-import { generateSarifReport } from './sarifGenerator.js';
+} = await import('./githubCommenter.js');
+const { generateSarifReport } = await import('./sarifGenerator.js');
 
 function loadDotEnvIfPresent(): void {
   try {
@@ -374,7 +410,7 @@ export async function evaluateCodeHybrid(
       'Evaluasi kode di dalam <code_to_review> secara jujur, ketat, dan tanpa kompromi.',
       'DILARANG memberikan skor buta 100/100.',
       '',
-      `Hasil deteksi Layer 1 AST Analyzer (wajib dihormati sebagai batas atas skor):`,
+      `Hasil deteksi Layer 1 Single-Pass Lexical & Heuristic Engine (wajib dihormati sebagai batas atas skor):`,
       `- Security=${l1Result.skor.security}, Correctness=${l1Result.skor.correctness}, Maintainability=${l1Result.skor.maintainability}`,
       `- Baris Temuan: ${l1Result.temuanUtama.line}`,
       `- Detail: ${redactSecretsPreservingLayout(l1Result.temuanUtama.description)}`,
@@ -498,7 +534,7 @@ export async function evaluateCodeHybrid(
     };
   } catch (err: unknown) {
     const errMsg = redactSecretsPreservingLayout(err instanceof Error ? err.message : String(err));
-    console.warn(`⚠️  Gemini API error (${errMsg}). Otomatis dialihkan ke Layer 1 AST Engine.`);
+    console.warn(`⚠️  Gemini API error (${errMsg}). Otomatis dialihkan ke Layer 1 Single-Pass Lexical & Heuristic Engine.`);
     return {
       mode: 'zero-api',
       isLiveApi: false,
@@ -551,9 +587,9 @@ export async function runAction() {
   if (prEnv.isFork) {
     console.log('Mode Eksekusi             : 🛡️  Zero-API (Fork PR — Layer 2 Gemini dinonaktifkan)');
   } else if (engineMode === 'OFFLINE_AST') {
-    console.log('Mode Eksekusi             : 🛡️  Zero-API (100% Offline AST Engine - Gratis)');
+    console.log('Mode Eksekusi             : 🛡️  Zero-API (100% Offline Single-Pass Lexical & Heuristic Engine - Gratis)');
   } else {
-    console.log('Mode Eksekusi             : 🤖 Hybrid Dual-Layer (AST + Gemini 3.8 Flash)');
+    console.log('Mode Eksekusi             : 🤖 Hybrid Dual-Layer (Lexical & Heuristic + Gemini 3.8 Flash)');
   }
 
   // 1. Dapatkan daftar berkas target
