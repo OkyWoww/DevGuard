@@ -515,8 +515,15 @@ test('6. SPOF graceful degradation (GitHub API + Gemini LLM fallback) and action
     process.env.GITHUB_TOKEN = 'test-token-value';
     process.env.GITHUB_REPOSITORY = 'OkyWoww/DevGuard';
     process.env.GITHUB_EVENT_PATH = eventPath;
+        const tmpServer = http.createServer();
+    await new Promise<void>((resolve) => tmpServer.listen(0, '127.0.0.1', resolve));
+    const tmpAddress = tmpServer.address();
+    assert.ok(tmpAddress && typeof tmpAddress === 'object');
+    const closedPort = tmpAddress.port;
+    await new Promise<void>((r) => tmpServer.close(() => r()));
+
     // Closed ephemeral port / unreachable endpoint
-    process.env.GITHUB_API_URL = 'http://127.0.0.1:1';
+    process.env.GITHUB_API_URL = `http://127.0.0.1:${closedPort}`;
 
     await assert.doesNotReject(async () => {
       await postPullRequestComment(
