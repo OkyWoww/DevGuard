@@ -1470,6 +1470,7 @@ test('23. loadVerifiedAllowlist reads base branch strictly, validates entries, d
 
   // Push event reads from beforeSha and fails safe on all-zeros or unreadable ref
   const pushValid = loadVerifiedAllowlist({
+    baseRef: '',
     eventName: 'push',
     beforeSha: 'a1b2c3d4',
     isCi: true,
@@ -1483,6 +1484,7 @@ test('23. loadVerifiedAllowlist reads base branch strictly, validates entries, d
   assert.equal(matchAllowlistForFile(pushValid, 'src/legacy/sub/old.ts').length, 1);
 
   const pushZeroSha = loadVerifiedAllowlist({
+    baseRef: '',
     eventName: 'push',
     beforeSha: '0000000000000000000000000000000000000000',
     isCi: true,
@@ -1495,6 +1497,7 @@ test('23. loadVerifiedAllowlist reads base branch strictly, validates entries, d
   assert.equal(pushZeroSha.rulesByPath.size, 0);
 
   const pushUnreadable = loadVerifiedAllowlist({
+    baseRef: '',
     eventName: 'push',
     beforeSha: 'a1b2c3d4',
     isCi: true,

@@ -39,6 +39,25 @@ if (typeof registerHooksFn === 'function') {
       }
     },
   });
+} else if (typeof (nodeModule as { register?: unknown }).register === 'function') {
+  const fallbackLoader = [
+    "import * as fs from 'node:fs';",
+    "import { fileURLToPath } from 'node:url';",
+    'export async function resolve(specifier, context, nextResolve) {',
+    '  try {',
+    '    return await nextResolve(specifier, context);',
+    '  } catch (err) {',
+    "    if (specifier.startsWith('.') && specifier.endsWith('.js') && context.parentURL) {",
+    "      const tsUrl = new URL(specifier.slice(0, -3) + '.ts', context.parentURL);",
+    '      if (fs.existsSync(fileURLToPath(tsUrl))) return nextResolve(tsUrl.href, context);',
+    '    }',
+    '    throw err;',
+    '  }',
+    '}',
+  ].join('\n');
+  (nodeModule as { register: (spec: string) => void }).register(
+    'data:text/javascript,' + encodeURIComponent(fallbackLoader)
+  );
 }
 
 const {
@@ -190,7 +209,7 @@ export function loadVerifiedAllowlist(options?: LoadAllowlistOptions): VerifiedA
   let sourceMode: VerifiedAllowlistResult['sourceMode'] = 'empty';
   let allowlistModifiedInPr = false;
 
-  if (baseRef) {
+  if (baseRef && eventName !== 'push') {
     sourceMode = 'base-pr';
     activeRaw = readBase(`origin/${baseRef}:.devguard.json`);
     if (workingRaw !== null && (activeRaw === null || workingRaw.trim() !== activeRaw.trim())) {
