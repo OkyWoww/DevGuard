@@ -6,6 +6,61 @@ import {
   type ParsedSuppression,
 } from './devguardAnalyzer.js';
 
+export interface PrEnvironmentInfo {
+  isPullRequest: boolean;
+  isFork: boolean;
+  prNumber?: number;
+}
+
+export function detectPrEnvironment(eventPayload: unknown): PrEnvironmentInfo {
+  if (!eventPayload || typeof eventPayload !== 'object') {
+    return { isPullRequest: false, isFork: false };
+  }
+  const payload = eventPayload as {
+    pull_request?: {
+      number?: number;
+      head?: { repo?: { full_name?: string } | null } | null;
+    } | null;
+    repository?: { full_name?: string } | null;
+  };
+
+  const pr = payload.pull_request;
+  if (!pr || typeof pr !== 'object') {
+    return { isPullRequest: false, isFork: false };
+  }
+
+  const headFullName = pr.head?.repo?.full_name;
+  const baseFullName = payload.repository?.full_name;
+  const isFork = !headFullName || !baseFullName || headFullName !== baseFullName;
+
+  return {
+    isPullRequest: true,
+    isFork,
+    prNumber: typeof pr.number === 'number' ? pr.number : undefined,
+  };
+}
+
+export function formatLayer2StatusLabel(status?: string, mode?: 'HYBRID' | 'OFFLINE_AST'): string {
+  if (status) {
+    if (status.startsWith('Layer 2 (Gemini):')) return status;
+    if (status === 'Verified' || status === 'Executed: Redacted') return 'Layer 2 (Gemini): Verified';
+    if (status === 'Skipped: Offline') return 'Layer 2 (Gemini): Skipped [Offline]';
+    if (status === 'Skipped: No API Key' || status === 'Skipped: Offline AST Only') {
+      return 'Layer 2 (Gemini): Skipped [No API Key]';
+    }
+    if (status === 'Skipped: Fork PR') return 'Layer 2 (Gemini): Skipped [Fork PR]';
+    if (status === 'Skipped: Quota/Error Fallback' || status === 'Skipped: Gemini API Error Fallback') {
+      return 'Layer 2 (Gemini): Skipped [Quota/Error Fallback]';
+    }
+    if (status === 'Skipped: Redaction Abort') return 'Layer 2 (Gemini): Skipped [Redaction Abort]';
+    if (status.startsWith('Skipped [')) return `Layer 2 (Gemini): ${status}`;
+    if (status.startsWith('Skipped: ')) {
+      return `Layer 2 (Gemini): Skipped [${status.slice('Skipped: '.length)}]`;
+    }
+  }
+  return mode === 'HYBRID' ? 'Layer 2 (Gemini): Verified' : 'Layer 2 (Gemini): Skipped [No API Key]';
+}
+
 export interface FileAuditSummary {
   filePath: string;
   security: number;
@@ -19,6 +74,7 @@ export interface FileAuditSummary {
   suppressions?: ParsedSuppression[];
   invalidAllowlistEntries?: string[];
   allowlistModifiedInPr?: boolean;
+  layer2Status?: string;
 }
 
 export const COMMENT_SIGNATURE = '<!-- devguard-adversarial-audit-sticky-comment -->';
@@ -49,20 +105,19 @@ function resolvePrContext(): PrContext | null {
     return null;
   }
 
-  let prNumber: number | undefined;
+  let envInfo: PrEnvironmentInfo = { isPullRequest: false, isFork: false };
   try {
-    const eventData = JSON.parse(fs.readFileSync(eventPath, 'utf-8')) as {
-      pull_request?: { number?: number };
-    };
-    prNumber = eventData.pull_request?.number;
+    const eventData = JSON.parse(fs.readFileSync(eventPath, 'utf-8')) as unknown;
+    envInfo = detectPrEnvironment(eventData);
   } catch (err) {
     console.warn('⚠️ Gagal membaca payload event GitHub:', err);
     return null;
   }
 
-  if (!prNumber) {
+  if (!envInfo.isPullRequest || !envInfo.prNumber) {
     return null;
   }
+  const prNumber = envInfo.prNumber;
 
   const apiBase = (process.env.GITHUB_API_URL || 'https://api.github.com').replace(/\/+$/, '');
   const headers: Record<string, string> = {
@@ -94,9 +149,16 @@ export async function postPullRequestComment(
     ? 'Hybrid Dual-Layer (Deterministic AST + Gemini 3.8 Flash)'
     : '100% Offline Deterministic AST Engine';
 
+  const headerStatuses = Array.from(
+    new Set(summaries.map((s) => formatLayer2StatusLabel(s.layer2Status, mode)))
+  );
+  const headerLayer2Status =
+    headerStatuses.length > 0 ? headerStatuses.join(' / ') : formatLayer2StatusLabel(undefined, mode);
+
   const tableRows = summaries.map((summary) => {
     const icon = summary.passed ? '🟢' : '🔴';
-    return `| ${icon} \`${escapeTableCell(summary.filePath)}\` | **${summary.overall}/100** | ${summary.security} | ${summary.correctness} | ${summary.maintainability} |`;
+    const fileL2 = formatLayer2StatusLabel(summary.layer2Status, mode);
+    return `| ${icon} \`${escapeTableCell(summary.filePath)}\` | **${summary.overall}/100** | ${summary.security} | ${summary.correctness} | ${summary.maintainability} | \`${escapeTableCell(fileL2)}\` |`;
   }).join('\n');
 
   let detailsSection = '';
@@ -152,14 +214,14 @@ export async function postPullRequestComment(
   const markdownBody = `${COMMENT_SIGNATURE}
 ## 🛡️ DevGuard Adversarial Security Gatekeeper
 
-| Status Gerbang | Ambang Batas Skor | Mode Mesin |
-| :--- | :--- | :--- |
-| **${badgeStatus}** | \`${minScore}/100\` | \`${engineLabel}\` |
+| Status Gerbang | Ambang Batas Skor | Mode Mesin | Status Analisis |
+| :--- | :--- | :--- | :--- |
+| **${badgeStatus}** | \`${minScore}/100\` | \`${engineLabel}\` | **${headerLayer2Status}** |
 
 ### 📊 Skor Evaluasi Berkas
-| Berkas | Skor Akhir | Security | Correctness | Maintainability |
-| :--- | :---: | :---: | :---: | :---: |
-${tableRows || '| Tidak ada berkas yang diaudit | — | — | — | — |'}
+| Berkas | Skor Akhir | Security | Correctness | Maintainability | Layer 2 |
+| :--- | :---: | :---: | :---: | :---: | :--- |
+${tableRows || '| Tidak ada berkas yang diaudit | — | — | — | — | — |'}
 ${suppressionSection}${detailsSection}
 
 ---
@@ -175,6 +237,10 @@ ${suppressionSection}${detailsSection}
         headers,
         signal: AbortSignal.timeout(15_000),
       });
+      if (listResp.status === 403) {
+        console.warn('⚠️ GitHub PR Comments API mengembalikan HTTP 403 (token read-only / fork PR); sticky comment dilewati secara aman.');
+        return;
+      }
       if (!listResp.ok) {
         console.warn(`⚠️ Gagal membaca komentar PR (HTTP ${listResp.status}); komentar laporan tidak dibuat untuk menghindari duplikasi.`);
         return;
@@ -193,7 +259,9 @@ ${suppressionSection}${detailsSection}
         body: JSON.stringify({ body: markdownBody }),
         signal: AbortSignal.timeout(15_000),
       });
-      if (updateResp.ok) {
+      if (updateResp.status === 403) {
+        console.warn('⚠️ GitHub PR Comments API mengembalikan HTTP 403 saat PATCH (token read-only / fork PR); dilewati secara fail-open.');
+      } else if (updateResp.ok) {
         console.log(`💬 Berhasil memperbarui komentar laporan DevGuard pada PR #${prNumber}.`);
       } else {
         console.warn(`⚠️ Gagal memperbarui komentar PR (HTTP ${updateResp.status}).`);
@@ -208,7 +276,9 @@ ${suppressionSection}${detailsSection}
       signal: AbortSignal.timeout(15_000),
     });
 
-    if (createResp.ok) {
+    if (createResp.status === 403) {
+      console.warn('⚠️ GitHub PR Comments API mengembalikan HTTP 403 saat POST (token read-only / fork PR); dilewati secara fail-open.');
+    } else if (createResp.ok) {
       console.log(`💬 Berhasil mengirim komentar laporan DevGuard ke PR #${prNumber}.`);
     } else {
       console.warn(`⚠️ Gagal mengirim komentar PR (HTTP ${createResp.status}): Pastikan workflow memiliki izin 'pull-requests: write'.`);
@@ -253,6 +323,10 @@ export async function postInlineReviewComments(summaries: FileAuditSummary[]): P
         headers,
         signal: AbortSignal.timeout(15_000),
       });
+      if (listResp.status === 403) {
+        console.warn('⚠️ GitHub PR Review API mengembalikan HTTP 403 (token read-only / fork PR); inline review dilewati secara fail-open.');
+        return;
+      }
       if (!listResp.ok) {
         console.warn(`⚠️ Gagal membaca komentar review PR (HTTP ${listResp.status}); melewati inline review untuk menghindari spam.`);
         return;
@@ -301,6 +375,11 @@ export async function postInlineReviewComments(summaries: FileAuditSummary[]): P
       }),
       signal: AbortSignal.timeout(15_000),
     });
+
+    if (reviewResp.status === 403) {
+      console.warn('⚠️ GitHub PR Review API mengembalikan HTTP 403 (token read-only / fork PR); inline review dilewati secara fail-open.');
+      return;
+    }
 
     if (reviewResp.status === 422) {
       console.warn(`⚠️ GitHub PR Review API mengembalikan HTTP 422 (baris di luar diff hunk); inline comment dilewati secara aman.`);

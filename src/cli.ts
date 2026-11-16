@@ -3,7 +3,6 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { execFileSync, execSync } from 'node:child_process';
 import { builtinModules } from 'node:module';
-import { GoogleGenAI, Type } from '@google/genai';
 import {
   analyzeCodeDeterministically,
   prepareRedactedCodeForLlm,
@@ -11,10 +10,11 @@ import {
   ParsedDevGuardReport,
 } from './devguardAnalyzer.js';
 import {
+  detectPrEnvironment,
   postInlineReviewComments,
   postPullRequestComment,
 } from './githubCommenter.js';
-import type { FileAuditSummary } from './githubCommenter.js';
+import type { FileAuditSummary, PrEnvironmentInfo } from './githubCommenter.js';
 import { generateSarifReport } from './sarifGenerator.js';
 
 function loadDotEnvIfPresent(): void {
@@ -292,12 +292,26 @@ function resolveNearestPackageInfo(filePath: string): {
   }
 }
 
+function resolvePrEnvironmentFromEnv(): PrEnvironmentInfo {
+  const eventPath = process.env.GITHUB_EVENT_PATH;
+  if (!eventPath || !fs.existsSync(eventPath)) {
+    return { isPullRequest: false, isFork: false };
+  }
+  try {
+    const raw = fs.readFileSync(eventPath, 'utf-8');
+    return detectPrEnvironment(JSON.parse(raw));
+  } catch {
+    return { isPullRequest: false, isFork: false };
+  }
+}
+
 export async function evaluateCodeHybrid(
   code: string,
   apiKey?: string,
   precomputedL1?: ParsedDevGuardReport,
   filePath?: string,
-  externalAllowlist?: ReadonlyArray<AllowlistRuleEntry>
+  externalAllowlist?: ReadonlyArray<AllowlistRuleEntry>,
+  isFork?: boolean
 ): Promise<CliAuditResult> {
   const pkgInfo = filePath ? resolveNearestPackageInfo(filePath) : {};
   const l1Result = precomputedL1 || analyzeCodeDeterministically(code, {
@@ -308,13 +322,32 @@ export async function evaluateCodeHybrid(
     externalAllowlist,
   });
 
-  const activeKey = apiKey || process.env.GEMINI_API_KEY;
-
-  if (!activeKey || activeKey === 'MY_GEMINI_API_KEY' || !activeKey.startsWith('AIzaSy')) {
+  const effectiveIsFork = isFork ?? resolvePrEnvironmentFromEnv().isFork;
+  if (effectiveIsFork) {
     return {
       mode: 'zero-api',
       isLiveApi: false,
-      layer2Status: 'Skipped: Offline AST Only',
+      layer2Status: 'Skipped: Fork PR',
+      parsedReport: l1Result,
+    };
+  }
+
+  const activeKey = apiKey !== undefined ? apiKey : process.env.GEMINI_API_KEY;
+
+  if (!activeKey) {
+    return {
+      mode: 'zero-api',
+      isLiveApi: false,
+      layer2Status: 'Skipped: No API Key',
+      parsedReport: l1Result,
+    };
+  }
+
+  if (activeKey === 'MY_GEMINI_API_KEY' || !activeKey.startsWith('AIzaSy')) {
+    return {
+      mode: 'zero-api',
+      isLiveApi: false,
+      layer2Status: 'Skipped: Offline',
       parsedReport: l1Result,
     };
   }
@@ -336,7 +369,6 @@ export async function evaluateCodeHybrid(
   }
 
   try {
-    const ai = new GoogleGenAI({ apiKey: activeKey });
     const prompt = [
       'Anda adalah Principal AppSec Engineer & Zero-Leniency Adversarial Code Auditor.',
       'Evaluasi kode di dalam <code_to_review> secara jujur, ketat, dan tanpa kompromi.',
@@ -352,60 +384,73 @@ export async function evaluateCodeHybrid(
       '</code_to_review>',
     ].join('\n');
 
-    const timeoutPromise = new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error('Gemini API timeout')), 6500)
-    );
-
-    const response = (await Promise.race([
-      ai.models.generateContent({
-        model: 'gemini-3.8-flash',
-        contents: prompt,
-        config: {
+    const model = 'gemini-3.8-flash';
+    const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(activeKey)}`;
+    const apiResponse = await fetch(geminiUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: AbortSignal.timeout(6500),
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: {
           temperature: 0.1,
           responseMimeType: 'application/json',
           responseSchema: {
-            type: Type.OBJECT,
+            type: 'OBJECT',
             properties: {
-              apresiasi: { type: Type.STRING },
+              apresiasi: { type: 'STRING' },
               skor: {
-                type: Type.OBJECT,
+                type: 'OBJECT',
                 properties: {
-                  security: { type: Type.INTEGER },
-                  securityDeductions: { type: Type.ARRAY, items: { type: Type.STRING } },
-                  correctness: { type: Type.INTEGER },
-                  correctnessDeductions: { type: Type.ARRAY, items: { type: Type.STRING } },
-                  maintainability: { type: Type.INTEGER },
-                  maintainabilityDeductions: { type: Type.ARRAY, items: { type: Type.STRING } },
+                  security: { type: 'INTEGER' },
+                  securityDeductions: { type: 'ARRAY', items: { type: 'STRING' } },
+                  correctness: { type: 'INTEGER' },
+                  correctnessDeductions: { type: 'ARRAY', items: { type: 'STRING' } },
+                  maintainability: { type: 'INTEGER' },
+                  maintainabilityDeductions: { type: 'ARRAY', items: { type: 'STRING' } },
                 },
                 required: ['security', 'correctness', 'maintainability'],
               },
               temuanUtama: {
-                type: Type.OBJECT,
+                type: 'OBJECT',
                 properties: {
-                  line: { type: Type.STRING },
-                  description: { type: Type.STRING },
+                  line: { type: 'STRING' },
+                  description: { type: 'STRING' },
                 },
                 required: ['line', 'description'],
               },
-              temuanLain: { type: Type.ARRAY, items: { type: Type.STRING } },
+              temuanLain: { type: 'ARRAY', items: { type: 'STRING' } },
               analogi: {
-                type: Type.OBJECT,
+                type: 'OBJECT',
                 properties: {
-                  story: { type: Type.STRING },
-                  technicalTerm: { type: Type.STRING },
+                  story: { type: 'STRING' },
+                  technicalTerm: { type: 'STRING' },
                 },
                 required: ['story', 'technicalTerm'],
               },
-              perbaikanSummary: { type: Type.STRING },
+              perbaikanSummary: { type: 'STRING' },
             },
             required: ['apresiasi', 'skor', 'temuanUtama', 'analogi'],
           },
         },
       }),
-      timeoutPromise,
-    ])) as { text?: string };
+    });
 
-    const rawResponseText = redactSecretsPreservingLayout((response.text || '').trim());
+    if (!apiResponse.ok) {
+      const errBody = await apiResponse.text();
+      throw new Error(`Gemini HTTP ${apiResponse.status}: ${errBody}`);
+    }
+
+    const payload = (await apiResponse.json()) as {
+      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+      text?: string;
+    };
+    const candidateText =
+      payload.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('') ??
+      payload.text ??
+      '';
+
+    const rawResponseText = redactSecretsPreservingLayout(candidateText.trim());
     const geminiData = JSON.parse(rawResponseText);
 
     // Ceilings enforced by Layer 1 zero-leniency rubric
@@ -420,7 +465,7 @@ export async function evaluateCodeHybrid(
     return {
       mode: 'hybrid',
       isLiveApi: true,
-      layer2Status: 'Executed: Redacted',
+      layer2Status: 'Verified',
       parsedReport: {
         ...l1Result,
         apresiasi: geminiData.apresiasi ? redactSecretsPreservingLayout(String(geminiData.apresiasi)) : l1Result.apresiasi,
@@ -457,7 +502,7 @@ export async function evaluateCodeHybrid(
     return {
       mode: 'zero-api',
       isLiveApi: false,
-      layer2Status: 'Skipped: Gemini API Error Fallback',
+      layer2Status: 'Skipped: Quota/Error Fallback',
       parsedReport: l1Result,
     };
   }
@@ -491,16 +536,21 @@ export async function runAction() {
   const apiKey = process.env.GEMINI_API_KEY;
   const minScore = parseInt(process.env.DEVGUARD_MIN_SCORE || '85', 10);
   const targetPattern = process.env.DEVGUARD_TARGET || 'modified';
+  const prEnv = resolvePrEnvironmentFromEnv();
   const explicitFileArgs = resolveCliFileArgs(process.argv.slice(2));
   const engineMode: 'HYBRID' | 'OFFLINE_AST' =
-    apiKey && apiKey !== 'MY_GEMINI_API_KEY' && apiKey.startsWith('AIzaSy') ? 'HYBRID' : 'OFFLINE_AST';
+    !prEnv.isFork && apiKey && apiKey !== 'MY_GEMINI_API_KEY' && apiKey.startsWith('AIzaSy')
+      ? 'HYBRID'
+      : 'OFFLINE_AST';
 
   console.log('======================================================================');
   console.log('           🛡️  DEVGUARD ADVERSARIAL CODE AUDITOR (CI GATE)            ');
   console.log('======================================================================');
   console.log(`Ambang Batas Kelulusan CI : Minimal ${minScore}/100`);
 
-  if (engineMode === 'OFFLINE_AST') {
+  if (prEnv.isFork) {
+    console.log('Mode Eksekusi             : 🛡️  Zero-API (Fork PR — Layer 2 Gemini dinonaktifkan)');
+  } else if (engineMode === 'OFFLINE_AST') {
     console.log('Mode Eksekusi             : 🛡️  Zero-API (100% Offline AST Engine - Gratis)');
   } else {
     console.log('Mode Eksekusi             : 🤖 Hybrid Dual-Layer (AST + Gemini 3.8 Flash)');
@@ -593,7 +643,14 @@ export async function runAction() {
 
     console.log(`\n🔍 Menganalisis: ${filePath}`);
     const fileExternalAllowlist = matchAllowlistForFile(verifiedAllowlist, filePath);
-    const result = await evaluateCodeHybrid(codeContent, apiKey, undefined, filePath, fileExternalAllowlist);
+    const result = await evaluateCodeHybrid(
+      codeContent,
+      apiKey,
+      undefined,
+      filePath,
+      fileExternalAllowlist,
+      prEnv.isFork
+    );
     const report = result.parsedReport;
     const score = report.skor;
     const hasInlineErrors = report.inlineFindings?.some((f) => f.severity === 'error') ?? false;
@@ -613,6 +670,7 @@ export async function runAction() {
           : [],
       defenseInDepth: (report.residualNotes || []).map((n) => redactSecretsPreservingLayout(n)),
       inlineFindings: report.inlineFindings,
+      layer2Status: result.layer2Status,
       suppressions: report.suppressions,
       invalidAllowlistEntries:
         verifiedAllowlist.invalidAllowlistEntries.length > 0 ? verifiedAllowlist.invalidAllowlistEntries : undefined,
@@ -646,8 +704,16 @@ export async function runAction() {
   writeGitHubOutput(outputFile, 'overall_score', avgScore);
   writeGitHubOutput(outputFile, 'audit_status', hasFatalFailure ? 'FAIL' : 'PASS');
 
+  const effectiveEngineMode: 'HYBRID' | 'OFFLINE_AST' =
+    prEnv.isFork || engineMode === 'OFFLINE_AST'
+      ? 'OFFLINE_AST'
+      : summaries.some((s) => s.layer2Status === 'Verified')
+        ? 'HYBRID'
+        : engineMode;
+
   // Comment & post inline review suggestions before process.exit so reports are posted on both pass and failure.
-  await postPullRequestComment(summaries, minScore, engineMode);
+  // Fail-open commenting: HTTP errors inside githubCommenter never override the DevGuard exit code.
+  await postPullRequestComment(summaries, minScore, effectiveEngineMode);
   await postInlineReviewComments(summaries);
 
   // Generate SARIF v2.1.0 report before process.exit so findings are always exported

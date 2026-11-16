@@ -4,7 +4,7 @@ import * as fs from 'node:fs';
 import * as http from 'node:http';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 import {
@@ -20,8 +20,11 @@ import {
   matchAllowlistForFile,
 } from '../src/cli.js';
 import { generateSarifReport } from '../src/sarifGenerator.js';
+import { analyzeLexicalStructure } from '../src/rules/lexicalMasker.js';
 import {
   COMMENT_SIGNATURE,
+  detectPrEnvironment,
+  formatLayer2StatusLabel,
   postInlineReviewComments,
   postPullRequestComment,
   type FileAuditSummary,
@@ -228,7 +231,14 @@ test('2. sarifGenerator produces valid SARIF v2.1.0 for DG001, DG002, DG003, emp
 test('3. githubCommenter posts once via POST and updates via PATCH using COMMENT_SIGNATURE without duplicates', async () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-commenter-test-'));
   const eventPath = path.join(tempDir, 'github_event.json');
-  fs.writeFileSync(eventPath, JSON.stringify({ pull_request: { number: 77 } }), 'utf-8');
+  fs.writeFileSync(
+    eventPath,
+    JSON.stringify({
+      pull_request: { number: 77, head: { repo: { full_name: 'OkyWoww/DevGuard' } } },
+      repository: { full_name: 'OkyWoww/DevGuard' },
+    }),
+    'utf-8'
+  );
 
   const storedComments: Array<{ id: number; body: string }> = [];
   const recordedRequests: Array<{ method: string; url: string; body?: string }> = [];
@@ -481,7 +491,14 @@ test('6. SPOF graceful degradation (GitHub API + Gemini LLM fallback) and action
   // 6a. Verify githubCommenter degrades gracefully on network error without throwing
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-spof-test-'));
   const eventPath = path.join(tempDir, 'event.json');
-  fs.writeFileSync(eventPath, JSON.stringify({ pull_request: { number: 88 } }), 'utf-8');
+  fs.writeFileSync(
+    eventPath,
+    JSON.stringify({
+      pull_request: { number: 88, head: { repo: { full_name: 'OkyWoww/DevGuard' } } },
+      repository: { full_name: 'OkyWoww/DevGuard' },
+    }),
+    'utf-8'
+  );
 
   const prevEnv = {
     GITHUB_TOKEN: process.env.GITHUB_TOKEN,
@@ -521,6 +538,7 @@ test('6. SPOF graceful degradation (GitHub API + Gemini LLM fallback) and action
     const llmFallback = await evaluateCodeHybrid(vulnerableCode, 'AIzaSyInvalidKeySimulateFailure000000');
     assert.equal(llmFallback.mode, 'zero-api');
     assert.equal(llmFallback.isLiveApi, false);
+    assert.equal(llmFallback.layer2Status, 'Skipped: Quota/Error Fallback');
     assert.ok(llmFallback.parsedReport.skor.security < 70);
 
     // 6c. Verify CLI with invalid GEMINI_API_KEY and multi-line DEVGUARD_SARIF_OUTPUT degrades cleanly & sanitizes output
@@ -739,7 +757,14 @@ test('10. sarifGenerator registers DG001-DG006 and maps inlineFindings with POSI
 test('11. postInlineReviewComments sends suggestion payload, deduplicates repeat runs, and fails open on HTTP 422', async () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-inline-review-test-'));
   const eventPath = path.join(tempDir, 'event.json');
-  fs.writeFileSync(eventPath, JSON.stringify({ pull_request: { number: 99 } }), 'utf-8');
+  fs.writeFileSync(
+    eventPath,
+    JSON.stringify({
+      pull_request: { number: 99, head: { repo: { full_name: 'OkyWoww/DevGuard' } } },
+      repository: { full_name: 'OkyWoww/DevGuard' },
+    }),
+    'utf-8'
+  );
 
   const existingReviewComments: Array<{ path: string; line: number; body: string }> = [];
   const postedReviews: Array<{ event: string; comments: Array<{ path: string; line: number; side: string; body: string }> }> = [];
@@ -1155,7 +1180,14 @@ test('19. Planted secret never leaks raw substring in DG007 message, suggestion,
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
     const addr = server.address() as { port: number };
     const eventPath = path.join(tempDir, 'event.json');
-    fs.writeFileSync(eventPath, JSON.stringify({ pull_request: { number: 105 } }), 'utf-8');
+    fs.writeFileSync(
+      eventPath,
+      JSON.stringify({
+        pull_request: { number: 105, head: { repo: { full_name: 'OkyWoww/DevGuard' } } },
+        repository: { full_name: 'OkyWoww/DevGuard' },
+      }),
+      'utf-8'
+    );
 
     const summary: FileAuditSummary = {
       filePath: 'src/ai/client.ts',
@@ -1539,7 +1571,14 @@ test('24. Sticky PR summary comment renders Active Suppressions table, invalid a
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
     const addr = server.address() as { port: number };
     const eventPath = path.join(tempDir, 'pr.json');
-    fs.writeFileSync(eventPath, JSON.stringify({ pull_request: { number: 314 } }), 'utf-8');
+    fs.writeFileSync(
+      eventPath,
+      JSON.stringify({
+        pull_request: { number: 314, head: { repo: { full_name: 'OkyWoww/DevGuard' } } },
+        repository: { full_name: 'OkyWoww/DevGuard' },
+      }),
+      'utf-8'
+    );
 
     process.env.GITHUB_TOKEN = 'test-token';
     process.env.GITHUB_REPOSITORY = 'OkyWoww/DevGuard';
@@ -1660,6 +1699,508 @@ test('25. SARIF output includes suppressed findings with standard OASIS suppress
     assert.deepEqual(results[1].suppressions, [
       { kind: 'external', justification: 'Serialized per-account via Redis mutex' },
     ]);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('26. detectPrEnvironment identifies same-repo PR, fork PR, deleted fork, missing metadata, and push events, and evaluateCodeHybrid skips Layer 2 on fork PR', async () => {
+  assert.deepEqual(
+    detectPrEnvironment({
+      pull_request: {
+        number: 42,
+        head: { repo: { full_name: 'OkyWoww/DevGuard' } },
+      },
+      repository: { full_name: 'OkyWoww/DevGuard' },
+    }),
+    { isPullRequest: true, isFork: false, prNumber: 42 }
+  );
+
+  assert.deepEqual(
+    detectPrEnvironment({
+      pull_request: {
+        number: 43,
+        head: { repo: { full_name: 'external-contributor/DevGuard' } },
+      },
+      repository: { full_name: 'OkyWoww/DevGuard' },
+    }),
+    { isPullRequest: true, isFork: true, prNumber: 43 }
+  );
+
+  assert.deepEqual(
+    detectPrEnvironment({
+      pull_request: {
+        number: 44,
+        head: { repo: null },
+      },
+      repository: { full_name: 'OkyWoww/DevGuard' },
+    }),
+    { isPullRequest: true, isFork: true, prNumber: 44 }
+  );
+
+  assert.deepEqual(
+    detectPrEnvironment({
+      pull_request: {
+        number: 45,
+        head: {},
+      },
+    }),
+    { isPullRequest: true, isFork: true, prNumber: 45 }
+  );
+
+  assert.deepEqual(
+    detectPrEnvironment({
+      ref: 'refs/heads/main',
+      repository: { full_name: 'OkyWoww/DevGuard' },
+    }),
+    { isPullRequest: false, isFork: false }
+  );
+
+  const forkRes = await evaluateCodeHybrid(
+    'export function add(a: number, b: number) { return a + b; }',
+    'AIzaSyDummyKeyForForkSafetyCheckOnly12345',
+    undefined,
+    'src/math.ts',
+    undefined,
+    true
+  );
+  assert.equal(forkRes.mode, 'zero-api');
+  assert.equal(forkRes.isLiveApi, false);
+  assert.equal(forkRes.layer2Status, 'Skipped: Fork PR');
+
+  const noKeyRes = await evaluateCodeHybrid(
+    'export function add(a: number, b: number) { return a + b; }',
+    '',
+    undefined,
+    'src/math.ts',
+    undefined,
+    false
+  );
+  assert.equal(noKeyRes.layer2Status, 'Skipped: No API Key');
+
+  const offlineRes = await evaluateCodeHybrid(
+    'export function add(a: number, b: number) { return a + b; }',
+    'MY_GEMINI_API_KEY',
+    undefined,
+    'src/math.ts',
+    undefined,
+    false
+  );
+  assert.equal(offlineRes.layer2Status, 'Skipped: Offline');
+});
+
+test('27. CLI fails open on HTTP 403 PR comment endpoints while preserving exit code 1 on findings and exit code 0 on clean code', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-403-cli-'));
+  const requests: Array<{ method: string; url: string }> = [];
+  const server = http.createServer((req, res) => {
+    requests.push({ method: req.method || 'GET', url: req.url || '' });
+    res.writeHead(403, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ message: 'Resource not accessible by integration' }));
+  });
+
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+  const address = server.address();
+  const port = typeof address === 'object' && address ? address.port : 0;
+
+  try {
+    const eventPath = path.join(tempDir, 'fork-pr-event.json');
+    fs.writeFileSync(
+      eventPath,
+      JSON.stringify({
+        pull_request: {
+          number: 77,
+          head: { repo: { full_name: 'fork-user/DevGuard' } },
+        },
+        repository: { full_name: 'OkyWoww/DevGuard' },
+      }),
+      'utf-8'
+    );
+
+    const vulnFile = path.join(tempDir, 'vuln.ts');
+    fs.writeFileSync(
+      vulnFile,
+      [
+        "import { exec } from 'node:child_process';",
+        'export async function processPaymentAuth(userInput: string) {',
+        '  exec(`ls ${userInput}`);',
+        '  try {',
+        "    const res = await fetch('https://payments.example.com/charge');",
+        '    return res.ok;',
+        '  } catch (_err) {',
+        '  }',
+        '  return false;',
+        '}',
+      ].join('\n'),
+      'utf-8'
+    );
+
+    const cleanFile = path.join(tempDir, 'clean.ts');
+    fs.writeFileSync(
+      cleanFile,
+      'export function sumSafe(a: number, b: number): number {\n  return a + b;\n}\n',
+      'utf-8'
+    );
+
+    const sarifOut = path.join(tempDir, 'results.sarif');
+    const ghOutput = path.join(tempDir, 'gh-output.txt');
+    const cliEntry = path.join(BUILD_ROOT, 'src', 'cli.js');
+    const sharedEnv: NodeJS.ProcessEnv = {
+      ...process.env,
+      GITHUB_ACTIONS: 'true',
+      GITHUB_EVENT_PATH: eventPath,
+      GITHUB_API_URL: `http://127.0.0.1:${port}`,
+      GITHUB_REPOSITORY: 'OkyWoww/DevGuard',
+      GITHUB_TOKEN: 'ghs_fork_readonly_token',
+      GITHUB_OUTPUT: ghOutput,
+      DEVGUARD_SARIF_OUTPUT: sarifOut,
+      GEMINI_API_KEY: '',
+    };
+
+    const runCliAsync = (args: string[]) =>
+      new Promise<{ status: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+        const child = spawn(process.execPath, [cliEntry, ...args], {
+          cwd: REPO_ROOT,
+          env: sharedEnv,
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        let stdout = '';
+        let stderr = '';
+        child.stdout.on('data', (d) => {
+          stdout += d.toString();
+        });
+        child.stderr.on('data', (d) => {
+          stderr += d.toString();
+        });
+        child.on('error', reject);
+        child.on('close', (code) => resolve({ status: code, stdout, stderr }));
+      });
+
+    const failRun = await runCliAsync([vulnFile]);
+    assert.equal(failRun.status, 1, `Expected exit 1 for vuln fixture despite HTTP 403, stderr: ${failRun.stderr}`);
+    assert.ok(
+      failRun.stdout.includes('Fork PR'),
+      `Expected fork PR safety notice in stdout, got:\n${failRun.stdout}`
+    );
+    assert.ok(fs.existsSync(sarifOut), 'Expected SARIF output even when PR commenting returns HTTP 403');
+    assert.ok(
+      requests.some((r) => r.url.includes('/issues/77/comments')) &&
+        requests.some((r) => r.url.includes('/pulls/77/comments')),
+      `Expected both summary and inline comment API calls under HTTP 403, saw: ${JSON.stringify(requests)}`
+    );
+
+    const cleanRun = await runCliAsync([cleanFile]);
+    assert.equal(cleanRun.status, 0, `Expected exit 0 for clean fixture despite HTTP 403, stderr: ${cleanRun.stderr}`);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('28. Sticky PR summary renders explicit Layer 2 Gemini Verified and Skipped status strings in header and per-file table', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-l2-summary-'));
+  const postedBodies: string[] = [];
+  const server = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (chunk) => {
+      body += chunk.toString();
+    });
+    req.on('end', () => {
+      if (req.method === 'GET' && req.url?.includes('/issues/55/comments')) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end('[]');
+        return;
+      }
+      if (req.method === 'POST' && req.url?.includes('/issues/55/comments')) {
+        const parsed = JSON.parse(body) as { body: string };
+        postedBodies.push(parsed.body);
+        res.writeHead(201, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ id: 999 }));
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+  });
+
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+  const address = server.address();
+  const port = typeof address === 'object' && address ? address.port : 0;
+
+  const prevEnv = {
+    GITHUB_EVENT_PATH: process.env.GITHUB_EVENT_PATH,
+    GITHUB_API_URL: process.env.GITHUB_API_URL,
+    GITHUB_REPOSITORY: process.env.GITHUB_REPOSITORY,
+    GITHUB_TOKEN: process.env.GITHUB_TOKEN,
+  };
+
+  try {
+    const eventPath = path.join(tempDir, 'pr-event.json');
+    fs.writeFileSync(
+      eventPath,
+      JSON.stringify({
+        pull_request: { number: 55, head: { repo: { full_name: 'OkyWoww/DevGuard' } } },
+        repository: { full_name: 'OkyWoww/DevGuard' },
+      }),
+      'utf-8'
+    );
+
+    process.env.GITHUB_EVENT_PATH = eventPath;
+    process.env.GITHUB_API_URL = `http://127.0.0.1:${port}`;
+    process.env.GITHUB_REPOSITORY = 'OkyWoww/DevGuard';
+    process.env.GITHUB_TOKEN = 'ghs_test_token';
+
+    const statusVariants: string[] = [
+      'Verified',
+      'Skipped: Offline',
+      'Skipped: No API Key',
+      'Skipped: Fork PR',
+      'Skipped: Quota/Error Fallback',
+      'Skipped: Redaction Abort',
+    ];
+
+    assert.equal(formatLayer2StatusLabel('Verified', 'HYBRID'), 'Layer 2 (Gemini): Verified');
+    assert.equal(formatLayer2StatusLabel('Skipped: Offline'), 'Layer 2 (Gemini): Skipped [Offline]');
+    assert.equal(formatLayer2StatusLabel('Skipped: No API Key'), 'Layer 2 (Gemini): Skipped [No API Key]');
+    assert.equal(formatLayer2StatusLabel('Skipped: Fork PR'), 'Layer 2 (Gemini): Skipped [Fork PR]');
+    assert.equal(
+      formatLayer2StatusLabel('Skipped: Quota/Error Fallback'),
+      'Layer 2 (Gemini): Skipped [Quota/Error Fallback]'
+    );
+    assert.equal(
+      formatLayer2StatusLabel('Skipped: Redaction Abort'),
+      'Layer 2 (Gemini): Skipped [Redaction Abort]'
+    );
+
+    const summaries: FileAuditSummary[] = statusVariants.map((status, idx) => ({
+      filePath: `src/file${idx}.ts`,
+      security: 95,
+      correctness: 95,
+      maintainability: 95,
+      overall: 95,
+      passed: true,
+      fatalFlaws: [],
+      defenseInDepth: [],
+      layer2Status: status,
+    }));
+
+    await postPullRequestComment(summaries, 85, 'HYBRID');
+    assert.equal(postedBodies.length, 1);
+    const commentBody = postedBodies[0];
+
+    assert.ok(commentBody.includes('Layer 2 (Gemini): Verified'));
+    assert.ok(commentBody.includes('Layer 2 (Gemini): Skipped [Offline]'));
+    assert.ok(commentBody.includes('Layer 2 (Gemini): Skipped [No API Key]'));
+    assert.ok(commentBody.includes('Layer 2 (Gemini): Skipped [Fork PR]'));
+    assert.ok(commentBody.includes('Layer 2 (Gemini): Skipped [Quota/Error Fallback]'));
+    assert.ok(commentBody.includes('Layer 2 (Gemini): Skipped [Redaction Abort]'));
+
+    await postPullRequestComment(
+      [
+        {
+          filePath: 'src/forkOnly.ts',
+          security: 95,
+          correctness: 95,
+          maintainability: 95,
+          overall: 95,
+          passed: true,
+          fatalFlaws: [],
+          defenseInDepth: [],
+          layer2Status: 'Skipped: Fork PR',
+        },
+      ],
+      85,
+      'OFFLINE_AST'
+    );
+    assert.equal(postedBodies.length, 2);
+    assert.ok(postedBodies[1].includes('Layer 2 (Gemini): Skipped [Fork PR]'));
+  } finally {
+    for (const [k, v] of Object.entries(prevEnv)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('29. All GitHub Actions workflows disallow pull_request_target and guard upload-sarif cleanly', () => {
+  const workflowsDir = path.join(REPO_ROOT, '.github', 'workflows');
+  const workflowFiles = fs
+    .readdirSync(workflowsDir)
+    .filter((f) => f.endsWith('.yml') || f.endsWith('.yaml'));
+
+  assert.ok(workflowFiles.length > 0, 'Expected at least one workflow file under .github/workflows');
+
+  const expectedGuard =
+    "if: always() && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo != null && github.event.pull_request.head.repo.full_name == github.repository))";
+
+  let foundUploadSarif = false;
+  for (const file of workflowFiles) {
+    const content = fs.readFileSync(path.join(workflowsDir, file), 'utf-8');
+    assert.ok(
+      !content.includes('pull_request_target'),
+      `Workflow ${file} must not use pull_request_target`
+    );
+
+    if (content.includes('github/codeql-action/upload-sarif')) {
+      foundUploadSarif = true;
+      assert.ok(
+        content.includes(expectedGuard),
+        `Workflow ${file} upload-sarif step must include exact fork-safe condition`
+      );
+      const sarifSection = content.slice(content.indexOf('upload-sarif') - 250);
+      const nextStepIdx = sarifSection.indexOf('\n      - name:', 20);
+      const stepBlock = nextStepIdx > 0 ? sarifSection.slice(0, nextStepIdx) : sarifSection;
+      assert.ok(
+        !/continue-on-error\s*:\s*true/i.test(stepBlock),
+        `Workflow ${file} upload-sarif step must not set continue-on-error: true`
+      );
+    }
+  }
+
+  assert.ok(foundUploadSarif, 'Expected at least one workflow to configure github/codeql-action/upload-sarif');
+});
+
+test('30. SARIF output includes exact security-severity ratings (DG001-DG008), POSIX %SRCROOT% URIs, and no custom partialFingerprints', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-sarif-sev-'));
+  try {
+    const sarifOut = path.join(tempDir, 'severity-check.sarif');
+    const summary: FileAuditSummary = {
+      filePath: path.join(REPO_ROOT, 'src', 'handlers', 'checkout.ts'),
+      security: 55,
+      correctness: 75,
+      maintainability: 80,
+      overall: 60,
+      passed: false,
+      fatalFlaws: ['Multiple findings'],
+      defenseInDepth: [],
+      inlineFindings: [
+        { line: 3, ruleId: 'DG001', severity: 'error', message: 'Shell execution sink', suggestion: 'Use execFile' },
+        { line: 6, ruleId: 'DG003', severity: 'error', message: 'SQL injection sink', suggestion: 'Use params' },
+        { line: 9, ruleId: 'DG004', severity: 'error', message: 'Undeclared dependency', suggestion: 'Install pkg' },
+        { line: 12, ruleId: 'DG005', severity: 'error', message: 'Swallowed error in auth', suggestion: 'Rethrow' },
+        { line: 15, ruleId: 'DG006', severity: 'error', message: 'Race condition in balance', suggestion: 'Use atomic' },
+        { line: 18, ruleId: 'DG007', severity: 'error', message: 'Hardcoded secret', suggestion: 'Use env' },
+        { line: 21, ruleId: 'DG008', severity: 'warning', message: 'Missing timeout', suggestion: 'Add AbortSignal' },
+      ],
+    };
+
+    const gateOnlyFail: FileAuditSummary = {
+      filePath: 'src\\services\\gateOnly.ts',
+      security: 60,
+      correctness: 85,
+      maintainability: 85,
+      overall: 76,
+      passed: false,
+      fatalFlaws: ['Score below CI gate threshold without inline rule'],
+      defenseInDepth: [],
+    };
+
+    generateSarifReport([summary, gateOnlyFail], sarifOut);
+
+    const sarif = JSON.parse(fs.readFileSync(sarifOut, 'utf-8')) as {
+      runs: Array<{
+        tool: {
+          driver: {
+            rules: Array<{
+              id: string;
+              properties?: { 'security-severity'?: string };
+            }>;
+          };
+        };
+        results: Array<{
+          ruleId: string;
+          partialFingerprints?: unknown;
+          locations: Array<{
+            physicalLocation: {
+              artifactLocation: { uri: string; uriBaseId?: string };
+            };
+          }>;
+        }>;
+      }>;
+    };
+
+    const expectedSeverity: Record<string, string> = {
+      DG001: '9.5',
+      DG007: '9.0',
+      DG006: '8.5',
+      DG003: '8.0',
+      DG004: '7.5',
+      DG005: '7.0',
+      DG008: '6.5',
+      DG002: '5.0',
+    };
+
+    const rulesById = new Map(sarif.runs[0].tool.driver.rules.map((r) => [r.id, r]));
+    for (const [ruleId, expectedScore] of Object.entries(expectedSeverity)) {
+      const rule = rulesById.get(ruleId);
+      assert.ok(rule, `Expected SARIF rule ${ruleId} in driver.rules`);
+      const sev = rule.properties?.['security-severity'];
+      assert.equal(typeof sev, 'string');
+      assert.ok(Number.isFinite(Number(sev)), `Expected finite numeric string for ${ruleId}, got ${String(sev)}`);
+      assert.equal(sev, expectedScore);
+    }
+
+    // 7 inline findings on summary + 1 DG002 gate finding on summary + 1 DG002 gate finding on gateOnlyFail
+    assert.equal(sarif.runs[0].results.length, 9);
+    for (const result of sarif.runs[0].results) {
+      assert.equal(result.partialFingerprints, undefined, `Result ${result.ruleId} must omit custom partialFingerprints`);
+      const loc = result.locations[0].physicalLocation.artifactLocation;
+      assert.equal(loc.uriBaseId, '%SRCROOT%');
+      assert.ok(!loc.uri.includes('\\'), `Expected POSIX forward-slash URI, got ${loc.uri}`);
+      assert.ok(!/^[A-Za-z]:/.test(loc.uri) && !loc.uri.startsWith('/'), `Expected repo-relative URI, got ${loc.uri}`);
+    }
+
+    // Verify 100% zero-dependency runtime and browser-safe core analyzer/rules imports
+    const pkgJson = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, 'package.json'), 'utf-8')) as {
+      dependencies?: Record<string, unknown>;
+    };
+    assert.equal(
+      Object.keys(pkgJson.dependencies ?? {}).length,
+      0,
+      'package.json dependencies must be empty for 100% zero-dependency runtime'
+    );
+
+    const rulesDir = path.join(REPO_ROOT, 'src', 'rules');
+    const ruleFiles = fs
+      .readdirSync(rulesDir)
+      .filter((f) => f.endsWith('.ts'))
+      .map((f) => path.join('src', 'rules', f));
+    const runtimeFiles = [
+      'src/cli.ts',
+      'src/devguardAnalyzer.ts',
+      'src/githubCommenter.ts',
+      'src/sarifGenerator.ts',
+      ...ruleFiles,
+    ];
+
+    for (const relFile of runtimeFiles) {
+      const srcText = fs.readFileSync(path.join(REPO_ROOT, relFile), 'utf-8');
+      const { maskedCode, stringLiterals } = analyzeLexicalStructure(srcText, false);
+      const importKeywordRe = /\b(?:import(?!\s*\.\s*meta)|export\s+(?:\*(?:\s+as\s+\w+)?|\{[^}]*\})\s+from)\b/g;
+      let m: RegExpExecArray | null;
+      while ((m = importKeywordRe.exec(maskedCode)) !== null) {
+        if (m.index > 0 && maskedCode[m.index - 1] === '.') continue;
+        const afterPos = m.index + m[0].length;
+        const specLit = stringLiterals.find((lit) => {
+          if (lit.startOffset < afterPos) return false;
+          const between = maskedCode.slice(afterPos, lit.startOffset);
+          return !between.includes(';');
+        });
+        if (!specLit) continue;
+        const spec = specLit.value;
+        assert.ok(
+          spec.startsWith('node:') || spec.startsWith('./') || spec.startsWith('../'),
+          `Runtime file ${relFile} must only import node:* or relative paths, found: "${spec}"`
+        );
+        if (relFile === 'src/devguardAnalyzer.ts' || relFile.startsWith(path.join('src', 'rules'))) {
+          assert.ok(
+            !spec.startsWith('node:'),
+            `Browser-safe file ${relFile} must not import node:* built-ins at top level, found: "${spec}"`
+          );
+        }
+      }
+    }
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }

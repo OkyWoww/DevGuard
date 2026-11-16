@@ -1,5 +1,5 @@
-import * as fs from 'fs';
-import * as path from 'path';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import { redactSecretsPreservingLayout } from './devguardAnalyzer.js';
 import type { FileAuditSummary } from './githubCommenter.js';
 
@@ -72,6 +72,9 @@ export function generateSarifReport(
     properties: { tags: string[]; 'security-severity': string };
   }>();
 
+  // Security-severity CVSS mapping per rule (OASIS SARIF / GitHub Code Scanning):
+  // DG001: 9.5, DG007: 9.0, DG006: 8.5, DG003: 8.0, DG004: 7.5, DG005: 7.0, DG008: 6.5, DG002: 5.0
+
   // Rule 1: Fatal Security / Logic Flaw (Blocker)
   rulesMap.set('DG001', {
     id: 'DG001',
@@ -85,7 +88,7 @@ export function generateSarifReport(
     defaultConfiguration: { level: 'error' },
     properties: {
       tags: ['security', 'adversarial-audit', 'external/cwe/cwe-693'],
-      'security-severity': '8.5'
+      'security-severity': '9.5'
     }
   });
 
@@ -102,7 +105,7 @@ export function generateSarifReport(
     defaultConfiguration: { level: 'warning' },
     properties: {
       tags: ['security', 'defense-in-depth', 'maintainability'],
-      'security-severity': '4.0'
+      'security-severity': '5.0'
     }
   });
 
@@ -119,7 +122,7 @@ export function generateSarifReport(
     defaultConfiguration: { level: 'error' },
     properties: {
       tags: ['quality-gate', 'security'],
-      'security-severity': '7.0'
+      'security-severity': '8.0'
     }
   });
 
@@ -136,7 +139,7 @@ export function generateSarifReport(
     defaultConfiguration: { level: 'error' },
     properties: {
       tags: ['security', 'supply-chain', 'slopsquatting', 'external/cwe/cwe-829'],
-      'security-severity': '9.0'
+      'security-severity': '7.5'
     }
   });
 
@@ -153,7 +156,7 @@ export function generateSarifReport(
     defaultConfiguration: { level: 'warning' },
     properties: {
       tags: ['security', 'reliability', 'error-handling', 'external/cwe/cwe-390'],
-      'security-severity': '6.5'
+      'security-severity': '7.0'
     }
   });
 
@@ -170,7 +173,7 @@ export function generateSarifReport(
     defaultConfiguration: { level: 'error' },
     properties: {
       tags: ['security', 'concurrency', 'toctou', 'external/cwe/cwe-362'],
-      'security-severity': '8.8'
+      'security-severity': '8.5'
     }
   });
 
@@ -187,7 +190,7 @@ export function generateSarifReport(
     defaultConfiguration: { level: 'error' },
     properties: {
       tags: ['security', 'secrets', 'credentials', 'external/cwe/cwe-798'],
-      'security-severity': '9.5'
+      'security-severity': '9.0'
     }
   });
 
@@ -204,7 +207,7 @@ export function generateSarifReport(
     defaultConfiguration: { level: 'error' },
     properties: {
       tags: ['security', 'reliability', 'resilience', 'external/cwe/cwe-400'],
-      'security-severity': '8.0'
+      'security-severity': '6.5'
     }
   });
 
