@@ -58,6 +58,14 @@ const REGEX_PRECEDING_KEYWORDS = new Set([
 ]);
 const SUPPRESSION_COMMENT_RE = /\bdevguard-ignore\s+(DG\d{3})\s*:\s*([^\r\n]+)/i;
 const VALID_DG_RULE_RE = /^DG00[1-8]$/;
+export const MEANINGFUL_SUPPRESSION_REASON_RE = /[A-Za-z]{2,}\s+[A-Za-z]{2,}/;
+
+/** Validates that a suppression justification has >= 8 chars and at least two alphabetic words. */
+export function isValidSuppressionReason(reason: unknown): reason is string {
+  if (typeof reason !== 'string') return false;
+  const trimmed = reason.trim();
+  return trimmed.length >= 8 && MEANINGFUL_SUPPRESSION_REASON_RE.test(trimmed);
+}
 
 function parseSuppressionFromComment(
   commentBody: string,
@@ -72,7 +80,7 @@ function parseSuppressionFromComment(
   const ruleUpper = match[1].toUpperCase();
   if (!VALID_DG_RULE_RE.test(ruleUpper)) return;
   const reason = match[2].replace(/\*\/\s*$/, '').trim();
-  if (reason.length < 8) return;
+  if (!isValidSuppressionReason(reason)) return;
 
   const ruleId = ruleUpper as DevGuardRuleId;
   if (isTrailing) {

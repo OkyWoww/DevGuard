@@ -3,7 +3,7 @@
 [![Zero-Dependency Runtime](https://img.shields.io/badge/Runtime-100%25%20Zero--Dependency-emerald.svg)](#hybrid-dual-layer-architecture)
 [![OASIS SARIF v2.1.0](https://img.shields.io/badge/SARIF-v2.1.0%20Compliant-blue.svg)](#quick-start-fork-safe-ci-setup)
 [![GitHub Action](https://img.shields.io/badge/GitHub%20Action-v1.2.1-black.svg)](#quick-start-fork-safe-ci-setup)
-[![Tests 31/31 Passing](https://img.shields.io/badge/Tests-31%2F31%20Passing-success.svg)](#local-development--verification)
+[![Tests 35/35 Passing](https://img.shields.io/badge/Tests-35%2F35%20Passing-success.svg)](#local-development--verification)
 
 **DevGuard** is a deterministic CI/CD security gatekeeper engineered to catch silent failures, slopsquatting, leaked API keys, and financial race conditions hidden inside AI-generated (*Cursor, Windsurf, Copilot, Antigravity*) Pull Requests before they reach production.
 
@@ -72,28 +72,28 @@ DevGuard supports controlled suppressions without letting AI-generated Pull Requ
 | **`DG001`** | `error` | ❌ Forbidden | ❌ Forbidden | Critical RCE/injection/traversal findings remain active with bypass warning |
 | **`DG002`** | `warning` | ❌ Forbidden | ❌ Forbidden | Score/defense-in-depth notes are never suppressible |
 | **`DG003`** | `error` | ❌ Forbidden | ❌ Forbidden | Score gate failures are never suppressible |
-| **`DG004`** | `error` | ✅ Allowed (reason `>= 8` chars) | ✅ Allowed (base branch only) | For monorepo/hoisted or vendored packages |
-| **`DG005`** | `warning` | ✅ Allowed (reason `>= 8` chars) | ❌ Forbidden | Only non-critical `warning` catches may be suppressed inline |
+| **`DG004`** | `error` | ❌ Forbidden | ✅ Allowed (base branch only) | For monorepo/hoisted or vendored packages (base-branch `.devguard.json` only) |
+| **`DG005`** | `warning` | ✅ Allowed (`>= 8` chars, 2+ words) | ❌ Forbidden | Only non-critical `warning` catches may be suppressed inline |
 | **`DG005`** | `error` | ❌ Forbidden | ❌ Forbidden | Critical auth/payment/DB `error` catches cannot be suppressed |
 | **`DG006`** | `error` | ❌ Forbidden | ✅ Allowed (base branch only) | External distributed locks can allowlist specific files on base branch |
 | **`DG007`** | `error` | ❌ Forbidden | ❌ Forbidden | Hardcoded secret exposure cannot be suppressed |
-| **`DG008`** | `warning` / `error` | ✅ Allowed (reason `>= 8` chars) | ❌ Forbidden | For upstream `AbortController` or framework-enforced deadlines |
+| **`DG008`** | `warning` / `error` | ✅ Allowed (`>= 8` chars, 2+ words) | ❌ Forbidden | For upstream `AbortController` or framework-enforced deadlines |
 
 ### Lexer-Level Inline Suppressions
-* Inline comments must be real `//` or `/* ... */` comments (not inside strings, template literals, or regex literals) immediately above or trailing the flagged line:
+* Inline comments must be real `//` or `/* ... */` comments (not inside strings, template literals, or regex literals) immediately above or trailing the flagged line (permitted only for `DG008` and `DG005` `warning`):
   ```ts
-  // devguard-ignore DG004: vendored compatibility package intentionally aliased
-  import helper from 'legacy-pkg';
+  // devguard-ignore DG008: upstream AbortController enforces gateway deadline
+  const response = await fetch('https://api.example.com/health');
   ```
-* A justification reason of at least **8 non-whitespace characters** after `DGxxx:` is mandatory.
-* Attempting inline suppression on forbidden rules (`DG001`, `DG005` `error`, `DG006`, `DG007`) leaves the finding active and appends `[Suppression ignored: DGxxx cannot be suppressed inline]`.
+* A meaningful justification reason of at least **8 characters** containing **at least two alphabetic words** (`/[A-Za-z]{2,}\s+[A-Za-z]{2,}/`) after `DGxxx:` is mandatory; dummy padding such as `"xxxxxxxx"` or `"........"` is rejected.
+* Attempting inline suppression on forbidden rules (`DG001`, `DG004`, `DG005` `error`, `DG006`, `DG007`) leaves the finding active and appends `[Suppression ignored: DGxxx cannot be suppressed inline]`.
 
 ### Verified `.devguard.json` Allowlist Security Model
 * **Strict Base-Branch Loading in CI:**
   * On Pull Requests (`GITHUB_BASE_REF`), DevGuard reads `.devguard.json` **strictly from git history** via `git show origin/${GITHUB_BASE_REF}:.devguard.json`.
   * On `push` events with a valid non-zero `before` SHA, DevGuard reads `${beforeSha}:.devguard.json`.
   * **PR edits to `.devguard.json` do NOT apply to the current PR**; they take effect **only after merge** into the base branch, and a warning banner is posted in the sticky PR comment whenever `.devguard.json` changed in the PR.
-* **Validation Constraints:** Only `DG004` and `DG006` are permitted under `ignoreRulesByPath`, each entry requires a trimmed `reason` of length `>= 8`, and wildcard patterns (`*`, `**`, `**/...`, `../`, leading `/`, or non-directory globs) are rejected and reported in the sticky PR summary.
+* **Validation Constraints:** Only `DG004` and `DG006` are permitted under `ignoreRulesByPath`, each entry requires a trimmed `reason` of length `>= 8` with at least two alphabetic words (`/[A-Za-z]{2,}\s+[A-Za-z]{2,}/`), and wildcard patterns (`*`, `**`, `**/...`, `../`, leading `/`, or non-directory globs) are rejected and reported in the sticky PR summary.
 * **SARIF Audit Trail:** Active `inSource` and `external` suppressions are recorded on the PR summary table and emitted into `devguard-results.sarif` using standard OASIS `suppressions` metadata (`kind`, `justification`).
 
 ---
@@ -103,10 +103,11 @@ DevGuard supports controlled suppressions without letting AI-generated Pull Requ
 Before transmitting any snippet to the Gemini REST endpoint (`generativelanguage.googleapis.com`), `prepareRedactedCodeForLlm` enforces a strict fail-closed privacy gate:
 
 1. **Sensitive Filename Blocking (Case-Insensitive):** Immediately aborts Layer 2 (`Skipped: Redaction Abort`) without network calls for files matching:
-   * `^\.env(\..+)?$` (e.g., `.env`, `.env.local`, `.ENV.PRODUCTION`)
-   * `\.(pem|key|p12|pfx|crt)$`
-   * `^id_(rsa|ed25519|ecdsa)(\..+)?$`
-2. **Layout-Preserving Secret Redaction (`redactSecretsPreservingLayout`):** Replaces PEM private key blocks, credentialed DB URI passwords, JWTs, `DG007` provider prefixes, and high-entropy secret string literals with `*` while preserving exact UTF-16 string length, `\n`, `\r`, and `\t` indices so line numbers stay aligned.
+   * `^\.env(\..+)?$` (e.g., `.env`, `.env.local`, `.ENV.PRODUCTION`) and `^\.(npmrc|netrc|pgpass)$`
+   * `\.(pem|key|p12|pfx|crt|tfvars|tfstate|jks|keystore)$`
+   * `^id_(rsa|ed25519|ecdsa)(\..+)?$` and `^kubeconfig(\..+)?$`
+   * `(?:credentials|service-account).*\.json$`
+2. **Layout-Preserving Secret Redaction (`redactSecretsPreservingLayout`):** Replaces PEM private key blocks, credentialed DB URI passwords, JWTs, `DG007` provider prefixes, and high-entropy secret string literals with `*` while preserving exact UTF-16 string length, `\n`, `\r`, and `\t` indices so line numbers stay aligned, and passes the Gemini API key in the `x-goog-api-key` request header instead of URL query strings.
 3. **Independent Residual Entropy Gate (`findResidualSecretLikeTokens`):** Re-scans redacted output independently (without reusing `DG007` provider regexes) for surviving PEM headers, unmasked URI credentials, or 24–256 character tokens having `>= 3` character classes and Shannon entropy `>= 4.2` bits/char (excluding URLs, `data:*base64,`, and asset file paths). If **any** residual finding or unexpected error occurs, Layer 2 aborts fail-closed (`Layer 2 (Gemini): Skipped [Redaction Abort]`) and Layer 1 continues offline.
 
 > [!CAUTION]
@@ -124,13 +125,15 @@ Before transmitting any snippet to the Gemini REST endpoint (`generativelanguage
   * `Layer 2 (Gemini): Skipped [Offline | No API Key | Fork PR | Quota/Error Fallback | Redaction Abort]`
 
 > [!WARNING]
-> **Never Use `pull_request_target`:** Always run DevGuard under `pull_request` (never `pull_request_target`), which checks out untrusted fork code in an isolated context without write tokens or repository secrets. Guard `upload-sarif` with `if: always() && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo != null && github.event.pull_request.head.repo.full_name == github.repository))` so fork PRs never fail a job step attempting unauthorized SARIF uploads.
+> **Never Use `pull_request_target`:** Always run DevGuard under `pull_request` (never `pull_request_target` — DevGuard exits immediately with code `1` if `GITHUB_EVENT_NAME == 'pull_request_target'`), which checks out untrusted fork code in an isolated context without write tokens or repository secrets. Guard `upload-sarif` with `if: always() && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo != null && github.event.pull_request.head.repo.full_name == github.repository))` so fork PRs never fail a job step attempting unauthorized SARIF uploads.
+>
+> **Enable Branch Protection:** Configure GitHub branch protection / rulesets with **Require status checks to pass before merging** for `DevGuard Quality Gate` so Pull Requests cannot bypass or delete `.github/workflows/devguard.yml`.
 
 ---
 
 ## ⚡ Quick Start (Fork-Safe CI Setup)
 
-Pin DevGuard by **full commit SHA** in `.github/workflows/devguard.yml` (`<full-40-char-commit-sha> # v1.2.1`) for immutable supply-chain security. Resolve the exact 40-character commit SHA for any release tag with: `git rev-parse v1.2.1^{commit}`:
+Pin DevGuard by release tag or **full 40-character commit SHA** (`git rev-parse v1.2.1^{commit}`) in `.github/workflows/devguard.yml`, with `fetch-depth: 0` so commit history and base-branch `.devguard.json` verification are always available:
 
 ```yaml
 name: DevGuard Security Audit
@@ -154,12 +157,11 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 2
+          fetch-depth: 0
 
       - name: Run DevGuard v1.2.1
         id: devguard
-        # Pin third-party actions to a full commit SHA for supply-chain integrity
-        uses: OkyWoww/DevGuard@<full-40-char-commit-sha> # v1.2.1
+        uses: OkyWoww/DevGuard@v1.2.1 # Or pin by 40-char commit SHA (git rev-parse v1.2.1^{commit})
         with:
           # Optional: Omit for 100% Free Offline Single-Pass Lexical & Heuristic mode
           gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
@@ -173,7 +175,7 @@ jobs:
           sarif_file: ${{ steps.devguard.outputs.sarif_file }}
 ```
 
-### Action Inputs & Outputs ([action.yml](file:///c:/Users/ADMIN/Documents/devguard/action.yml))
+### Action Inputs & Outputs ([action.yml](action.yml))
 
 | Direction | Name | Default / Example | Description |
 | :--- | :--- | :--- | :--- |
@@ -182,28 +184,28 @@ jobs:
 | **Input** | `target_files` | `'modified'` | Audit scope: `'modified'` (git diff), `'all'` (workspace scan), or a specific file path (`DEVGUARD_TARGET`). |
 | **Output** | `overall_score` | `96` | Aggregate Overall Guard score across audited files (`0`–`100`). |
 | **Output** | `audit_status` | `PASS` / `FAIL` | Final gate verdict written to `GITHUB_OUTPUT`. |
-| **Output** | `sarif_file` | `devguard-results.sarif` | Path to generated OASIS SARIF v2.1.0 report (`%SRCROOT%` POSIX URIs & CVSS `security-severity` metadata). |
+| **Output** | `sarif_file` | `devguard-results.sarif` | Path to generated OASIS SARIF v2.1.0 report (`%SRCROOT%` POSIX URIs & GitHub Code Scanning `security-severity` rating (`5.0`–`9.5`)). |
 
 ---
 
 ## 🏗️ Hybrid Dual-Layer Architecture
 
 1. **Layer 1 — Deterministic Single-Pass Lexical & Heuristic Engine (`0-Latency`, `Zero-Dependency`):**
-   * Core analyzers ([src/devguardAnalyzer.ts](file:///c:/Users/ADMIN/Documents/devguard/src/devguardAnalyzer.ts) and [src/rules/](file:///c:/Users/ADMIN/Documents/devguard/src/rules/lexicalMasker.ts)) are browser-safe TypeScript modules; CLI & GitHub integration use only Node.js built-ins (`node:fs`, `node:path`, `node:child_process`, `node:module`) and native `fetch()`.
+   * Core analyzers ([src/devguardAnalyzer.ts](src/devguardAnalyzer.ts) and [src/rules/lexicalMasker.ts](src/rules/lexicalMasker.ts)) are browser-safe TypeScript modules; CLI & GitHub integration use only Node.js built-ins (`node:fs`, `node:path`, `node:child_process`, `node:module`) and native `fetch()`.
    * Immune to prompt-injection instructions embedded in comments (`// IGNORE ALL PREVIOUS INSTRUCTIONS`).
    * Cross-checks imported packages and `#subpath` aliases against ancestor `package.json` manifests and Node built-ins without external registry latency.
 2. **Layer 2 — Gemini Adversarial Reasoning (`Fail-Closed Privacy` + `Fail-Open Resilience`):**
-   * Uses a direct zero-dependency `fetch()` POST request to `generativelanguage.googleapis.com` when running on same-repo workflows with a valid `AIzaSy...` key and after passing the Pre-LLM redaction & residual entropy gate.
-   * Automatically degrades fail-open to Layer 1 scores on timeout (`6.5s`), HTTP 4xx/5xx errors, or redaction aborts without breaking CI.
+   * Uses a direct zero-dependency `fetch()` POST request to `generativelanguage.googleapis.com` with the `x-goog-api-key` header when running on same-repo workflows with a valid `AIzaSy...` key and after passing the Pre-LLM redaction & residual entropy gate.
+   * Caps Layer 2 score deductions against clean Layer 1 verdicts so unverified LLM prose alone cannot fail a clean PR, and degrades fail-open to Layer 1 scores on timeout (`6.5s`), HTTP 4xx/5xx errors, or redaction aborts without breaking CI.
 3. **One-Click PR Inline Remediation, Sticky Summary, & SARIF v2.1.0:**
-   * Posts deduplicated inline review `suggestion` blocks per `path:line:ruleId` and maintains a single sticky PR summary table with Active Suppressions, Rejected Allowlist Entries, and explicit Layer 2 status badges.
-   * Writes OASIS SARIF v2.1.0 logs with per-rule `security-severity` CVSS scores (`5.0`–`9.5`), `%SRCROOT%` forward-slash relative URIs, and standard `suppressions` records without custom `partialFingerprints`.
+   * Posts deduplicated inline review `suggestion` blocks per `path:line:ruleId` and maintains a single sticky PR summary table with Active Suppressions, Rejected Allowlist Entries, and explicit Layer 2 status badges (with `@mentions` and external markdown images neutralized).
+   * Writes OASIS SARIF v2.1.0 logs with GitHub Code Scanning `security-severity` ratings (`5.0`–`9.5`), `%SRCROOT%` forward-slash relative URIs, and standard `suppressions` records without custom `partialFingerprints`.
 
 ---
 
 ## 📊 Benchmark Corpus & Known Limitations (JS/TS & NPM Scope)
 
-DevGuard tracks detector precision, recall, and known evasion gaps transparently in [tests/corpus/cases.ts](file:///c:/Users/ADMIN/Documents/devguard/tests/corpus/cases.ts) (`npm run corpus:report`). Because Layer 1 operates as a single-pass lexical and heuristic engine without full inter-procedural data-flow analysis, complex obfuscation or multi-hop aliasing remains out-of-scope for Layer 1 (`knownMiss` below). Current deterministic rules `DG004`–`DG008` target JS/TS & NPM ecosystems.
+DevGuard tracks detector precision, recall, and known evasion gaps transparently in [tests/corpus/cases.ts](tests/corpus/cases.ts) (`npm run corpus:report`). Because Layer 1 operates as a single-pass lexical and heuristic engine without full inter-procedural data-flow analysis, complex obfuscation or multi-hop aliasing remains out-of-scope for Layer 1 (`knownMiss` below). Current deterministic rules `DG004`–`DG008` target JS/TS & NPM ecosystems.
 
 ### Automated Corpus Report (`npm run corpus:report`)
 
@@ -236,13 +238,13 @@ DevGuard tracks detector precision, recall, and known evasion gaps transparently
 - **`DG008-EV-02`** (`DG008`, `knownMiss`): Aliased fetch reference (httpGet) bypasses literal fetch() call matcher
 - **`DG008-EV-03`** (`DG008`, `knownMiss`): while (running) async loop where boolean guard is never mutated or broken
 
-See [docs/benchmarks/realworld-2026-11-16.md](file:///c:/Users/ADMIN/Documents/devguard/docs/benchmarks/realworld-2026-11-16.md) for the real-world self-scan baseline (`7` files under `src`, `0` false-positive findings across `DG001`–`DG008`).
+See [docs/benchmarks/realworld-2026-11-16.md](docs/benchmarks/realworld-2026-11-16.md) for the real-world self-scan baseline (`7` files under `src`, `0` false-positive findings across `DG001`–`DG008`).
 
 ---
 
 ## 🧪 Local Development & Verification
 
-DevGuard enforces a strict zero-dependency test harness using Node's built-in test runner (`node:test`), currently verified at **31/31 passing tests** across [tests/corpus.test.ts](file:///c:/Users/ADMIN/Documents/devguard/tests/corpus.test.ts) (`Corpus Benchmark`) and [tests/integration.test.ts](file:///c:/Users/ADMIN/Documents/devguard/tests/integration.test.ts) (`Tests 1–30`):
+DevGuard enforces a strict zero-dependency test harness using Node's built-in test runner (`node:test`), currently verified at **35/35 passing tests** across [tests/corpus.test.ts](tests/corpus.test.ts) (`Corpus Benchmark`) and [tests/integration.test.ts](tests/integration.test.ts) (`Tests 1–34`):
 
 ```bash
 # 1. Typecheck application, CLI, & tests
@@ -251,7 +253,7 @@ npm run lint
 # 2. Build standalone web UI bundle
 npm run build
 
-# 3. Run zero-dependency benchmark + integration test suite (31/31 scenarios)
+# 3. Run zero-dependency benchmark + integration test suite (35/35 scenarios)
 npm test
 
 # 4. Regenerate labeled corpus Markdown summary

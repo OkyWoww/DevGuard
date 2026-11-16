@@ -15,7 +15,10 @@ import {
   type AuditAnalyzeOptions,
 } from '../src/devguardAnalyzer.js';
 import {
+  MAX_AUDIT_FILE_BYTES,
+  discoverWorkspaceFiles,
   evaluateCodeHybrid,
+  isExcludedFromAutoDiscovery,
   loadVerifiedAllowlist,
   matchAllowlistForFile,
 } from '../src/cli.js';
@@ -27,6 +30,7 @@ import {
   formatLayer2StatusLabel,
   postInlineReviewComments,
   postPullRequestComment,
+  sanitizeMarkdownText,
   type FileAuditSummary,
 } from '../src/githubCommenter.js';
 
@@ -1305,7 +1309,7 @@ test('20. When Layer 2 redaction aborts, Layer 1 findings still drive the CLI ex
   }
 });
 
-test('21. Lexer ignores suppression markers in literals/regexes and honors real // and /* */ suppressions for DG004, DG008, DG005(warning)', () => {
+test('21. Lexer ignores suppression markers in literals/regexes and honors real // and /* */ suppressions for DG008 and DG005(warning) while rejecting DG004 inline', () => {
   const ignoredLiteralsCode = [
     'const msgStr = "// devguard-ignore DG004: inside double-quoted string";',
     'const tmplStr = `/* devguard-ignore DG008: inside template literal */`;',
@@ -1334,13 +1338,11 @@ test('21. Lexer ignores suppression markers in literals/regexes and honors real 
   const invalidReasonReport = analyzeCodeDeterministically(invalidReasonCode, { filePath: 'src/shortReason.ts' });
   const activeDg004Lines = (invalidReasonReport.inlineFindings || []).filter((f) => f.ruleId === 'DG004').map((f) => f.line);
   const activeDg008Lines = (invalidReasonReport.inlineFindings || []).filter((f) => f.ruleId === 'DG008').map((f) => f.line);
-  assert.deepEqual(activeDg004Lines, [2, 4], 'Missing and <8-char DG004 reasons must NOT suppress findings');
+  assert.deepEqual(activeDg004Lines, [2, 4], 'DG004 findings must remain active when inline suppression attempted');
   assert.deepEqual(activeDg008Lines, [7], 'Whitespace-padded short DG008 reason must NOT suppress finding');
   assert.equal(invalidReasonReport.suppressions, undefined);
 
   const realSuppressionsCode = [
-    '// devguard-ignore DG004: vendored compatibility fork intentionally aliased',
-    "import _ from 'lodahs';",
     'export async function callWithAllowedSuppressions() {',
     '  /* devguard-ignore DG008: local retry loop already enforces gateway deadline */',
     '  await fetch("https://api.openai.com/v1/chat");',
@@ -1351,12 +1353,11 @@ test('21. Lexer ignores suppression markers in literals/regexes and honors real 
   ].join('\n');
 
   const suppressedReport = analyzeCodeDeterministically(realSuppressionsCode, { filePath: 'src/suppressed.ts' });
-  assert.equal((suppressedReport.inlineFindings || []).length, 0, 'Expected all 3 permitted inline findings to be suppressed');
-  assert.equal(suppressedReport.suppressions?.length, 3);
+  assert.equal((suppressedReport.inlineFindings || []).length, 0, 'Expected permitted DG008 and DG005(warning) suppressions to pass');
+  assert.equal(suppressedReport.suppressions?.length, 2);
   assert.deepEqual(
     suppressedReport.suppressions?.map((s) => ({ ruleId: s.ruleId, kind: s.kind })),
     [
-      { ruleId: 'DG004', kind: 'inSource' },
       { ruleId: 'DG008', kind: 'inSource' },
       { ruleId: 'DG005', kind: 'inSource' },
     ]
@@ -1364,13 +1365,15 @@ test('21. Lexer ignores suppression markers in literals/regexes and honors real 
   assert.ok(suppressedReport.skor.totalScore >= 85, `Expected clean score after suppression, got ${suppressedReport.skor.totalScore}`);
 });
 
-test('22. Non-bypassable suppression policy rejects inline suppressions for DG001, DG006, DG007, and critical DG005(error)', () => {
+test('22. Non-bypassable suppression policy rejects inline suppressions for DG001, DG004, DG006, DG007, and critical DG005(error)', () => {
   const fakeKey = 'AIza' + 'SyD-9k8L7m6N5p4Q3r2S1t0U9v8W7x6Y5z4';
   const bypassAttemptCode = [
+    '// devguard-ignore DG004: pretending slopsquatted package is vendored safe',
+    "import _ from 'lodahs';",
     'export async function dangerousTransfer(req: { query: { cmd: string } }, account: { balance: number }, amount: number) {',
     '  // devguard-ignore DG001: pretending eval is safe here',
     '  const evalRes = eval(req.query.cmd);',
-    `  // devguard-ignore DG007: pretending temporary key is acceptable`,
+    '  // devguard-ignore DG007: pretending temporary key is acceptable',
     `  const apiKey = "${fakeKey}";`,
     '  if (account.balance >= amount) {',
     '    await chargeGateway();',
@@ -1381,18 +1384,21 @@ test('22. Non-bypassable suppression policy rejects inline suppressions for DG00
     '    await chargePayment(account, amount);',
     '  // devguard-ignore DG005: pretending payment error catch can be ignored',
     '  } catch (err) {}',
-    '  return { evalRes, apiKey };',
+    '  return { evalRes, apiKey, _ };',
     '}',
   ].join('\n');
 
   const report = analyzeCodeDeterministically(bypassAttemptCode, { filePath: 'src/bypass.ts' });
   const inline = report.inlineFindings || [];
 
+  const dg004 = inline.find((f) => f.ruleId === 'DG004');
   const dg005 = inline.find((f) => f.ruleId === 'DG005');
   const dg006 = inline.find((f) => f.ruleId === 'DG006');
   const dg007 = inline.find((f) => f.ruleId === 'DG007');
+  assert.ok(dg004 && dg004.severity === 'error', 'DG004 finding must remain active when inline suppression attempted');
   assert.ok(dg005 && dg005.severity === 'error', 'DG005 error finding must remain active');
   assert.ok(dg006 && dg007, 'DG006 and DG007 findings must remain active');
+  assert.match(dg004.message, /cannot be suppressed inline/i);
   assert.match(dg005.message, /cannot be suppressed inline/i);
   assert.match(dg006.message, /cannot be suppressed inline/i);
   assert.match(dg007.message, /cannot be suppressed inline/i);
@@ -1436,6 +1442,7 @@ test('23. loadVerifiedAllowlist reads base branch strictly, validates entries, d
 
   const prResult = loadVerifiedAllowlist({
     baseRef: 'main',
+    eventName: 'pull_request',
     isCi: true,
     readBaseFile: (ref) => {
       assert.equal(ref, 'origin/main:.devguard.json');
@@ -1510,6 +1517,7 @@ test('23. loadVerifiedAllowlist reads base branch strictly, validates entries, d
   // Fail-safe when base ref is unreadable in CI
   const unreadableBase = loadVerifiedAllowlist({
     baseRef: 'main',
+    eventName: 'pull_request',
     isCi: true,
     readBaseFile: () => null,
     readWorkingFile: () => prEditedAllowlist,
@@ -1601,11 +1609,21 @@ test('24. Sticky PR summary comment renders Active Suppressions table, invalid a
       invalidAllowlistEntries: ['Rejected disallowed allowlist rule "DG001" for "src/legacy/**"'],
       suppressions: [
         {
+          ruleId: 'DG008',
+          targetLine: 12,
+          commentLine: 11,
+          reason: 'Upstream request controller enforces abort deadline',
+          kind: 'inSource',
+          filePath: 'src/legacy/wrapper.ts',
+          severity: 'warning',
+          message: 'fetch() without inline AbortSignal.timeout',
+        },
+        {
           ruleId: 'DG004',
           targetLine: 2,
-          commentLine: 1,
+          commentLine: 0,
           reason: 'Vendored workspace package verified in root lockfile',
-          kind: 'inSource',
+          kind: 'external',
           filePath: 'src/legacy/wrapper.ts',
           severity: 'error',
           message: "Typosquatted package 'lodahs'",
@@ -1627,7 +1645,8 @@ test('24. Sticky PR summary comment renders Active Suppressions table, invalid a
 
     assert.ok(postedBody.includes('allowlist config (.devguard.json) changed in this PR; changes apply only after merge'));
     assert.ok(postedBody.includes('| File | Line | Rule | Kind | Reason |'));
-    assert.ok(postedBody.includes('`src/legacy/wrapper.ts` | 2 | `DG004` | `inSource` | Vendored workspace package verified in root lockfile'));
+    assert.ok(postedBody.includes('`src/legacy/wrapper.ts` | 12 | `DG008` | `inSource` | Upstream request controller enforces abort deadline'));
+    assert.ok(postedBody.includes('`src/legacy/wrapper.ts` | 2 | `DG004` | `external` | Vendored workspace package verified in root lockfile'));
     assert.ok(postedBody.includes('`src/legacy/wrapper.ts` | 18 | `DG006` | `external` | Protected by distributed queue lock in caller'));
     assert.ok(postedBody.includes('Rejected disallowed allowlist rule'));
   } finally {
@@ -2208,7 +2227,7 @@ test('30. SARIF output includes exact security-severity ratings (DG001-DG008), P
     const stripTypesSarif = path.join(tempDir, 'strip-types.sarif');
     const stripRun = spawnSync(
       process.execPath,
-      ['--experimental-strip-types', path.join(REPO_ROOT, 'src', 'cli.ts'), path.join(REPO_ROOT, 'src', 'devguardAnalyzer.ts')],
+      ['--experimental-strip-types', path.join(REPO_ROOT, 'src', 'loader.mjs'), path.join(REPO_ROOT, 'src', 'devguardAnalyzer.ts')],
       {
         cwd: REPO_ROOT,
         encoding: 'utf-8',
@@ -2217,6 +2236,7 @@ test('30. SARIF output includes exact security-severity ratings (DG001-DG008), P
           GEMINI_API_KEY: '',
           GITHUB_ACTIONS: '',
           GITHUB_EVENT_PATH: '',
+          GITHUB_EVENT_NAME: '',
           DEVGUARD_SARIF_OUTPUT: stripTypesSarif,
         },
       }
@@ -2224,9 +2244,345 @@ test('30. SARIF output includes exact security-severity ratings (DG001-DG008), P
     assert.equal(
       stripRun.status,
       0,
-      `Expected node --experimental-strip-types src/cli.ts src/devguardAnalyzer.ts to exit 0, stderr: ${stripRun.stderr}`
+      `Expected node --experimental-strip-types src/loader.mjs src/devguardAnalyzer.ts to exit 0, stderr: ${stripRun.stderr}`
     );
-    assert.ok(fs.existsSync(stripTypesSarif), 'Expected SARIF output from direct --experimental-strip-types run');
+    assert.ok(fs.existsSync(stripTypesSarif), 'Expected SARIF output from direct --experimental-strip-types loader run');
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('31. ESM loader.mjs executes CLI cleanly without compile and auto-discovery excludes tests/** and scripts/**', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-loader-discovery-'));
+  try {
+    const sarifOut = path.join(tempDir, 'loader-run.sarif');
+    const loaderRun = spawnSync(
+      process.execPath,
+      ['--experimental-strip-types', path.join(REPO_ROOT, 'src', 'loader.mjs'), path.join(REPO_ROOT, 'src', 'devguardAnalyzer.ts')],
+      {
+        cwd: REPO_ROOT,
+        encoding: 'utf-8',
+        env: {
+          ...process.env,
+          GEMINI_API_KEY: '',
+          GITHUB_ACTIONS: '',
+          GITHUB_EVENT_PATH: '',
+          GITHUB_EVENT_NAME: '',
+          DEVGUARD_SARIF_OUTPUT: sarifOut,
+        },
+      }
+    );
+    assert.equal(loaderRun.status, 0, `loader.mjs run failed: ${loaderRun.stderr}`);
+    assert.ok(fs.existsSync(sarifOut), 'Expected loader.mjs run to generate SARIF output');
+
+    assert.equal(isExcludedFromAutoDiscovery('tests/corpus/cases.ts'), true);
+    assert.equal(isExcludedFromAutoDiscovery('tests/integration.test.ts'), true);
+    assert.equal(isExcludedFromAutoDiscovery('scripts/corpus-report.ts'), true);
+    assert.equal(isExcludedFromAutoDiscovery('scripts/realworld-negatives.ts'), true);
+    assert.equal(isExcludedFromAutoDiscovery('src/widget.test.ts'), true);
+    assert.equal(isExcludedFromAutoDiscovery('src/widget.spec.ts'), true);
+    assert.equal(isExcludedFromAutoDiscovery('src/cli.ts'), false);
+
+    const allFiles = discoverWorkspaceFiles('all', REPO_ROOT).map((p) =>
+      path.relative(REPO_ROOT, p).replace(/\\/g, '/')
+    );
+    assert.ok(allFiles.some((p) => p === 'src/cli.ts'), 'Expected src/cli.ts in workspace scan');
+    assert.equal(
+      allFiles.some((p) => p.startsWith('tests/') || p.startsWith('scripts/')),
+      false,
+      `Auto-discovery must exclude tests/** and scripts/**, got: ${JSON.stringify(allFiles)}`
+    );
+
+    // Verify modified discovery in an isolated git repo excludes tests/ & scripts/ while preserving src/
+    const repoDir = path.join(tempDir, 'mini-repo');
+    fs.mkdirSync(path.join(repoDir, 'src'), { recursive: true });
+    fs.mkdirSync(path.join(repoDir, 'tests'), { recursive: true });
+    fs.mkdirSync(path.join(repoDir, 'scripts'), { recursive: true });
+    const git = (args: string[]) =>
+      spawnSync('git', args, { cwd: repoDir, encoding: 'utf-8' });
+    git(['init']);
+    git(['config', 'user.email', 'ci@devguard.local']);
+    git(['config', 'user.name', 'DevGuard Test']);
+    fs.writeFileSync(path.join(repoDir, 'src', 'index.ts'), 'export const a = 1;\n', 'utf-8');
+    git(['add', '.']);
+    git(['commit', '-m', 'init']);
+    fs.writeFileSync(path.join(repoDir, 'src', 'index.ts'), 'export const a = 2;\n', 'utf-8');
+    fs.writeFileSync(path.join(repoDir, 'tests', 'vulnFixture.ts'), 'export const x = eval("1+1");\n', 'utf-8');
+    fs.writeFileSync(path.join(repoDir, 'scripts', 'helper.ts'), 'export const y = 2;\n', 'utf-8');
+    git(['add', '.']);
+    git(['commit', '-m', 'modify src and test fixture']);
+
+    const modifiedFiles = discoverWorkspaceFiles('modified', repoDir);
+    assert.deepEqual(modifiedFiles, ['src/index.ts']);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('32. Meaningful suppression reasons reject single-word/char padding while base-branch .devguard.json allows DG004', () => {
+  const paddedReasonsCode = [
+    'export async function paddedCases() {',
+    '  // devguard-ignore DG008: xxxxxxxx',
+    '  await fetch("https://api.openai.com/v1/chat");',
+    '  // devguard-ignore DG008: ........',
+    '  await fetch("https://api.anthropic.com/v1/messages");',
+    '  try { await chargeGateway(); } catch (e) {} // devguard-ignore DG005: singlewordpadding',
+    '}',
+  ].join('\n');
+
+  const paddedReport = analyzeCodeDeterministically(paddedReasonsCode, { filePath: 'src/padded.ts' });
+  assert.equal((paddedReport.inlineFindings || []).filter((f) => f.ruleId === 'DG008').length, 2);
+  assert.equal((paddedReport.inlineFindings || []).filter((f) => f.ruleId === 'DG005').length, 1);
+  assert.equal(paddedReport.suppressions, undefined);
+
+  const dg004BypassCode = [
+    '// devguard-ignore DG004: internal monorepo package aliased safely',
+    "import _ from 'lodahs';",
+    'export const val = typeof _;',
+  ].join('\n');
+  const dg004Blocked = analyzeCodeDeterministically(dg004BypassCode, { filePath: 'src/legacy/pkg.ts' });
+  const dg004Finding = (dg004Blocked.inlineFindings || []).find((f) => f.ruleId === 'DG004');
+  assert.ok(dg004Finding, 'DG004 inline suppression must be rejected');
+  assert.match(dg004Finding.message, /DG004 cannot be suppressed inline/i);
+  assert.equal(dg004Blocked.suppressions, undefined);
+
+  const baseAllowlistJson = JSON.stringify({
+    ignoreRulesByPath: {
+      'src/legacy/**': [
+        { rule: 'DG004', reason: 'xxxxxxxx' },
+        { rule: 'DG004', reason: '........' },
+        { rule: 'DG004', reason: 'Vendored workspace package verified in root lockfile' },
+      ],
+    },
+  });
+  const loaded = loadVerifiedAllowlist({
+    baseRef: 'main',
+    eventName: 'pull_request',
+    isCi: true,
+    readBaseFile: () => baseAllowlistJson,
+    readWorkingFile: () => baseAllowlistJson,
+  });
+  assert.equal(loaded.invalidAllowlistEntries.length, 2, 'Dummy padding reasons in .devguard.json must be rejected');
+  const matched = matchAllowlistForFile(loaded, 'src/legacy/pkg.ts');
+  assert.equal(matched.length, 1);
+
+  const allowedReport = analyzeCodeDeterministically(dg004BypassCode, {
+    filePath: 'src/legacy/pkg.ts',
+    externalAllowlist: matched,
+  });
+  assert.equal((allowedReport.inlineFindings || []).length, 0);
+  assert.equal(allowedReport.suppressions?.length, 1);
+  assert.equal(allowedReport.suppressions?.[0].kind, 'external');
+  assert.equal(allowedReport.suppressions?.[0].ruleId, 'DG004');
+});
+
+test('33. Gemini uses x-goog-api-key header, Layer 2 hallucination cap protects clean code, expanded secret filenames abort, and PR comments sanitize mentions/images', async () => {
+  const cleanCode = [
+    'export function normalizeTitle(input: string): string {',
+    '  if (typeof input !== "string") {',
+    '    throw new Error("Expected string input");',
+    '  }',
+    '  try {',
+    '    return input.trim();',
+    '  } catch (err) {',
+    '    throw err;',
+    '  }',
+    '}',
+  ].join('\n');
+
+  const l1Clean = analyzeCodeDeterministically(cleanCode, { filePath: 'src/cleanTitle.ts' });
+  assert.equal((l1Clean.inlineFindings || []).length, 0);
+  assert.ok(l1Clean.skor.totalScore >= 90, `Expected L1 totalScore >= 90, got ${l1Clean.skor.totalScore}`);
+
+  const origFetch = globalThis.fetch;
+  let capturedUrl = '';
+  let capturedHeaders: Record<string, string> = {};
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    capturedUrl = String(input);
+    capturedHeaders = Object.fromEntries(new Headers(init?.headers).entries());
+    return new Response(
+      JSON.stringify({
+        candidates: [
+          {
+            content: {
+              parts: [
+                {
+                  text: JSON.stringify({
+                    apresiasi: 'Good attempt',
+                    skor: { security: 10, correctness: 15, maintainability: 20 },
+                    temuanUtama: { line: '1', description: 'Hallucinated critical warning' },
+                    analogi: { story: 'Test', technicalTerm: 'Hallucination' },
+                  }),
+                },
+              ],
+            },
+          },
+        ],
+      }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } }
+    );
+  }) as typeof globalThis.fetch;
+
+  try {
+    const fakeKey = 'AIzaSy' + 'HeaderOnlyTestKeyValue1234567890';
+    const hybrid = await evaluateCodeHybrid(cleanCode, fakeKey, l1Clean, 'src/cleanTitle.ts', undefined, false);
+    assert.ok(!capturedUrl.includes('?key='), `Gemini URL must never contain ?key= query string, got ${capturedUrl}`);
+    assert.equal(capturedHeaders['x-goog-api-key'], fakeKey, 'Expected Gemini key in x-goog-api-key header');
+    assert.equal(hybrid.layer2Status, 'Verified');
+    assert.ok(
+      hybrid.parsedReport.skor.totalScore >= 85,
+      `Hallucination gate must cap clean Layer 1 deductions at >= 85, got ${hybrid.parsedReport.skor.totalScore}`
+    );
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+
+  const extraSensitive = [
+    '.npmrc',
+    '.netrc',
+    '.pgpass',
+    'deploy/kubeconfig',
+    'deploy/kubeconfig.prod',
+    'terraform/prod.tfvars',
+    'terraform/terraform.tfstate',
+    'certs/app.jks',
+    'certs/upload.keystore',
+    'secrets/db-credentials.json',
+    'gcp/service-account.json',
+  ];
+  for (const sensitivePath of extraSensitive) {
+    const gate = prepareRedactedCodeForLlm(sensitivePath, 'export const safe = true;');
+    assert.equal(gate.aborted, true, `Expected ${sensitivePath} to abort Layer 2 immediately`);
+    assert.equal(gate.safeCode, '');
+  }
+
+  const sanitized = sanitizeMarkdownText('Notify @admin and @security-team! ![px](https://evil.example/track.png)');
+  assert.ok(!sanitized.includes('@admin'), '@admin mention must be neutralized');
+  assert.ok(sanitized.includes('@\u200Badmin'), 'Expected zero-width space mention neutralization');
+  assert.ok(sanitized.includes('@\u200Bsecurity-team'));
+  assert.ok(!sanitized.includes('![px]('), 'External markdown image tag must be blocked');
+  assert.ok(sanitized.includes('[blocked-external-image: px]'));
+
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-sanitize-pr-'));
+  const postedBodies: string[] = [];
+  const server = http.createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on('data', (c: Buffer) => chunks.push(c));
+    req.on('end', () => {
+      const raw = Buffer.concat(chunks).toString('utf-8');
+      if (req.method === 'POST' && raw) postedBodies.push(raw);
+      res.writeHead(req.method === 'GET' ? 200 : 201, { 'Content-Type': 'application/json' });
+      res.end(req.method === 'GET' ? '[]' : JSON.stringify({ id: 707 }));
+    });
+  });
+
+  const prevEnv = {
+    GITHUB_TOKEN: process.env.GITHUB_TOKEN,
+    GITHUB_REPOSITORY: process.env.GITHUB_REPOSITORY,
+    GITHUB_EVENT_PATH: process.env.GITHUB_EVENT_PATH,
+    GITHUB_API_URL: process.env.GITHUB_API_URL,
+  };
+
+  try {
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const addr = server.address() as { port: number };
+    const eventPath = path.join(tempDir, 'pr.json');
+    fs.writeFileSync(
+      eventPath,
+      JSON.stringify({
+        pull_request: { number: 808, head: { repo: { full_name: 'OkyWoww/DevGuard' } } },
+        repository: { full_name: 'OkyWoww/DevGuard' },
+      }),
+      'utf-8'
+    );
+    process.env.GITHUB_TOKEN = 'test-token';
+    process.env.GITHUB_REPOSITORY = 'OkyWoww/DevGuard';
+    process.env.GITHUB_EVENT_PATH = eventPath;
+    process.env.GITHUB_API_URL = `http://127.0.0.1:${addr.port}`;
+
+    const summary: FileAuditSummary = {
+      filePath: 'src/prompt.ts',
+      security: 80,
+      correctness: 90,
+      maintainability: 90,
+      overall: 87,
+      passed: false,
+      fatalFlaws: ['Injected @everyone ![tracker](https://evil.example/pixel.gif)'],
+      defenseInDepth: ['Ping @alice ![img](http://evil.example/b.png)'],
+      inlineFindings: [
+        {
+          ruleId: 'DG004',
+          line: 1,
+          severity: 'error',
+          message: 'Ping @bob ![p](https://evil.example/i.png)',
+          suggestion: "import { PrismaClient } from '@prisma/client';",
+        },
+      ],
+    };
+    await postPullRequestComment([summary], 85, 'HYBRID');
+    await postInlineReviewComments([summary]);
+
+    assert.equal(postedBodies.length, 2);
+    assert.ok(postedBodies[0].includes('@\u200Beveryone'));
+    assert.ok(postedBodies[0].includes('[blocked-external-image: tracker]'));
+    assert.ok(postedBodies[1].includes('@\u200Bbob'));
+    assert.ok(postedBodies[1].includes('@prisma/client'), 'Scoped package code suggestions must remain intact');
+  } finally {
+    process.env.GITHUB_TOKEN = prevEnv.GITHUB_TOKEN;
+    process.env.GITHUB_REPOSITORY = prevEnv.GITHUB_REPOSITORY;
+    process.env.GITHUB_EVENT_PATH = prevEnv.GITHUB_EVENT_PATH;
+    process.env.GITHUB_API_URL = prevEnv.GITHUB_API_URL;
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('34. CLI rejects pull_request_target at runtime and skips files exceeding 1MB ReDoS safety limit', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-guardrails-'));
+  try {
+    const compiledCliPath = path.join(BUILD_ROOT, 'src', 'cli.js');
+    const cleanFile = path.join(tempDir, 'clean.ts');
+    fs.writeFileSync(cleanFile, 'export const safeFlag = true;\n', 'utf-8');
+
+    const prTargetRun = spawnSync(process.execPath, [compiledCliPath, cleanFile], {
+      cwd: tempDir,
+      encoding: 'utf-8',
+      env: {
+        ...process.env,
+        GITHUB_EVENT_NAME: 'pull_request_target',
+        GEMINI_API_KEY: '',
+        GITHUB_TOKEN: '',
+        GITHUB_EVENT_PATH: '',
+      },
+    });
+    assert.equal(prTargetRun.status, 1, 'Expected pull_request_target to fail with exit code 1');
+    assert.match(`${prTargetRun.stderr}\n${prTargetRun.stdout}`, /pull_request_target/i);
+
+    const hugeFile = path.join(tempDir, 'hugeBundle.ts');
+    const paddingLine = '// safe generated bundle padding line 0123456789abcdef\n';
+    const repetitions = Math.ceil((MAX_AUDIT_FILE_BYTES + 2048) / Buffer.byteLength(paddingLine, 'utf-8'));
+    fs.writeFileSync(hugeFile, paddingLine.repeat(repetitions), 'utf-8');
+    assert.ok(fs.statSync(hugeFile).size > MAX_AUDIT_FILE_BYTES);
+
+    const hugeSarif = path.join(tempDir, 'huge.sarif');
+    const hugeRun = spawnSync(process.execPath, [compiledCliPath, hugeFile], {
+      cwd: tempDir,
+      encoding: 'utf-8',
+      env: {
+        ...process.env,
+        GITHUB_EVENT_NAME: '',
+        GEMINI_API_KEY: '',
+        GITHUB_TOKEN: '',
+        GITHUB_EVENT_PATH: '',
+        DEVGUARD_SARIF_OUTPUT: hugeSarif,
+      },
+    });
+    assert.equal(hugeRun.status, 0, `Expected >1MB file to be skipped cleanly with exit 0, stderr: ${hugeRun.stderr}`);
+    assert.ok(
+      `${hugeRun.stderr}\n${hugeRun.stdout}`.includes('Skipped: File exceeds 1MB ReDoS safety limit'),
+      `Expected 1MB skip warning, got:\n${hugeRun.stdout}\n${hugeRun.stderr}`
+    );
+    assert.ok(fs.existsSync(hugeSarif), 'Expected SARIF output even when >1MB file is skipped');
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }

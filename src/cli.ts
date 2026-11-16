@@ -1,76 +1,23 @@
 #!/usr/bin/env node
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { execFileSync, execSync } from 'node:child_process';
-import * as nodeModule from 'node:module';
-import { fileURLToPath } from 'node:url';
-import type { ParsedDevGuardReport } from './devguardAnalyzer.js';
-import type { FileAuditSummary, PrEnvironmentInfo } from './githubCommenter.js';
-
-const { builtinModules } = nodeModule;
-
-// Enable direct zero-compile execution (`node --experimental-strip-types src/cli.ts`)
-// by resolving relative `./*.js` specifiers to sibling `./*.ts` files when running from source.
-const registerHooksFn = (
-  nodeModule as unknown as {
-    registerHooks?: (hooks: {
-      resolve?: (
-        specifier: string,
-        context: { parentURL?: string },
-        nextResolve: (spec: string, ctx: { parentURL?: string }) => unknown
-      ) => unknown;
-    }) => void;
-  }
-).registerHooks;
-
-if (typeof registerHooksFn === 'function') {
-  registerHooksFn({
-    resolve(specifier, context, nextResolve) {
-      try {
-        return nextResolve(specifier, context);
-      } catch (err) {
-        if (specifier.startsWith('.') && specifier.endsWith('.js') && context.parentURL) {
-          const tsUrl = new URL(specifier.slice(0, -3) + '.ts', context.parentURL);
-          if (fs.existsSync(fileURLToPath(tsUrl))) {
-            return nextResolve(tsUrl.href, context);
-          }
-        }
-        throw err;
-      }
-    },
-  });
-} else if (typeof (nodeModule as { register?: unknown }).register === 'function') {
-  const fallbackLoader = [
-    "import * as fs from 'node:fs';",
-    "import { fileURLToPath } from 'node:url';",
-    'export async function resolve(specifier, context, nextResolve) {',
-    '  try {',
-    '    return await nextResolve(specifier, context);',
-    '  } catch (err) {',
-    "    if (specifier.startsWith('.') && specifier.endsWith('.js') && context.parentURL) {",
-    "      const tsUrl = new URL(specifier.slice(0, -3) + '.ts', context.parentURL);",
-    '      if (fs.existsSync(fileURLToPath(tsUrl))) return nextResolve(tsUrl.href, context);',
-    '    }',
-    '    throw err;',
-    '  }',
-    '}',
-  ].join('\n');
-  (nodeModule as { register: (spec: string) => void }).register(
-    'data:text/javascript,' + encodeURIComponent(fallbackLoader)
-  );
-}
-
-const {
+import { execFileSync } from 'node:child_process';
+import { builtinModules } from 'node:module';
+import {
   analyzeCodeDeterministically,
+  isValidSuppressionReason,
   prepareRedactedCodeForLlm,
   redactSecretsPreservingLayout,
-} = await import('./devguardAnalyzer.js');
-const {
+  type ParsedDevGuardReport,
+} from './devguardAnalyzer.js';
+import {
   detectPrEnvironment,
   postInlineReviewComments,
   postPullRequestComment,
-} = await import('./githubCommenter.js');
-const { generateSarifReport } = await import('./sarifGenerator.js');
+  type FileAuditSummary,
+  type PrEnvironmentInfo,
+} from './githubCommenter.js';
+import { generateSarifReport } from './sarifGenerator.js';
 
 function loadDotEnvIfPresent(): void {
   try {
@@ -165,6 +112,27 @@ function isValidAllowlistPathKey(rawKey: string): string | null {
   return norm;
 }
 
+function ensureOriginBaseRefFetched(baseRef: string | undefined, cwd: string): void {
+  if (!baseRef || baseRef.startsWith('-')) return;
+  try {
+    execFileSync('git', ['rev-parse', '--verify', `origin/${baseRef}`], {
+      cwd,
+      stdio: ['ignore', 'ignore', 'ignore'],
+    });
+    return;
+  } catch {
+    // Shallow clone lacks origin/<baseRef>; perform best-effort fetch
+  }
+  try {
+    execFileSync('git', ['fetch', '--no-tags', '--depth=1', 'origin', baseRef], {
+      cwd,
+      stdio: ['ignore', 'ignore', 'ignore'],
+    });
+  } catch {
+    // Fail safe if remote/git is unavailable
+  }
+}
+
 /**
  * Loads `.devguard.json` using base-branch verification on PR/push CI events so PR authors
  * cannot weaken security rules inside the same PR. Fails closed to empty allowlist on git errors.
@@ -172,13 +140,22 @@ function isValidAllowlistPathKey(rawKey: string): string | null {
 export function loadVerifiedAllowlist(options?: LoadAllowlistOptions): VerifiedAllowlistResult {
   const cwd = options?.cwd || process.cwd();
   const baseRef = options?.baseRef !== undefined ? options.baseRef : process.env.GITHUB_BASE_REF;
-  const eventName = options?.eventName !== undefined ? options.eventName : process.env.GITHUB_EVENT_NAME;
+  const eventName =
+    options?.eventName !== undefined
+      ? options.eventName
+      : options?.baseRef
+        ? 'pull_request'
+        : process.env.GITHUB_EVENT_NAME;
   const beforeSha =
     options?.beforeSha !== undefined
       ? options.beforeSha
       : readBeforeShaFromEventFile(options?.eventPath ?? process.env.GITHUB_EVENT_PATH);
   const isCi =
     options?.isCi !== undefined ? options.isCi : process.env.GITHUB_ACTIONS === 'true';
+
+  if (baseRef && eventName !== 'push' && !options?.readBaseFile) {
+    ensureOriginBaseRefFetched(baseRef, cwd);
+  }
 
   const readBase =
     options?.readBaseFile ||
@@ -266,7 +243,7 @@ export function loadVerifiedAllowlist(options?: LoadAllowlistOptions): VerifiedA
         invalidAllowlistEntries.push(`Rejected disallowed allowlist rule "${String(candidate.rule)}" for "${validKey}"`);
         continue;
       }
-      if (typeof candidate.reason !== 'string' || candidate.reason.trim().length < 8) {
+      if (!isValidSuppressionReason(candidate.reason)) {
         invalidAllowlistEntries.push(`Rejected short/missing reason for ${candidate.rule} under "${validKey}"`);
         continue;
       }
@@ -440,10 +417,13 @@ export async function evaluateCodeHybrid(
     ].join('\n');
 
     const model = 'gemini-3.8-flash';
-    const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(activeKey)}`;
+    const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
     const apiResponse = await fetch(geminiUrl, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': activeKey,
+      },
       signal: AbortSignal.timeout(6500),
       body: JSON.stringify({
         contents: [{ parts: [{ text: prompt }] }],
@@ -508,11 +488,24 @@ export async function evaluateCodeHybrid(
     const rawResponseText = redactSecretsPreservingLayout(candidateText.trim());
     const geminiData = JSON.parse(rawResponseText);
 
-    // Ceilings enforced by Layer 1 zero-leniency rubric
-    const reconciledSecurity = Math.min(l1Result.skor.security, geminiData.skor?.security ?? 100);
-    const reconciledCorrectness = Math.min(l1Result.skor.correctness, geminiData.skor?.correctness ?? 100);
-    const reconciledMaintainability = Math.min(l1Result.skor.maintainability, geminiData.skor?.maintainability ?? 100);
-    const reconciledTotal = Math.round((reconciledSecurity + reconciledCorrectness + reconciledMaintainability) / 3);
+    // Ceilings enforced by Layer 1 zero-leniency rubric; hallucination gate prevents unverified LLM prose
+    // from dragging a clean Layer 1 file (0 findings, totalScore >= 90) below minScore.
+    const rawMinScore = parseInt(process.env.DEVGUARD_MIN_SCORE || '85', 10);
+    const minScore = Number.isFinite(rawMinScore) ? rawMinScore : 85;
+    const isLayer1Clean =
+      (l1Result.inlineFindings?.length ?? 0) === 0 &&
+      l1Result.temuanUtama.line === '-' &&
+      l1Result.skor.totalScore >= 90;
+
+    const rawSecurity = Math.min(l1Result.skor.security, geminiData.skor?.security ?? 100);
+    const rawCorrectness = Math.min(l1Result.skor.correctness, geminiData.skor?.correctness ?? 100);
+    const rawMaintainability = Math.min(l1Result.skor.maintainability, geminiData.skor?.maintainability ?? 100);
+
+    const reconciledSecurity = isLayer1Clean ? Math.max(minScore, rawSecurity) : rawSecurity;
+    const reconciledCorrectness = isLayer1Clean ? Math.max(minScore, rawCorrectness) : rawCorrectness;
+    const reconciledMaintainability = isLayer1Clean ? Math.max(minScore, rawMaintainability) : rawMaintainability;
+    const rawTotal = Math.round((reconciledSecurity + reconciledCorrectness + reconciledMaintainability) / 3);
+    const reconciledTotal = isLayer1Clean ? Math.max(minScore, rawTotal) : rawTotal;
 
     const redactList = (items?: string[]): string[] | undefined =>
       items?.length ? items.map((s) => redactSecretsPreservingLayout(String(s))) : undefined;
@@ -587,7 +580,106 @@ function resolveCliFileArgs(args: string[]): string[] {
   return Array.from(new Set(resolved));
 }
 
+export const MAX_AUDIT_FILE_BYTES = 1_048_576;
+
+const AUTO_DISCOVERY_EXCLUDED_DIRS = new Set([
+  'node_modules',
+  'dist',
+  'build',
+  'coverage',
+  'remotion',
+  'out',
+  'tests',
+  'scripts',
+]);
+
+/** Returns true when a path belongs to tests, scripts, build artifacts, or excluded self-reference files. */
+export function isExcludedFromAutoDiscovery(filePath: string, cwd: string = process.cwd()): boolean {
+  const rel = path.isAbsolute(filePath) ? path.relative(cwd, filePath) : filePath;
+  const posix = rel.replace(/\\/g, '/').replace(/^\.\//, '');
+  if (!posix || posix.startsWith('..')) return true;
+
+  const segments = posix.split('/');
+  const fileName = segments[segments.length - 1] || '';
+  if (segments.some((seg) => seg.startsWith('.') && seg !== '.')) return true;
+  if (segments.some((seg) => AUTO_DISCOVERY_EXCLUDED_DIRS.has(seg))) return true;
+
+  return (
+    !/\.(py|ts|js|jsx|tsx)$/.test(fileName) ||
+    fileName.endsWith('.d.ts') ||
+    fileName.includes('.test.') ||
+    fileName.includes('.spec.') ||
+    fileName === 'devguardAnalyzer.ts' ||
+    fileName === 'devguard_verify.py'
+  );
+}
+
+/** Discovers workspace audit targets automatically for `'modified'` (git diff) or `'all'` mode. */
+export function discoverWorkspaceFiles(mode: 'modified' | 'all', cwd: string = process.cwd()): string[] {
+  if (mode === 'all') {
+    const scanDir = (dir: string): string[] => {
+      const results: string[] = [];
+      const list = fs.readdirSync(dir, { withFileTypes: true });
+      for (const item of list) {
+        if (item.name.startsWith('.') || AUTO_DISCOVERY_EXCLUDED_DIRS.has(item.name)) {
+          continue;
+        }
+        const full = path.join(dir, item.name);
+        if (item.isDirectory()) {
+          results.push(...scanDir(full));
+        } else if (!isExcludedFromAutoDiscovery(full, cwd)) {
+          results.push(full);
+        }
+      }
+      return results;
+    };
+    return scanDir(cwd);
+  }
+
+  const baseRef = process.env.GITHUB_BASE_REF;
+  if (baseRef) {
+    ensureOriginBaseRefFetched(baseRef, cwd);
+  }
+
+  const runGitDiff = (args: string[]): string | null => {
+    try {
+      return execFileSync('git', args, {
+        cwd,
+        encoding: 'utf-8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
+    } catch {
+      return null;
+    }
+  };
+
+  let diffOutput: string | null = null;
+  if (baseRef && !baseRef.startsWith('-')) {
+    diffOutput = runGitDiff(['diff', '--name-only', `origin/${baseRef}...HEAD`]);
+  }
+  if (diffOutput === null) {
+    diffOutput = runGitDiff(['diff', '--name-only', 'HEAD~1', 'HEAD']) ?? runGitDiff(['diff', '--name-only', 'HEAD']);
+  }
+
+  if (diffOutput === null) {
+    console.warn('⚠️  Git diff tidak menemukan riwayat commit; beralih ke pengecekan berkas lokal.');
+    return [];
+  }
+
+  return diffOutput
+    .split('\n')
+    .map((f) => f.trim())
+    .filter((f) => Boolean(f) && !isExcludedFromAutoDiscovery(f, cwd));
+}
+
 export async function runAction() {
+  if (process.env.GITHUB_EVENT_NAME === 'pull_request_target') {
+    console.error(
+      '🚨 Fatal Security Error: Running DevGuard on pull_request_target is forbidden due to pwn-request secret-exfiltration risks. Switch workflow trigger to pull_request.'
+    );
+    process.exit(1);
+  }
+
   const apiKey = process.env.GEMINI_API_KEY;
   const minScore = parseInt(process.env.DEVGUARD_MIN_SCORE || '85', 10);
   const targetPattern = process.env.DEVGUARD_TARGET || 'modified';
@@ -612,62 +704,10 @@ export async function runAction() {
   }
 
   // 1. Dapatkan daftar berkas target
-  let filesToAudit: string[] = [];
-
-  if (explicitFileArgs.length > 0) {
-    filesToAudit = explicitFileArgs;
-  } else if (targetPattern === 'all') {
-    // Scan recursively for py, ts, js excluding node_modules, dist, etc.
-    const scanDir = (dir: string): string[] => {
-      let results: string[] = [];
-      const list = fs.readdirSync(dir, { withFileTypes: true });
-      for (const item of list) {
-        if (
-          item.name.startsWith('.') ||
-          ['node_modules', 'dist', 'build', 'coverage', 'remotion', 'out'].includes(item.name) ||
-          item.name.includes('.test.') ||
-          item.name.includes('.spec.') ||
-          item.name === 'devguardAnalyzer.ts' ||
-          item.name === 'devguard_verify.py'
-        ) {
-          continue;
-        }
-        const full = path.join(dir, item.name);
-        if (item.isDirectory()) {
-          results = results.concat(scanDir(full));
-        } else if (/\.(py|ts|js|jsx|tsx)$/.test(item.name) && !item.name.endsWith('.d.ts')) {
-          results.push(full);
-        }
-      }
-      return results;
-    };
-    filesToAudit = scanDir(process.cwd());
-  } else {
-    // Modified files via git diff
-    try {
-      const gitDiff = execSync('git diff --name-only HEAD~1 HEAD || git diff --name-only HEAD', {
-        encoding: 'utf-8',
-        stdio: ['ignore', 'pipe', 'ignore'],
-      });
-      filesToAudit = gitDiff
-        .split('\n')
-        .map((f) => f.trim())
-        .filter(
-          (f) =>
-            f &&
-            /\.(py|ts|js|jsx|tsx)$/.test(f) &&
-            !f.endsWith('.d.ts') &&
-            !f.startsWith('remotion/') &&
-            !f.includes('.test.') &&
-            !f.includes('.spec.') &&
-            !f.endsWith('devguardAnalyzer.ts') &&
-            !f.endsWith('devguard_verify.py')
-        );
-    } catch {
-      console.warn('⚠️  Git diff tidak menemukan riwayat commit; beralih ke pengecekan berkas lokal.');
-      filesToAudit = [];
-    }
-  }
+  const filesToAudit: string[] =
+    explicitFileArgs.length > 0
+      ? explicitFileArgs
+      : discoverWorkspaceFiles(targetPattern === 'all' ? 'all' : 'modified', process.cwd());
 
   if (filesToAudit.length === 0) {
     console.log('\n✅ Tidak ada berkas target (.py, .ts, .js) yang diubah. DevGuard quality check lolos.');
@@ -692,6 +732,11 @@ export async function runAction() {
 
   for (const filePath of filesToAudit) {
     if (!fs.existsSync(filePath)) continue;
+    const stats = fs.statSync(filePath);
+    if (stats.size > MAX_AUDIT_FILE_BYTES) {
+      console.warn(`⚠️  Skipped: File exceeds 1MB ReDoS safety limit (${filePath}, ${stats.size} bytes)`);
+      continue;
+    }
 
     const codeContent = fs.readFileSync(filePath, 'utf-8');
     auditedCount++;
@@ -788,11 +833,8 @@ export async function runAction() {
 }
 
 // Check if run directly
-const isMain = process.argv[1] && (
-  process.argv[1].endsWith('cli.ts') ||
-  process.argv[1].endsWith('cli.js') ||
-  process.argv[1].includes('cli')
-);
+const entryBase = process.argv[1] ? path.basename(process.argv[1]) : '';
+const isMain = entryBase === 'cli.ts' || entryBase === 'cli.js' || entryBase === 'loader.mjs';
 
 if (isMain) {
   runAction().catch((err) => {

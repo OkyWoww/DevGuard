@@ -279,8 +279,11 @@ export function findResidualSecretLikeTokens(code: string): string[] {
 
 const SENSITIVE_BASENAME_PATTERNS: ReadonlyArray<RegExp> = [
   /^\.env(\..+)?$/i,
-  /\.(pem|key|p12|pfx|crt)$/i,
+  /^\.(npmrc|netrc|pgpass)$/i,
+  /^kubeconfig(\..+)?$/i,
+  /\.(pem|key|p12|pfx|crt|tfvars|tfstate|jks|keystore)$/i,
   /^id_(rsa|ed25519|ecdsa)(\..+)?$/i,
+  /(?:credentials|service-account).*\.json$/i,
 ];
 
 export interface PrepareLlmOptions {

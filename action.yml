@@ -34,6 +34,7 @@ runs:
       uses: actions/setup-node@v4
       with:
         node-version: '22'
+        check-latest: true
 
     - name: Run DevGuard CLI Audit Gate
       id: audit_gate
@@ -48,10 +49,10 @@ runs:
         if [ -n "${DEVGUARD_TARGET:-}" ] && [ "${DEVGUARD_TARGET}" != "modified" ] && [ "${DEVGUARD_TARGET}" != "all" ]; then
           TARGET_ARGS+=("${DEVGUARD_TARGET}")
         fi
-        if node --experimental-strip-types -e "" >/dev/null 2>&1; then
-          node --experimental-strip-types "${{ github.action_path }}/src/cli.ts" "${TARGET_ARGS[@]}"
+        if node --experimental-strip-types -e "const m=require('node:module'); if(typeof m.registerHooks!=='function') process.exit(1)" >/dev/null 2>&1; then
+          node --experimental-strip-types "${{ github.action_path }}/src/loader.mjs" "${TARGET_ARGS[@]}"
         else
-          npx --yes tsx "${{ github.action_path }}/src/cli.ts" "${TARGET_ARGS[@]}"
+          npx --yes tsx@4.19.2 "${{ github.action_path }}/src/cli.ts" "${TARGET_ARGS[@]}"
         fi
 
 branding:

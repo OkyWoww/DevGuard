@@ -91,6 +91,16 @@ function escapeTableCell(value: string): string {
   return value.replace(/\|/g, '\\|').replace(/`/g, '\\`').replace(/[\r\n]+/g, ' ');
 }
 
+/** Sanitizes PR comment markdown text: redacts secrets, blocks external image pixels, and neutralizes @mentions. */
+export function sanitizeMarkdownText(value: string): string {
+  const redacted = redactSecretsPreservingLayout(value);
+  const noExternalImages = redacted.replace(
+    /!\[([^\]]*)\]\(\s*https?:\/\/[^)]+\)/gi,
+    (_full, alt: string) => `[blocked-external-image: ${alt}]`
+  );
+  return noExternalImages.replace(/(^|[^A-Za-z0-9_])@([A-Za-z0-9_][A-Za-z0-9_-]*)/g, '$1@\u200B$2');
+}
+
 function normalizePosixRepoPath(filePath: string): string {
   const relPath = path.isAbsolute(filePath) ? path.relative(process.cwd(), filePath) : filePath;
   return relPath.replace(/\\/g, '/').replace(/^\.\//, '');
@@ -168,13 +178,13 @@ export async function postPullRequestComment(
       if (summary.fatalFlaws.length > 0) {
         detailsSection += '**💣 Celah Keamanan / Logika Terdeteksi:**\n';
         summary.fatalFlaws.forEach((flaw) => {
-          detailsSection += `- ❌ ${redactSecretsPreservingLayout(flaw)}\n`;
+          detailsSection += `- ❌ ${sanitizeMarkdownText(flaw)}\n`;
         });
       }
       if (summary.defenseInDepth.length > 0) {
         detailsSection += '\n**🛡️ Catatan Defense-in-Depth (Alasan Skor Tidak 100/100):**\n';
         summary.defenseInDepth.forEach((note) => {
-          detailsSection += `- ⚠️ ${redactSecretsPreservingLayout(note)}\n`;
+          detailsSection += `- ⚠️ ${sanitizeMarkdownText(note)}\n`;
         });
       }
     }
@@ -199,7 +209,7 @@ export async function postPullRequestComment(
     const supRows = allSuppressions
       .map(
         (s) =>
-          `| \`${escapeTableCell(normalizePosixRepoPath(s.filePath))}\` | ${s.targetLine} | \`${s.ruleId}\` | \`${s.kind}\` | ${escapeTableCell(redactSecretsPreservingLayout(s.reason))} |`
+          `| \`${escapeTableCell(normalizePosixRepoPath(s.filePath))}\` | ${s.targetLine} | \`${s.ruleId}\` | \`${s.kind}\` | ${escapeTableCell(sanitizeMarkdownText(s.reason))} |`
       )
       .join('\n');
     suppressionSection += `\n### 🙈 Active Suppressions\n| File | Line | Rule | Kind | Reason |\n| :--- | :---: | :---: | :---: | :--- |\n${supRows}\n`;
@@ -207,7 +217,7 @@ export async function postPullRequestComment(
   if (allInvalidEntries.length > 0) {
     suppressionSection += '\n### ⚠️ Rejected `.devguard.json` Allowlist Entries\n';
     allInvalidEntries.forEach((entry) => {
-      suppressionSection += `- ❌ ${escapeTableCell(redactSecretsPreservingLayout(entry))}\n`;
+      suppressionSection += `- ❌ ${escapeTableCell(sanitizeMarkdownText(entry))}\n`;
     });
   }
 
@@ -298,7 +308,7 @@ export async function postInlineReviewComments(summaries: FileAuditSummary[]): P
 
     for (const finding of summary.inlineFindings) {
       const targetLine = Math.max(1, finding.line);
-      const safeMessage = redactSecretsPreservingLayout(finding.message);
+      const safeMessage = sanitizeMarkdownText(finding.message);
       let body = `🛡️ **[DevGuard ${finding.ruleId}]** (${finding.severity.toUpperCase()}): ${safeMessage}`;
       if (finding.suggestion) {
         body += `\n\n\`\`\`suggestion\n${redactSecretsPreservingLayout(finding.suggestion)}\n\`\`\``;

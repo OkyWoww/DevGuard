@@ -1,8 +1,10 @@
 import {
+  MEANINGFUL_SUPPRESSION_REASON_RE,
   analyzeLexicalStructure,
   calculateShannonEntropy,
   damerauLevenshtein,
   isCommentOrEmptyLine,
+  isValidSuppressionReason,
   type AuditAnalyzeOptions,
   type DevGuardRuleId,
   type InlineFinding,
@@ -28,6 +30,7 @@ import {
 export type { AuditAnalyzeOptions, DevGuardRuleId, InlineFinding, ParsedSuppression, PrepareLlmOptions };
 export {
   DG007_PROVIDER_PATTERNS,
+  MEANINGFUL_SUPPRESSION_REASON_RE,
   POPULAR_NPM_PACKAGES,
   analyzeLexicalStructure,
   calculateShannonEntropy,
@@ -38,6 +41,7 @@ export {
   detectNonAtomicBalanceMutations,
   detectSwallowedExceptions,
   findResidualSecretLikeTokens,
+  isValidSuppressionReason,
   prepareRedactedCodeForLlm,
   redactSecretsPreservingLayout,
 };
@@ -298,7 +302,7 @@ function calculateTotal(items, discountCode) {
 // Evaluates the exact live code string line-by-line on every single audit run.
 // =============================================================================
 
-const INLINE_SUPPRESSIBLE_ALWAYS = new Set<DevGuardRuleId>(['DG004', 'DG008']);
+const INLINE_SUPPRESSIBLE_ALWAYS = new Set<DevGuardRuleId>(['DG008']);
 
 function isInlineSuppressionPermitted(ruleId: DevGuardRuleId, severity?: 'error' | 'warning'): boolean {
   if (INLINE_SUPPRESSIBLE_ALWAYS.has(ruleId)) return true;
