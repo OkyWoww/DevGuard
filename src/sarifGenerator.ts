@@ -266,6 +266,24 @@ export function generateSarifReport(
       const line = extractLineNumber(note);
       results.push(createSarifResult('DG002', 'warning', note, normalizedUri, line));
     }
+
+    // 5. Stage 3a: Emit active suppressions with standard SARIF v2.1.0 suppressions metadata
+    for (const sup of summary.suppressions || []) {
+      const suppressedResult = createSarifResult(
+        sup.ruleId,
+        sup.severity || 'warning',
+        sup.message || `Suppressed ${sup.ruleId} finding: ${sup.reason}`,
+        normalizedUri,
+        sup.targetLine
+      );
+      suppressedResult.suppressions = [
+        {
+          kind: sup.kind,
+          justification: redactSecretsPreservingLayout(sup.reason),
+        },
+      ];
+      results.push(suppressedResult);
+    }
   }
 
   const sarifLog = {

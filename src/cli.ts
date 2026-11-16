@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { execSync } from 'node:child_process';
+import { execFileSync, execSync } from 'node:child_process';
 import { builtinModules } from 'node:module';
 import { GoogleGenAI, Type } from '@google/genai';
 import {
@@ -59,44 +59,255 @@ export interface CliAuditResult {
 
 let loggedRedactedTransmissionNotice = false;
 
-function resolveNearestPackageDependencies(filePath: string): Set<string> | undefined {
+export interface AllowlistRuleEntry {
+  rule: 'DG004' | 'DG006';
+  reason: string;
+}
+
+export interface LoadAllowlistOptions {
+  cwd?: string;
+  baseRef?: string;
+  eventName?: string;
+  beforeSha?: string;
+  eventPath?: string;
+  isCi?: boolean;
+  readBaseFile?: (refSpec: string) => string | null;
+  readWorkingFile?: (filePath: string) => string | null;
+}
+
+export interface VerifiedAllowlistResult {
+  rulesByPath: Map<string, AllowlistRuleEntry[]>;
+  invalidAllowlistEntries: string[];
+  allowlistModifiedInPr: boolean;
+  sourceMode: 'base-pr' | 'base-push' | 'local' | 'empty';
+}
+
+function readBeforeShaFromEventFile(eventPath: string | undefined): string | undefined {
+  if (!eventPath || !fs.existsSync(eventPath)) return undefined;
   try {
+    const parsed = JSON.parse(fs.readFileSync(eventPath, 'utf-8')) as { before?: string };
+    return typeof parsed.before === 'string' ? parsed.before : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function isValidAllowlistPathKey(rawKey: string): string | null {
+  const norm = rawKey.trim().replace(/\\/g, '/').replace(/^\.\//, '');
+  if (
+    !norm ||
+    norm === '*' ||
+    norm === '**' ||
+    norm.startsWith('**/') ||
+    norm.startsWith('/') ||
+    norm.split('/').includes('..')
+  ) {
+    return null;
+  }
+  if (norm.includes('*')) {
+    return /^[^*]+\/\*\*$/.test(norm) ? norm : null;
+  }
+  return norm;
+}
+
+/**
+ * Loads `.devguard.json` using base-branch verification on PR/push CI events so PR authors
+ * cannot weaken security rules inside the same PR. Fails closed to empty allowlist on git errors.
+ */
+export function loadVerifiedAllowlist(options?: LoadAllowlistOptions): VerifiedAllowlistResult {
+  const cwd = options?.cwd || process.cwd();
+  const baseRef = options?.baseRef !== undefined ? options.baseRef : process.env.GITHUB_BASE_REF;
+  const eventName = options?.eventName !== undefined ? options.eventName : process.env.GITHUB_EVENT_NAME;
+  const beforeSha =
+    options?.beforeSha !== undefined
+      ? options.beforeSha
+      : readBeforeShaFromEventFile(options?.eventPath ?? process.env.GITHUB_EVENT_PATH);
+  const isCi =
+    options?.isCi !== undefined ? options.isCi : process.env.GITHUB_ACTIONS === 'true';
+
+  const readBase =
+    options?.readBaseFile ||
+    ((refSpec: string): string | null => {
+      try {
+        return execFileSync('git', ['show', refSpec], {
+          cwd,
+          encoding: 'utf-8',
+          stdio: ['ignore', 'pipe', 'ignore'],
+        });
+      } catch {
+        return null;
+      }
+    });
+
+  const readWorking =
+    options?.readWorkingFile ||
+    ((filePath: string): string | null => {
+      try {
+        return fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf-8') : null;
+      } catch {
+        return null;
+      }
+    });
+
+  const workingRaw = readWorking(path.join(cwd, '.devguard.json'));
+  let activeRaw: string | null = null;
+  let sourceMode: VerifiedAllowlistResult['sourceMode'] = 'empty';
+  let allowlistModifiedInPr = false;
+
+  if (baseRef) {
+    sourceMode = 'base-pr';
+    activeRaw = readBase(`origin/${baseRef}:.devguard.json`);
+    if (workingRaw !== null && (activeRaw === null || workingRaw.trim() !== activeRaw.trim())) {
+      allowlistModifiedInPr = true;
+    }
+  } else if (eventName === 'push' && beforeSha && !/^0+$/.test(beforeSha)) {
+    sourceMode = 'base-push';
+    activeRaw = readBase(`${beforeSha}:.devguard.json`);
+    if (workingRaw !== null && (activeRaw === null || workingRaw.trim() !== activeRaw.trim())) {
+      allowlistModifiedInPr = true;
+    }
+  } else if (!isCi && workingRaw !== null) {
+    sourceMode = 'local';
+    activeRaw = workingRaw;
+    console.warn('Warning: local mode, unverified allowlist (.devguard.json)');
+  }
+
+  const rulesByPath = new Map<string, AllowlistRuleEntry[]>();
+  const invalidAllowlistEntries: string[] = [];
+
+  if (!activeRaw) {
+    return { rulesByPath, invalidAllowlistEntries, allowlistModifiedInPr, sourceMode };
+  }
+
+  let parsedJson: unknown;
+  try {
+    parsedJson = JSON.parse(activeRaw);
+  } catch {
+    invalidAllowlistEntries.push('Malformed JSON in .devguard.json');
+    return { rulesByPath, invalidAllowlistEntries, allowlistModifiedInPr, sourceMode };
+  }
+
+  const rawMap = (parsedJson as { ignoreRulesByPath?: unknown })?.ignoreRulesByPath;
+  if (!rawMap || typeof rawMap !== 'object' || Array.isArray(rawMap)) {
+    invalidAllowlistEntries.push('.devguard.json must contain an ignoreRulesByPath object');
+    return { rulesByPath, invalidAllowlistEntries, allowlistModifiedInPr, sourceMode };
+  }
+
+  for (const [rawKey, rawEntries] of Object.entries(rawMap as Record<string, unknown>)) {
+    const validKey = isValidAllowlistPathKey(rawKey);
+    if (!validKey) {
+      invalidAllowlistEntries.push(`Rejected invalid path pattern: "${rawKey}"`);
+      continue;
+    }
+    if (!Array.isArray(rawEntries)) {
+      invalidAllowlistEntries.push(`Rejected non-array allowlist entry list for "${rawKey}"`);
+      continue;
+    }
+
+    const accepted: AllowlistRuleEntry[] = [];
+    for (const item of rawEntries) {
+      const candidate = item as { rule?: unknown; reason?: unknown };
+      if (candidate.rule !== 'DG004' && candidate.rule !== 'DG006') {
+        invalidAllowlistEntries.push(`Rejected disallowed allowlist rule "${String(candidate.rule)}" for "${validKey}"`);
+        continue;
+      }
+      if (typeof candidate.reason !== 'string' || candidate.reason.trim().length < 8) {
+        invalidAllowlistEntries.push(`Rejected short/missing reason for ${candidate.rule} under "${validKey}"`);
+        continue;
+      }
+      accepted.push({ rule: candidate.rule, reason: candidate.reason.trim() });
+    }
+    if (accepted.length > 0) {
+      rulesByPath.set(validKey, accepted);
+    }
+  }
+
+  return { rulesByPath, invalidAllowlistEntries, allowlistModifiedInPr, sourceMode };
+}
+
+export function matchAllowlistForFile(
+  allowlist: VerifiedAllowlistResult,
+  filePath: string,
+  cwd: string = process.cwd()
+): AllowlistRuleEntry[] {
+  const relPath = path.isAbsolute(filePath) ? path.relative(cwd, filePath) : filePath;
+  const posixRel = relPath.replace(/\\/g, '/').replace(/^\.\//, '');
+  const matched: AllowlistRuleEntry[] = [];
+
+  for (const [pattern, entries] of allowlist.rulesByPath.entries()) {
+    if (pattern.endsWith('/**')) {
+      const dirPrefix = pattern.slice(0, -2); // keep trailing '/'
+      if (posixRel.startsWith(dirPrefix)) {
+        matched.push(...entries);
+      }
+    } else if (posixRel === pattern) {
+      matched.push(...entries);
+    }
+  }
+  return matched;
+}
+
+function resolveNearestPackageInfo(filePath: string): {
+  declaredDependencies?: Set<string>;
+  subpathImports?: Record<string, unknown>;
+} {
+  try {
+    const mergedDeps = new Set<string>();
+    let foundAny = false;
+    let mergedImports: Record<string, unknown> | undefined;
+
     let currentDir = path.dirname(path.resolve(filePath));
     while (true) {
       const pkgPath = path.join(currentDir, 'package.json');
       if (fs.existsSync(pkgPath)) {
+        foundAny = true;
         const parsed = JSON.parse(fs.readFileSync(pkgPath, 'utf-8')) as {
           dependencies?: Record<string, unknown>;
           devDependencies?: Record<string, unknown>;
           peerDependencies?: Record<string, unknown>;
+          imports?: Record<string, unknown>;
         };
-        return new Set([
+        for (const dep of [
           ...Object.keys(parsed.dependencies || {}),
           ...Object.keys(parsed.devDependencies || {}),
           ...Object.keys(parsed.peerDependencies || {}),
-        ]);
+        ]) {
+          mergedDeps.add(dep);
+        }
+        if (parsed.imports && typeof parsed.imports === 'object') {
+          mergedImports = { ...parsed.imports, ...(mergedImports || {}) };
+        }
       }
       const parentDir = path.dirname(currentDir);
       if (parentDir === currentDir) break;
       currentDir = parentDir;
     }
+
+    return {
+      declaredDependencies: foundAny ? mergedDeps : undefined,
+      subpathImports: mergedImports,
+    };
   } catch {
-    // SPOF mitigation: ignore unreadable or malformed package.json
+    return {};
   }
-  return undefined;
 }
 
 export async function evaluateCodeHybrid(
   code: string,
   apiKey?: string,
   precomputedL1?: ParsedDevGuardReport,
-  filePath?: string
+  filePath?: string,
+  externalAllowlist?: ReadonlyArray<AllowlistRuleEntry>
 ): Promise<CliAuditResult> {
+  const pkgInfo = filePath ? resolveNearestPackageInfo(filePath) : {};
   const l1Result = precomputedL1 || analyzeCodeDeterministically(code, {
     filePath,
-    declaredDependencies: filePath ? resolveNearestPackageDependencies(filePath) : undefined,
+    declaredDependencies: pkgInfo.declaredDependencies,
+    subpathImports: pkgInfo.subpathImports,
     builtinModules,
+    externalAllowlist,
   });
+
   const activeKey = apiKey || process.env.GEMINI_API_KEY;
 
   if (!activeKey || activeKey === 'MY_GEMINI_API_KEY' || !activeKey.startsWith('AIzaSy')) {
@@ -367,6 +578,8 @@ export async function runAction() {
   console.log(`\n📂 Jumlah berkas yang akan diaudit: ${filesToAudit.length}`);
   console.log('----------------------------------------------------------------------');
 
+  const verifiedAllowlist = loadVerifiedAllowlist();
+
   let hasFatalFailure = false;
   let totalScoreSum = 0;
   let auditedCount = 0;
@@ -379,7 +592,8 @@ export async function runAction() {
     auditedCount++;
 
     console.log(`\n🔍 Menganalisis: ${filePath}`);
-    const result = await evaluateCodeHybrid(codeContent, apiKey, undefined, filePath);
+    const fileExternalAllowlist = matchAllowlistForFile(verifiedAllowlist, filePath);
+    const result = await evaluateCodeHybrid(codeContent, apiKey, undefined, filePath, fileExternalAllowlist);
     const report = result.parsedReport;
     const score = report.skor;
     const hasInlineErrors = report.inlineFindings?.some((f) => f.severity === 'error') ?? false;
@@ -399,6 +613,10 @@ export async function runAction() {
           : [],
       defenseInDepth: (report.residualNotes || []).map((n) => redactSecretsPreservingLayout(n)),
       inlineFindings: report.inlineFindings,
+      suppressions: report.suppressions,
+      invalidAllowlistEntries:
+        verifiedAllowlist.invalidAllowlistEntries.length > 0 ? verifiedAllowlist.invalidAllowlistEntries : undefined,
+      allowlistModifiedInPr: verifiedAllowlist.allowlistModifiedInPr || undefined,
     });
 
     console.log(`   - Security        : ${score.security}/100`);

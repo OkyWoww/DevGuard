@@ -14,7 +14,11 @@ import {
   redactSecretsPreservingLayout,
   type AuditAnalyzeOptions,
 } from '../src/devguardAnalyzer.js';
-import { evaluateCodeHybrid } from '../src/cli.js';
+import {
+  evaluateCodeHybrid,
+  loadVerifiedAllowlist,
+  matchAllowlistForFile,
+} from '../src/cli.js';
 import { generateSarifReport } from '../src/sarifGenerator.js';
 import {
   COMMENT_SIGNATURE,
@@ -1264,6 +1268,398 @@ test('20. When Layer 2 redaction aborts, Layer 1 findings still drive the CLI ex
     assert.equal(cliRun.status, 1, `Expected CLI to exit with code 1 from Layer 1 despite Layer 2 abort; stderr=${cliRun.stderr}`);
     assert.ok(fs.existsSync(sarifOut), 'Expected SARIF output even when Layer 2 aborted');
     assert.match(cliRun.stderr + cliRun.stdout, /fail-closed abort/i, 'Expected fail-closed abort warning notice');
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('21. Lexer ignores suppression markers in literals/regexes and honors real // and /* */ suppressions for DG004, DG008, DG005(warning)', () => {
+  const ignoredLiteralsCode = [
+    'const msgStr = "// devguard-ignore DG004: inside double-quoted string";',
+    'const tmplStr = `/* devguard-ignore DG008: inside template literal */`;',
+    'const patRe = /devguard-ignore DG004: inside regex literal/;',
+    "import _ from 'lodahs';",
+    'export async function checkRemote() {',
+    '  return fetch("https://api.openai.com/v1/chat");',
+    '}',
+  ].join('\n');
+
+  const literalReport = analyzeCodeDeterministically(ignoredLiteralsCode, { filePath: 'src/literals.ts' });
+  const litRules = (literalReport.inlineFindings || []).map((f) => f.ruleId);
+  assert.ok(litRules.includes('DG004'), 'DG004 must NOT be suppressed by string/template/regex markers');
+  assert.ok(litRules.includes('DG008'), 'DG008 must NOT be suppressed by string/template/regex markers');
+
+  const invalidReasonCode = [
+    '// devguard-ignore DG004',
+    "import _ from 'lodahs';",
+    '// devguard-ignore DG004: ok',
+    "import axios from 'axois';",
+    'export async function checkShortReason() {',
+    '  // devguard-ignore DG008:    fix   ',
+    '  return fetch("https://api.openai.com/v1/chat");',
+    '}',
+  ].join('\n');
+  const invalidReasonReport = analyzeCodeDeterministically(invalidReasonCode, { filePath: 'src/shortReason.ts' });
+  const activeDg004Lines = (invalidReasonReport.inlineFindings || []).filter((f) => f.ruleId === 'DG004').map((f) => f.line);
+  const activeDg008Lines = (invalidReasonReport.inlineFindings || []).filter((f) => f.ruleId === 'DG008').map((f) => f.line);
+  assert.deepEqual(activeDg004Lines, [2, 4], 'Missing and <8-char DG004 reasons must NOT suppress findings');
+  assert.deepEqual(activeDg008Lines, [7], 'Whitespace-padded short DG008 reason must NOT suppress finding');
+  assert.equal(invalidReasonReport.suppressions, undefined);
+
+  const realSuppressionsCode = [
+    '// devguard-ignore DG004: vendored compatibility fork intentionally aliased',
+    "import _ from 'lodahs';",
+    'export async function callWithAllowedSuppressions() {',
+    '  /* devguard-ignore DG008: local retry loop already enforces gateway deadline */',
+    '  await fetch("https://api.openai.com/v1/chat");',
+    '  try {',
+    '    await warmupCache();',
+    '  } catch (err) {} // devguard-ignore DG005: non-critical cache warmup fallback is intentional',
+    '}',
+  ].join('\n');
+
+  const suppressedReport = analyzeCodeDeterministically(realSuppressionsCode, { filePath: 'src/suppressed.ts' });
+  assert.equal((suppressedReport.inlineFindings || []).length, 0, 'Expected all 3 permitted inline findings to be suppressed');
+  assert.equal(suppressedReport.suppressions?.length, 3);
+  assert.deepEqual(
+    suppressedReport.suppressions?.map((s) => ({ ruleId: s.ruleId, kind: s.kind })),
+    [
+      { ruleId: 'DG004', kind: 'inSource' },
+      { ruleId: 'DG008', kind: 'inSource' },
+      { ruleId: 'DG005', kind: 'inSource' },
+    ]
+  );
+  assert.ok(suppressedReport.skor.totalScore >= 85, `Expected clean score after suppression, got ${suppressedReport.skor.totalScore}`);
+});
+
+test('22. Non-bypassable suppression policy rejects inline suppressions for DG001, DG006, DG007, and critical DG005(error)', () => {
+  const fakeKey = 'AIza' + 'SyD-9k8L7m6N5p4Q3r2S1t0U9v8W7x6Y5z4';
+  const bypassAttemptCode = [
+    'export async function dangerousTransfer(req: { query: { cmd: string } }, account: { balance: number }, amount: number) {',
+    '  // devguard-ignore DG001: pretending eval is safe here',
+    '  const evalRes = eval(req.query.cmd);',
+    `  // devguard-ignore DG007: pretending temporary key is acceptable`,
+    `  const apiKey = "${fakeKey}";`,
+    '  if (account.balance >= amount) {',
+    '    await chargeGateway();',
+    '    // devguard-ignore DG006: pretending race condition is acceptable',
+    '    account.balance -= amount;',
+    '  }',
+    '  try {',
+    '    await chargePayment(account, amount);',
+    '  // devguard-ignore DG005: pretending payment error catch can be ignored',
+    '  } catch (err) {}',
+    '  return { evalRes, apiKey };',
+    '}',
+  ].join('\n');
+
+  const report = analyzeCodeDeterministically(bypassAttemptCode, { filePath: 'src/bypass.ts' });
+  const inline = report.inlineFindings || [];
+
+  const dg005 = inline.find((f) => f.ruleId === 'DG005');
+  const dg006 = inline.find((f) => f.ruleId === 'DG006');
+  const dg007 = inline.find((f) => f.ruleId === 'DG007');
+  assert.ok(dg005 && dg005.severity === 'error', 'DG005 error finding must remain active');
+  assert.ok(dg006 && dg007, 'DG006 and DG007 findings must remain active');
+  assert.match(dg005.message, /cannot be suppressed inline/i);
+  assert.match(dg006.message, /cannot be suppressed inline/i);
+  assert.match(dg007.message, /cannot be suppressed inline/i);
+
+  const dg001OnlyCode = [
+    'export function run(cmd: string) {',
+    '  // devguard-ignore DG001: trying to suppress RCE',
+    '  return eval(cmd);',
+    '}',
+  ].join('\n');
+  const dg001Report = analyzeCodeDeterministically(dg001OnlyCode, { filePath: 'src/evalBypass.ts' });
+  assert.ok(!dg001Report.isHardened);
+  assert.match(dg001Report.temuanUtama.description, /DG001 cannot be suppressed inline/i);
+  assert.equal(dg001Report.suppressions, undefined, 'Forbidden suppressions must never be recorded as active');
+});
+
+test('23. loadVerifiedAllowlist reads base branch strictly, validates entries, detects PR edits, and fails safe when base unreadable', () => {
+  const baseAllowlist = JSON.stringify({
+    ignoreRulesByPath: {
+      'src/legacy/**': [
+        { rule: 'DG004', reason: 'Monorepo hoisted legacy package verified safe' },
+        { rule: 'DG001', reason: 'Attempted forbidden rule in base' },
+      ],
+      'src/payments/batch.ts': [
+        { rule: 'DG006', reason: 'Serialized upstream by distributed job queue' },
+        { rule: 'DG004', reason: 'short' },
+      ],
+      '*': [{ rule: 'DG004', reason: 'Wildcard bypass attempt should reject' }],
+      '**': [{ rule: 'DG006', reason: 'Double star bypass attempt should reject' }],
+      'src/bad/*': [{ rule: 'DG004', reason: 'Mid/single star pattern invalid' }],
+      '../outside/**': [{ rule: 'DG004', reason: 'Parent traversal allowlist key should reject' }],
+      '': [{ rule: 'DG004', reason: 'Empty key allowlist should reject' }],
+    },
+  });
+
+  const prEditedAllowlist = JSON.stringify({
+    ignoreRulesByPath: {
+      'src/new/pwn.ts': [{ rule: 'DG004', reason: 'Malicious PR adding self-suppression' }],
+    },
+  });
+
+  const prResult = loadVerifiedAllowlist({
+    baseRef: 'main',
+    isCi: true,
+    readBaseFile: (ref) => {
+      assert.equal(ref, 'origin/main:.devguard.json');
+      return baseAllowlist;
+    },
+    readWorkingFile: () => prEditedAllowlist,
+  });
+
+  assert.equal(prResult.sourceMode, 'base-pr');
+  assert.equal(prResult.allowlistModifiedInPr, true);
+  assert.equal(prResult.rulesByPath.has('src/new/pwn.ts'), false, 'Working-tree PR allowlist edits must be ignored');
+  assert.equal(prResult.rulesByPath.has('../outside/**'), false, 'Parent traversal path key must be rejected');
+  assert.equal(prResult.rulesByPath.has(''), false, 'Empty path key must be rejected');
+  assert.equal(
+    prResult.invalidAllowlistEntries.length,
+    7,
+    'Should record DG001, short reason, *, **, src/bad/*, ../outside/**, and empty key rejections'
+  );
+
+  const legacyMatches = matchAllowlistForFile(prResult, 'src/legacy/sub/old.ts');
+  assert.deepEqual(legacyMatches, [{ rule: 'DG004', reason: 'Monorepo hoisted legacy package verified safe' }]);
+
+  const exactMatches = matchAllowlistForFile(prResult, 'src/payments/batch.ts');
+  assert.deepEqual(exactMatches, [{ rule: 'DG006', reason: 'Serialized upstream by distributed job queue' }]);
+
+  const appliedReport = analyzeCodeDeterministically("import _ from 'lodahs';\nexport const fn = (x: unknown) => typeof x;", {
+    filePath: 'src/legacy/sub/old.ts',
+    externalAllowlist: legacyMatches,
+  });
+  assert.equal((appliedReport.inlineFindings || []).length, 0);
+  assert.equal(appliedReport.suppressions?.[0]?.kind, 'external');
+
+  // Push event reads from beforeSha and fails safe on all-zeros or unreadable ref
+  const pushValid = loadVerifiedAllowlist({
+    eventName: 'push',
+    beforeSha: 'a1b2c3d4',
+    isCi: true,
+    readBaseFile: (ref) => {
+      assert.equal(ref, 'a1b2c3d4:.devguard.json');
+      return baseAllowlist;
+    },
+    readWorkingFile: () => baseAllowlist,
+  });
+  assert.equal(pushValid.sourceMode, 'base-push');
+  assert.equal(matchAllowlistForFile(pushValid, 'src/legacy/sub/old.ts').length, 1);
+
+  const pushZeroSha = loadVerifiedAllowlist({
+    eventName: 'push',
+    beforeSha: '0000000000000000000000000000000000000000',
+    isCi: true,
+    readBaseFile: () => {
+      throw new Error('Must not query all-zero SHA');
+    },
+    readWorkingFile: () => prEditedAllowlist,
+  });
+  assert.equal(pushZeroSha.sourceMode, 'empty');
+  assert.equal(pushZeroSha.rulesByPath.size, 0);
+
+  const pushUnreadable = loadVerifiedAllowlist({
+    eventName: 'push',
+    beforeSha: 'a1b2c3d4',
+    isCi: true,
+    readBaseFile: () => null,
+    readWorkingFile: () => prEditedAllowlist,
+  });
+  assert.equal(pushUnreadable.sourceMode, 'base-push');
+  assert.equal(pushUnreadable.rulesByPath.size, 0);
+
+  // Fail-safe when base ref is unreadable in CI
+  const unreadableBase = loadVerifiedAllowlist({
+    baseRef: 'main',
+    isCi: true,
+    readBaseFile: () => null,
+    readWorkingFile: () => prEditedAllowlist,
+  });
+  assert.equal(unreadableBase.rulesByPath.size, 0);
+  assert.equal(unreadableBase.allowlistModifiedInPr, true);
+
+  // Local non-CI mode loads working tree and warns loudly
+  const warnMessages: string[] = [];
+  const origWarn = console.warn;
+  console.warn = (...args: unknown[]) => {
+    warnMessages.push(args.map((a) => String(a)).join(' '));
+  };
+  try {
+    const localResult = loadVerifiedAllowlist({
+      baseRef: '',
+      eventName: '',
+      isCi: false,
+      readWorkingFile: () =>
+        JSON.stringify({
+          ignoreRulesByPath: {
+            'src/local.ts': [{ rule: 'DG004', reason: 'Local dev allowlist verification' }],
+          },
+        }),
+    });
+    assert.equal(localResult.sourceMode, 'local');
+    assert.equal(matchAllowlistForFile(localResult, 'src/local.ts').length, 1);
+    assert.ok(
+      warnMessages.some((m) => m.includes('local mode, unverified allowlist')),
+      'Expected local mode unverified allowlist warning'
+    );
+  } finally {
+    console.warn = origWarn;
+  }
+});
+
+test('24. Sticky PR summary comment renders Active Suppressions table, invalid allowlist entries, and PR modification banner', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-pr-sup-'));
+  let postedBody = '';
+
+  const server = http.createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on('data', (c: Buffer) => chunks.push(c));
+    req.on('end', () => {
+      const raw = Buffer.concat(chunks).toString('utf-8');
+      if (req.method === 'POST' && raw) {
+        postedBody = (JSON.parse(raw) as { body: string }).body;
+      }
+      res.writeHead(req.method === 'GET' ? 200 : 201, { 'Content-Type': 'application/json' });
+      res.end(req.method === 'GET' ? '[]' : JSON.stringify({ id: 901 }));
+    });
+  });
+
+  const prevEnv = {
+    GITHUB_TOKEN: process.env.GITHUB_TOKEN,
+    GITHUB_REPOSITORY: process.env.GITHUB_REPOSITORY,
+    GITHUB_EVENT_PATH: process.env.GITHUB_EVENT_PATH,
+    GITHUB_API_URL: process.env.GITHUB_API_URL,
+  };
+
+  try {
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const addr = server.address() as { port: number };
+    const eventPath = path.join(tempDir, 'pr.json');
+    fs.writeFileSync(eventPath, JSON.stringify({ pull_request: { number: 314 } }), 'utf-8');
+
+    process.env.GITHUB_TOKEN = 'test-token';
+    process.env.GITHUB_REPOSITORY = 'OkyWoww/DevGuard';
+    process.env.GITHUB_EVENT_PATH = eventPath;
+    process.env.GITHUB_API_URL = `http://127.0.0.1:${addr.port}`;
+
+    const summary: FileAuditSummary = {
+      filePath: 'src/legacy/wrapper.ts',
+      security: 90,
+      correctness: 90,
+      maintainability: 90,
+      overall: 90,
+      passed: true,
+      fatalFlaws: [],
+      defenseInDepth: [],
+      allowlistModifiedInPr: true,
+      invalidAllowlistEntries: ['Rejected disallowed allowlist rule "DG001" for "src/legacy/**"'],
+      suppressions: [
+        {
+          ruleId: 'DG004',
+          targetLine: 2,
+          commentLine: 1,
+          reason: 'Vendored workspace package verified in root lockfile',
+          kind: 'inSource',
+          filePath: 'src/legacy/wrapper.ts',
+          severity: 'error',
+          message: "Typosquatted package 'lodahs'",
+        },
+        {
+          ruleId: 'DG006',
+          targetLine: 18,
+          commentLine: 0,
+          reason: 'Protected by distributed queue lock in caller',
+          kind: 'external',
+          filePath: 'src/legacy/wrapper.ts',
+          severity: 'error',
+          message: 'Non-atomic balance update',
+        },
+      ],
+    };
+
+    await postPullRequestComment([summary], 85, 'OFFLINE_AST');
+
+    assert.ok(postedBody.includes('allowlist config (.devguard.json) changed in this PR; changes apply only after merge'));
+    assert.ok(postedBody.includes('| File | Line | Rule | Kind | Reason |'));
+    assert.ok(postedBody.includes('`src/legacy/wrapper.ts` | 2 | `DG004` | `inSource` | Vendored workspace package verified in root lockfile'));
+    assert.ok(postedBody.includes('`src/legacy/wrapper.ts` | 18 | `DG006` | `external` | Protected by distributed queue lock in caller'));
+    assert.ok(postedBody.includes('Rejected disallowed allowlist rule'));
+  } finally {
+    process.env.GITHUB_TOKEN = prevEnv.GITHUB_TOKEN;
+    process.env.GITHUB_REPOSITORY = prevEnv.GITHUB_REPOSITORY;
+    process.env.GITHUB_EVENT_PATH = prevEnv.GITHUB_EVENT_PATH;
+    process.env.GITHUB_API_URL = prevEnv.GITHUB_API_URL;
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('25. SARIF output includes suppressed findings with standard OASIS suppressions metadata', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-sarif-sup-'));
+  try {
+    const sarifOut = path.join(tempDir, 'suppressed.sarif');
+    const summary: FileAuditSummary = {
+      filePath: 'src\\legacy\\adapter.ts',
+      security: 95,
+      correctness: 95,
+      maintainability: 90,
+      overall: 93,
+      passed: true,
+      fatalFlaws: [],
+      defenseInDepth: [],
+      suppressions: [
+        {
+          ruleId: 'DG008',
+          targetLine: 14,
+          commentLine: 13,
+          reason: 'Timeout enforced by upstream AbortController passed via options',
+          kind: 'inSource',
+          filePath: 'src\\legacy\\adapter.ts',
+          severity: 'warning',
+          message: 'fetch() without inline AbortSignal.timeout',
+        },
+        {
+          ruleId: 'DG006',
+          targetLine: 29,
+          commentLine: 0,
+          reason: 'Serialized per-account via Redis mutex',
+          kind: 'external',
+          filePath: 'src\\legacy\\adapter.ts',
+          severity: 'error',
+          message: 'Balance update across await',
+        },
+      ],
+    };
+
+    generateSarifReport([summary], sarifOut);
+    const sarif = JSON.parse(fs.readFileSync(sarifOut, 'utf-8')) as {
+      runs: Array<{
+        results: Array<{
+          ruleId: string;
+          locations: Array<{ physicalLocation: { artifactLocation: { uri: string }; region: { startLine: number } } }>;
+          suppressions?: Array<{ kind: string; justification: string }>;
+        }>;
+      }>;
+    };
+
+    const results = sarif.runs[0].results;
+    assert.equal(results.length, 2);
+
+    assert.equal(results[0].ruleId, 'DG008');
+    assert.equal(results[0].locations[0].physicalLocation.artifactLocation.uri, 'src/legacy/adapter.ts');
+    assert.equal(results[0].locations[0].physicalLocation.region.startLine, 14);
+    assert.deepEqual(results[0].suppressions, [
+      { kind: 'inSource', justification: 'Timeout enforced by upstream AbortController passed via options' },
+    ]);
+
+    assert.equal(results[1].ruleId, 'DG006');
+    assert.deepEqual(results[1].suppressions, [
+      { kind: 'external', justification: 'Serialized per-account via Redis mutex' },
+    ]);
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }

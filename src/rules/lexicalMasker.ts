@@ -11,10 +11,23 @@ export interface InlineFinding {
   suggestion?: string;
 }
 
+export interface ParsedSuppression {
+  ruleId: DevGuardRuleId;
+  targetLine: number;
+  commentLine: number;
+  reason: string;
+  kind: 'inSource' | 'external';
+  filePath?: string;
+  severity?: 'error' | 'warning';
+  message?: string;
+}
+
 export interface AuditAnalyzeOptions {
   filePath?: string;
   declaredDependencies?: ReadonlySet<string> | readonly string[];
   builtinModules?: readonly string[];
+  subpathImports?: Record<string, unknown>;
+  externalAllowlist?: ReadonlyArray<{ rule: 'DG004' | 'DG006'; reason: string }>;
 }
 
 export interface LineFinding {
@@ -43,6 +56,42 @@ const REGEX_PRECEDING_CHARS = new Set([
 const REGEX_PRECEDING_KEYWORDS = new Set([
   'return', 'typeof', 'void', 'delete', 'await', 'throw', 'case', 'in', 'of', 'instanceof', 'new', 'else', 'do', 'yield', 'export', 'default',
 ]);
+const SUPPRESSION_COMMENT_RE = /\bdevguard-ignore\s+(DG\d{3})\s*:\s*([^\r\n]+)/i;
+const VALID_DG_RULE_RE = /^DG00[1-8]$/;
+
+function parseSuppressionFromComment(
+  commentBody: string,
+  commentLine: number,
+  isTrailing: boolean,
+  suppressions: ParsedSuppression[],
+  pending: Array<{ ruleId: DevGuardRuleId; commentLine: number; reason: string }>
+): void {
+  const cleaned = commentBody.replace(/\*\/\s*$/, '').trim();
+  const match = cleaned.match(SUPPRESSION_COMMENT_RE);
+  if (!match?.[1] || !match[2]) return;
+  const ruleUpper = match[1].toUpperCase();
+  if (!VALID_DG_RULE_RE.test(ruleUpper)) return;
+  const reason = match[2].replace(/\*\/\s*$/, '').trim();
+  if (reason.length < 8) return;
+
+  const ruleId = ruleUpper as DevGuardRuleId;
+  if (isTrailing) {
+    suppressions.push({ ruleId, targetLine: commentLine, commentLine, reason, kind: 'inSource' });
+  } else {
+    pending.push({ ruleId, commentLine, reason });
+  }
+}
+
+function flushPendingSuppressions(
+  targetLine: number,
+  suppressions: ParsedSuppression[],
+  pending: Array<{ ruleId: DevGuardRuleId; commentLine: number; reason: string }>
+): void {
+  while (pending.length > 0) {
+    const item = pending.shift()!;
+    suppressions.push({ ...item, targetLine, kind: 'inSource' });
+  }
+}
 
 function skipQuotedLiteral(
   rawCode: string,
@@ -116,15 +165,18 @@ function skipRegexLiteral(rawCode: string, out: string[], startIdx: number): num
   return i;
 }
 
-/** Masks comments, regexes, and string literals while keeping 1:1 line/offset mapping. */
+/** Masks comments, regexes, and literals while extracting in-comment suppressions. */
 export function analyzeLexicalStructure(
   rawCode: string,
   allowHashComments: boolean
-): { maskedCode: string; stringLiterals: ExtractedStringLiteral[] } {
+): { maskedCode: string; stringLiterals: ExtractedStringLiteral[]; suppressions: ParsedSuppression[] } {
   if (typeof rawCode !== 'string') throw new TypeError('rawCode must be a string');
   const out = rawCode.split('');
   const stringLiterals: ExtractedStringLiteral[] = [];
+  const suppressions: ParsedSuppression[] = [];
+  const pending: Array<{ ruleId: DevGuardRuleId; commentLine: number; reason: string }> = [];
   let line = 1;
+  let lineHadCode = false;
   let prevNonWs = '';
   let currentWord = '';
   let lastWord = '';
@@ -135,27 +187,39 @@ export function analyzeLexicalStructure(
       const next = rawCode[i + 1];
       if (ch === '\n') {
         line++;
+        lineHadCode = false;
         lastWord = currentWord || lastWord;
         currentWord = '';
         prevNonWs = '\n';
       } else if ((ch === '/' && next === '/') || ((allowHashComments || (i === 0 && next === '!')) && ch === '#')) {
+        const cStart = i + (ch === '#' ? 1 : 2);
+        const cLine = line;
         while (i < rawCode.length && rawCode[i] !== '\n') out[i++] = ' ';
-        if (rawCode[i] === '\n') { line++; prevNonWs = '\n'; }
+        parseSuppressionFromComment(rawCode.slice(cStart, i), cLine, lineHadCode, suppressions, pending);
+        if (rawCode[i] === '\n') { line++; lineHadCode = false; prevNonWs = '\n'; }
         currentWord = '';
       } else if (!allowHashComments && ch === '/' && next === '*') {
+        const cStart = i + 2;
+        const cLine = line;
+        const wasTrailing = lineHadCode;
         out[i] = ' ';
         out[i + 1] = ' ';
         for (i += 2; i < rawCode.length; i++) {
           if (rawCode[i] === '*' && rawCode[i + 1] === '/') { out[i] = ' '; out[++i] = ' '; break; }
           if (rawCode[i] === '\n') line++; else out[i] = ' ';
         }
+        parseSuppressionFromComment(rawCode.slice(cStart, i - 1), cLine, wasTrailing, suppressions, pending);
         currentWord = '';
       } else if (!allowHashComments && ch === '/' && (REGEX_PRECEDING_KEYWORDS.has(currentWord || lastWord) || (!currentWord && REGEX_PRECEDING_CHARS.has(prevNonWs)))) {
+        flushPendingSuppressions(line, suppressions, pending);
+        lineHadCode = true;
         i = skipRegexLiteral(rawCode, out, i);
         prevNonWs = ')';
         currentWord = '';
         lastWord = '';
       } else if (ch === '\'' || ch === '"' || ch === '`') {
+        flushPendingSuppressions(line, suppressions, pending);
+        lineHadCode = true;
         const res = skipQuotedLiteral(rawCode, out, i, line);
         stringLiterals.push(res.literal);
         i = res.nextIdx;
@@ -164,17 +228,24 @@ export function analyzeLexicalStructure(
         currentWord = '';
         lastWord = '';
       } else if (/[A-Za-z0-9_$]/.test(ch)) {
+        flushPendingSuppressions(line, suppressions, pending);
+        lineHadCode = true;
         currentWord += ch;
         prevNonWs = ch;
       } else {
         if (currentWord) { lastWord = currentWord; currentWord = ''; }
-        if (!/\s/.test(ch)) { prevNonWs = ch; lastWord = ''; }
+        if (!/\s/.test(ch)) {
+          flushPendingSuppressions(line, suppressions, pending);
+          lineHadCode = true;
+          prevNonWs = ch;
+          lastWord = '';
+        }
       }
     }
   } catch {
-    return { maskedCode: rawCode, stringLiterals: [] };
+    return { maskedCode: rawCode, stringLiterals: [], suppressions: [] };
   }
-  return { maskedCode: out.join(''), stringLiterals };
+  return { maskedCode: out.join(''), stringLiterals, suppressions };
 }
 
 export function calculateShannonEntropy(input: string): number {

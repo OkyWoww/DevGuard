@@ -7,6 +7,7 @@ import {
   type DevGuardRuleId,
   type InlineFinding,
   type LineFinding,
+  type ParsedSuppression,
 } from './rules/lexicalMasker.js';
 import {
   POPULAR_NPM_PACKAGES,
@@ -24,7 +25,7 @@ import {
   type PrepareLlmOptions,
 } from './rules/secretAndResilienceRules.js';
 
-export type { AuditAnalyzeOptions, DevGuardRuleId, InlineFinding, PrepareLlmOptions };
+export type { AuditAnalyzeOptions, DevGuardRuleId, InlineFinding, ParsedSuppression, PrepareLlmOptions };
 export {
   DG007_PROVIDER_PATTERNS,
   POPULAR_NPM_PACKAGES,
@@ -79,6 +80,7 @@ export interface ParsedDevGuardReport {
   residualNotes?: string[];
   isHardened?: boolean;
   inlineFindings?: InlineFinding[];
+  suppressions?: ParsedSuppression[];
 }
 
 export type AuditReport = ParsedDevGuardReport;
@@ -296,6 +298,99 @@ function calculateTotal(items, discountCode) {
 // Evaluates the exact live code string line-by-line on every single audit run.
 // =============================================================================
 
+const INLINE_SUPPRESSIBLE_ALWAYS = new Set<DevGuardRuleId>(['DG004', 'DG008']);
+
+function isInlineSuppressionPermitted(ruleId: DevGuardRuleId, severity?: 'error' | 'warning'): boolean {
+  if (INLINE_SUPPRESSIBLE_ALWAYS.has(ruleId)) return true;
+  return ruleId === 'DG005' && severity === 'warning';
+}
+
+function applySuppressionPolicy(
+  parsedSuppressions: ParsedSuppression[],
+  options: AuditAnalyzeOptions | undefined,
+  findings: LineFinding[],
+  inlineFindings: InlineFinding[]
+): ParsedSuppression[] {
+  const activeSuppressions: ParsedSuppression[] = [];
+  const suppressedInlineKeys = new Set<string>();
+  const filePath = options?.filePath;
+  const externalRules = new Map<'DG004' | 'DG006', string>();
+
+  for (const ext of options?.externalAllowlist || []) {
+    if ((ext.rule === 'DG004' || ext.rule === 'DG006') && !externalRules.has(ext.rule)) {
+      externalRules.set(ext.rule, ext.reason);
+    }
+  }
+
+  for (let i = inlineFindings.length - 1; i >= 0; i--) {
+    const f = inlineFindings[i];
+    const matchingInSource = parsedSuppressions.find((s) => s.ruleId === f.ruleId && s.targetLine === f.line);
+    const matchingExtReason = f.ruleId === 'DG004' || f.ruleId === 'DG006' ? externalRules.get(f.ruleId) : undefined;
+
+    if (matchingExtReason) {
+      activeSuppressions.push({
+        ruleId: f.ruleId,
+        targetLine: f.line,
+        commentLine: 0,
+        reason: matchingExtReason,
+        kind: 'external',
+        filePath,
+        severity: f.severity,
+        message: f.message,
+      });
+      suppressedInlineKeys.add(`${f.line}:${f.ruleId}`);
+      inlineFindings.splice(i, 1);
+      continue;
+    }
+
+    if (matchingInSource) {
+      if (isInlineSuppressionPermitted(f.ruleId, f.severity)) {
+        activeSuppressions.push({
+          ...matchingInSource,
+          filePath,
+          severity: f.severity,
+          message: f.message,
+        });
+        suppressedInlineKeys.add(`${f.line}:${f.ruleId}`);
+        inlineFindings.splice(i, 1);
+      } else {
+        const notice = ` [Suppression ignored: ${f.ruleId} cannot be suppressed inline]`;
+        if (!f.message.includes(notice)) f.message += notice;
+        for (const lf of findings) {
+          if (lf.line === f.line && lf.shortReason.includes(`[${f.ruleId}]`) && !lf.detailedReason.includes(notice)) {
+            lf.detailedReason += notice;
+          }
+        }
+      }
+    }
+  }
+
+  // Remove LineFinding penalties for successfully suppressed inline findings
+  for (let i = findings.length - 1; i >= 0; i--) {
+    const lf = findings[i];
+    const tagMatch = lf.shortReason.match(/\[(DG\d{3})\]/);
+    if (tagMatch?.[1] && suppressedInlineKeys.has(`${lf.line}:${tagMatch[1]}`)) {
+      findings.splice(i, 1);
+    }
+  }
+
+  // Enforce non-bypassable policy on DG001 / DG002 / DG003 inline attempts
+  for (const sup of parsedSuppressions) {
+    if (sup.ruleId === 'DG001' || sup.ruleId === 'DG002' || sup.ruleId === 'DG003') {
+      const notice = ` [Suppression ignored: ${sup.ruleId} cannot be suppressed inline]`;
+      for (const lf of findings) {
+        const hitsLine = lf.line === sup.targetLine || (lf.extraLines?.includes(sup.targetLine) ?? false);
+        const isUnprefixedDg001 = !/\[DG00[4-8]\]/.test(lf.shortReason);
+        if (hitsLine && isUnprefixedDg001 && !lf.detailedReason.includes(notice)) {
+          lf.detailedReason += notice;
+        }
+      }
+    }
+  }
+
+  return activeSuppressions.sort((a, b) => a.targetLine - b.targetLine);
+}
+
 export function analyzeCodeDeterministically(
   code: string,
   options?: AuditAnalyzeOptions
@@ -324,15 +419,26 @@ export function analyzeCodeDeterministically(
       codeWithoutComments
     );
 
-  // Detect domain & language from executable code
-  const isSqlDomain = !isSelfAnalyzerModule && /(?:SELECT\s+|UPDATE\s+members|INSERT\s+INTO|DELETE\s+FROM|sqlite3|db\.execute|kirim_poin)/i.test(codeWithoutComments);
+  const isExplicitJsTsFile = /\.(?:[cm]?[jt]sx?)$/i.test(normalizedFilePath);
+  const isExplicitPyFile = /\.py$/i.test(normalizedFilePath);
+  const hasJsTsSyntax =
+    isExplicitJsTsFile ||
+    isSelfAnalyzerModule ||
+    /\bfrom\s+['"]|\brequire\s*\(|\b(?:const|let|var|function|async|export|interface)\b|=>/.test(codeWithoutComments);
+
+  // Detect domain & language from executable code (JS/TS files never collapse into Python SQLite rules)
+  const isSqlDomain =
+    !isSelfAnalyzerModule &&
+    !hasJsTsSyntax &&
+    /(?:SELECT\s+|UPDATE\s+members|INSERT\s+INTO|DELETE\s+FROM|sqlite3|db\.execute\s*\(|kirim_poin)/i.test(
+      codeWithoutComments
+    );
   const isPingDomain = !isSelfAnalyzerModule && /(?:ping_host|ping\s+-c|subprocess\.run|os\.system|ipaddress\.ip_address)/i.test(codeWithoutComments) && !isSqlDomain;
   const isAuthDomain = !isSelfAnalyzerModule && /(?:JWT_SECRET|jsonwebtoken|jwt\.verify|billingService|\/api\/users\/:id\/billing)/i.test(codeWithoutComments) && !isSqlDomain;
   const isFileDomain = !isSelfAnalyzerModule && /(?:downloadReport|public\/reports|req\.query\.file|res\.download|res\.sendFile)/i.test(codeWithoutComments) && !isSqlDomain;
   const isCartDomain = !isSelfAnalyzerModule && /(?:calculateTotal|discountCode|VIP100|SERVER_PRICE_CATALOG|items\[i\]\.price|item\.quantity)/i.test(codeWithoutComments) && !isSqlDomain;
 
-  const hasJsSyntax = isSelfAnalyzerModule || /\bfrom\s+['"]|\brequire\s*\(|\b(?:const|let|var|function|async|export|interface)\b/.test(codeWithoutComments);
-  const isPython = !isSelfAnalyzerModule && (isSqlDomain || isPingDomain || (!hasJsSyntax && /\bdef\s+\w+\s*\(|\bimport\s+\w+|\braise\s+ValueError/i.test(codeWithoutComments)));
+  const isPython = !isSelfAnalyzerModule && (isExplicitPyFile || (!hasJsTsSyntax && (isSqlDomain || isPingDomain || /\bdef\s+\w+\s*\(|\bimport\s+\w+|\braise\s+ValueError/i.test(codeWithoutComments))));
   const isTypeScript = isSelfAnalyzerModule || isAuthDomain || /:\s*(?:string|number|boolean|any|Request|Response|JwtPayload)\b|\binterface\s+\w+/i.test(codeWithoutComments);
   const language = isPython ? 'python' : isTypeScript ? 'typescript' : 'javascript';
 
@@ -1016,7 +1122,16 @@ export function analyzeCodeDeterministically(
   // 6. CUSTOM SCRATCHPAD / GENERAL CODE RULES
   // ---------------------------------------------------------------------------
   else {
-    const evalLines = findAllLines(/(?:^|[^.\w])(?:eval|exec)\s*\(|os\.system\s*\(|child_process\.exec/i);
+    const evalSinkRe = /(?:^|[^.\w])(?:eval|exec)\s*\(|os\.system\s*\(|child_process\.exec|\bnew\s+Function\s*\(/i;
+    const maskedGlobalBracketRe = /\b(?:globalThis|window|global|self)\b[^\n;]*\[/;
+    const bracketEvalRe = /\b(?:globalThis|window|global|self)\b[^\n;]*\[\s*['"](?:eval|exec)['"]\s*\]/;
+    const evalLines = execLines
+      .filter(({ num, text }) => {
+        const maskedLine = maskedLines[num - 1] ?? '';
+        if (evalSinkRe.test(maskedLine)) return true;
+        return maskedGlobalBracketRe.test(maskedLine) && bracketEvalRe.test(text);
+      })
+      .map((l) => l.num);
     if (evalLines.length > 0) {
       findings.push({
         line: evalLines[0],
@@ -1143,6 +1258,9 @@ export function analyzeCodeDeterministically(
     detectNonAtomicBalanceMutations(rawLines, findings, inlineFindings);
     detectMissingTimeoutsAndLoops(code, lexical.maskedCode, rawLines, findings, inlineFindings);
   }
+
+  // 4. Stage 3a: Non-Bypassable Suppression & Verified Allowlist Policy
+  const activeSuppressions = applySuppressionPolicy(lexical.suppressions, options, findings, inlineFindings);
 
   // ---------------------------------------------------------------------------
   // AGGREGATE SCORES & BUILD REPORT
@@ -1441,5 +1559,6 @@ ${tesMarkdown}`;
     residualNotes,
     isHardened,
     inlineFindings: inlineFindings.length > 0 ? inlineFindings : undefined,
+    suppressions: activeSuppressions.length > 0 ? activeSuppressions : undefined,
   };
 }

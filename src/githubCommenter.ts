@@ -1,6 +1,10 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { redactSecretsPreservingLayout, type InlineFinding } from './devguardAnalyzer.js';
+import {
+  redactSecretsPreservingLayout,
+  type InlineFinding,
+  type ParsedSuppression,
+} from './devguardAnalyzer.js';
 
 export interface FileAuditSummary {
   filePath: string;
@@ -12,6 +16,9 @@ export interface FileAuditSummary {
   fatalFlaws: string[];
   defenseInDepth: string[];
   inlineFindings?: InlineFinding[];
+  suppressions?: ParsedSuppression[];
+  invalidAllowlistEntries?: string[];
+  allowlistModifiedInPr?: boolean;
 }
 
 export const COMMENT_SIGNATURE = '<!-- devguard-adversarial-audit-sticky-comment -->';
@@ -111,6 +118,37 @@ export async function postPullRequestComment(
     }
   }
 
+  const allSuppressions = summaries.flatMap((summary) =>
+    (summary.suppressions || []).map((s) => ({
+      ...s,
+      filePath: s.filePath || summary.filePath,
+    }))
+  );
+  const allInvalidEntries = Array.from(
+    new Set(summaries.flatMap((summary) => summary.invalidAllowlistEntries || []))
+  );
+  const allowlistChanged = summaries.some((summary) => summary.allowlistModifiedInPr === true);
+
+  let suppressionSection = '';
+  if (allowlistChanged) {
+    suppressionSection += '\n> ⚠️ allowlist config (.devguard.json) changed in this PR; changes apply only after merge\n';
+  }
+  if (allSuppressions.length > 0) {
+    const supRows = allSuppressions
+      .map(
+        (s) =>
+          `| \`${escapeTableCell(normalizePosixRepoPath(s.filePath))}\` | ${s.targetLine} | \`${s.ruleId}\` | \`${s.kind}\` | ${escapeTableCell(redactSecretsPreservingLayout(s.reason))} |`
+      )
+      .join('\n');
+    suppressionSection += `\n### 🙈 Active Suppressions\n| File | Line | Rule | Kind | Reason |\n| :--- | :---: | :---: | :---: | :--- |\n${supRows}\n`;
+  }
+  if (allInvalidEntries.length > 0) {
+    suppressionSection += '\n### ⚠️ Rejected `.devguard.json` Allowlist Entries\n';
+    allInvalidEntries.forEach((entry) => {
+      suppressionSection += `- ❌ ${escapeTableCell(redactSecretsPreservingLayout(entry))}\n`;
+    });
+  }
+
   const markdownBody = `${COMMENT_SIGNATURE}
 ## 🛡️ DevGuard Adversarial Security Gatekeeper
 
@@ -122,7 +160,7 @@ export async function postPullRequestComment(
 | Berkas | Skor Akhir | Security | Correctness | Maintainability |
 | :--- | :---: | :---: | :---: | :---: |
 ${tableRows || '| Tidak ada berkas yang diaudit | — | — | — | — |'}
-${detailsSection}
+${suppressionSection}${detailsSection}
 
 ---
 *Diinspeksi secara otomatis oleh [DevGuard Zero-Leniency Auditor](https://github.com/marketplace/actions/devguard-adversarial-code-auditor).*`;

@@ -167,7 +167,7 @@ export const CORPUS_CASES: readonly CorpusCase[] = [
       '  }',
       '}',
     ].join('\n'),
-    status: 'knownMiss',
+    status: 'expected',
     note: 'Dynamic code execution via new Function constructor bypassing eval() regex',
   },
   {
@@ -185,7 +185,7 @@ export const CORPUS_CASES: readonly CorpusCase[] = [
       '  }',
       '}',
     ].join('\n'),
-    status: 'knownMiss',
+    status: 'expected',
     note: 'Bracket property access globalThis["eval"](payload) indirection',
   },
   {
@@ -350,7 +350,7 @@ export const CORPUS_CASES: readonly CorpusCase[] = [
       "export { z } from 'zodd';",
     ].join('\n'),
     declaredDependencies: ['express'],
-    status: 'knownMiss',
+    status: 'expected',
     note: 'Re-export from typosquatted package using export ... from syntax',
   },
 
@@ -386,8 +386,8 @@ export const CORPUS_CASES: readonly CorpusCase[] = [
       '  }',
       '}',
     ].join('\n'),
-    status: 'knownMiss',
-    note: 'Console-only catch handler inside DB transaction flow (missed because db.execute triggers isSqlDomain -> isPython=true)',
+    status: 'expected',
+    note: 'Console-only catch handler inside DB transaction flow (fixed: TS/JS db.execute* stays in JS/TS pipeline)',
   },
   {
     id: 'DG005-TP-03',

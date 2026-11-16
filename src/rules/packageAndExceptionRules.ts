@@ -57,16 +57,40 @@ function getBasePackageName(specifier: string): string {
   return specifier.split('/')[0];
 }
 
-function resolveDeclaredDependencies(options?: AuditAnalyzeOptions): ReadonlySet<string> | undefined {
-  if (options?.declaredDependencies !== undefined) {
-    return options.declaredDependencies instanceof Set
-      ? options.declaredDependencies
-      : new Set(options.declaredDependencies);
+interface ResolvedPackageMetadata {
+  declaredDeps?: ReadonlySet<string>;
+  subpathImports?: Record<string, unknown>;
+}
+
+function matchesSubpathImport(specifier: string, subpathImports: Record<string, unknown>): boolean {
+  if (Object.prototype.hasOwnProperty.call(subpathImports, specifier)) return true;
+  for (const key of Object.keys(subpathImports)) {
+    const starIdx = key.indexOf('*');
+    if (starIdx !== -1) {
+      const prefix = key.slice(0, starIdx);
+      const suffix = key.slice(starIdx + 1);
+      if (specifier.startsWith(prefix) && specifier.endsWith(suffix)) return true;
+    }
   }
-  if (!options?.filePath || typeof options.filePath !== 'string') return undefined;
+  return false;
+}
+
+function resolvePackageMetadata(options?: AuditAnalyzeOptions): ResolvedPackageMetadata {
+  const result: ResolvedPackageMetadata = {
+    declaredDeps:
+      options?.declaredDependencies !== undefined
+        ? options.declaredDependencies instanceof Set
+          ? options.declaredDependencies
+          : new Set(options.declaredDependencies)
+        : undefined,
+    subpathImports: options?.subpathImports,
+  };
+
+  if (result.declaredDeps !== undefined && result.subpathImports !== undefined) return result;
+  if (!options?.filePath || typeof options.filePath !== 'string') return result;
 
   const proc = (globalThis as { process?: { getBuiltinModule?: (id: string) => unknown } }).process;
-  if (!proc || typeof proc.getBuiltinModule !== 'function') return undefined;
+  if (!proc || typeof proc.getBuiltinModule !== 'function') return result;
 
   try {
     const fsMod = proc.getBuiltinModule('node:fs') as {
@@ -79,29 +103,47 @@ function resolveDeclaredDependencies(options?: AuditAnalyzeOptions): ReadonlySet
       join: (...parts: string[]) => string;
     };
 
+    const mergedDeps = new Set<string>();
+    let foundAnyPkg = false;
+    let mergedImports: Record<string, unknown> | undefined;
+
     let currentDir = pathMod.dirname(pathMod.resolve(options.filePath));
     while (true) {
       const pkgPath = pathMod.join(currentDir, 'package.json');
       if (fsMod.existsSync(pkgPath)) {
+        foundAnyPkg = true;
         const parsed = JSON.parse(fsMod.readFileSync(pkgPath, 'utf-8')) as {
           dependencies?: Record<string, unknown>;
           devDependencies?: Record<string, unknown>;
           peerDependencies?: Record<string, unknown>;
+          imports?: Record<string, unknown>;
         };
-        return new Set<string>([
+        for (const dep of [
           ...Object.keys(parsed.dependencies || {}),
           ...Object.keys(parsed.devDependencies || {}),
           ...Object.keys(parsed.peerDependencies || {}),
-        ]);
+        ]) {
+          mergedDeps.add(dep);
+        }
+        if (parsed.imports && typeof parsed.imports === 'object') {
+          mergedImports = { ...parsed.imports, ...(mergedImports || {}) };
+        }
       }
       const parentDir = pathMod.dirname(currentDir);
       if (parentDir === currentDir) break;
       currentDir = parentDir;
     }
+
+    if (result.declaredDeps === undefined && foundAnyPkg) {
+      result.declaredDeps = mergedDeps;
+    }
+    if (result.subpathImports === undefined && mergedImports) {
+      result.subpathImports = mergedImports;
+    }
   } catch {
-    return undefined;
+    return result;
   }
-  return undefined;
+  return result;
 }
 
 /** DG004: Detects typosquatted and undeclared phantom package imports. */
@@ -113,10 +155,10 @@ export function detectHallucinatedPackages(
   inlineFindings: InlineFinding[]
 ): void {
   const builtinSet = getNodeBuiltinModuleSet(options?.builtinModules);
-  const declaredDeps = resolveDeclaredDependencies(options);
-  const staticImportRe = /^\s*(?:import\b[^'"]*\bfrom\s+|import\s+|\}\s*from\s+)['"]([^'"]+)['"]/;
+  const { declaredDeps, subpathImports } = resolvePackageMetadata(options);
+  const staticImportRe = /^\s*(?:(?:import|export)\b[^'"]*\bfrom\s+|import\s+|\}\s*from\s+)['"]([^'"]+)['"]/;
   const dynamicOrRequireRe = /(?:^|[^\w.'"`])\b(?:require|import)\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
-  const maskedImportOrRequireRe = /^\s*(?:import\b|\}\s*from\b)|(?:^|[^\w.'"`])\b(?:require|import)\s*\(/;
+  const maskedImportOrRequireRe = /^\s*(?:import\b|export\b[^\n;]*\bfrom\b|\}\s*from\b)|(?:^|[^\w.'"`])\b(?:require|import)\s*\(/;
 
   for (const { num, text } of execLines) {
     if (!maskedImportOrRequireRe.test(maskedLines[num - 1] ?? '')) continue;
@@ -129,13 +171,30 @@ export function detectHallucinatedPackages(
     }
 
     for (const rawSpec of specs) {
+      if (!rawSpec) continue;
+
+      if (rawSpec.startsWith('#')) {
+        if (subpathImports && !matchesSubpathImport(rawSpec, subpathImports)) {
+          const msg = `Subpath import '${rawSpec}' tidak terdaftar pada field "imports" di package.json (baris ${num}).`;
+          findings.push({
+            line: num,
+            category: 'security',
+            penalty: 35,
+            shortReason: `-35 [DG004] Undeclared subpath import '${rawSpec}' (baris ${num})`,
+            detailedReason: msg,
+            isCritical: true,
+          });
+          inlineFindings.push({ ruleId: 'DG004', line: num, severity: 'error', message: msg });
+        }
+        continue;
+      }
+
       if (
-        !rawSpec ||
         rawSpec.startsWith('.') ||
         rawSpec.startsWith('/') ||
         rawSpec.startsWith('@/') ||
         rawSpec.startsWith('~/') ||
-        rawSpec.startsWith('#') ||
+        rawSpec.startsWith('virtual:') ||
         (/^[a-z]+:/i.test(rawSpec) && !rawSpec.startsWith('node:'))
       ) {
         continue;
