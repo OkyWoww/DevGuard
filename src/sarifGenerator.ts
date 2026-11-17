@@ -2,7 +2,9 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { redactSecretsPreservingLayout } from './devguardAnalyzer.js';
 import {
+  PARTIAL_COVERAGE_REASON_TEXT,
   formatSkippedReasonText,
+  getDevGuardVersion,
   type FileAuditSummary,
   type SkippedFileReportItem,
 } from './githubCommenter.js';
@@ -70,10 +72,16 @@ function createSarifResult(
   };
 }
 
+export interface GenerateSarifOptions {
+  partialFiles?: ReadonlyArray<string>;
+  hasAnalysisFailure?: boolean;
+}
+
 export function generateSarifReport(
   summaries: FileAuditSummary[],
   outputPath: string = 'devguard-results.sarif',
-  skippedFiles: ReadonlyArray<SkippedFileReportItem> = []
+  skippedFiles: ReadonlyArray<SkippedFileReportItem> = [],
+  options?: GenerateSarifOptions
 ): string {
   const rulesMap = new Map<string, {
     id: string;
@@ -303,29 +311,39 @@ export function generateSarifReport(
     }
   }
 
-  const hasExecutionError = skippedFiles.some(
-    (item) => item.reason === 'parse_error' || item.reason === 'internal_error'
-  );
+  const hasExecutionError =
+    Boolean(options?.hasAnalysisFailure) ||
+    skippedFiles.some((item) => item.reason === 'parse_error' || item.reason === 'internal_error');
 
-  const toolExecutionNotifications = skippedFiles.map((item) => {
-    const isError = item.reason === 'parse_error' || item.reason === 'internal_error';
-    return {
-      level: (isError ? 'error' : 'note') as 'error' | 'note',
-      message: {
-        text: redactSecretsPreservingLayout(formatSkippedReasonText(item.reason)),
-      },
-      locations: [
-        {
-          physicalLocation: {
-            artifactLocation: {
-              uri: normalizeSarifUri(item.filePath),
-              uriBaseId: '%SRCROOT%',
-            },
+  const createToolNotification = (level: 'error' | 'note', text: string, filePath: string) => ({
+    level,
+    message: {
+      text: redactSecretsPreservingLayout(text),
+    },
+    locations: [
+      {
+        physicalLocation: {
+          artifactLocation: {
+            uri: normalizeSarifUri(filePath),
+            uriBaseId: '%SRCROOT%',
           },
         },
-      ],
-    };
+      },
+    ],
   });
+
+  const partialNotifications = (options?.partialFiles ?? []).map((filePath) =>
+    createToolNotification('note', PARTIAL_COVERAGE_REASON_TEXT, filePath)
+  );
+  const skippedNotifications = skippedFiles.map((item) => {
+    const isError = item.reason === 'parse_error' || item.reason === 'internal_error';
+    return createToolNotification(
+      isError ? 'error' : 'note',
+      formatSkippedReasonText(item.reason),
+      item.filePath
+    );
+  });
+  const toolExecutionNotifications = [...partialNotifications, ...skippedNotifications];
 
   const sarifLog = {
     $schema: 'https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json',
@@ -336,7 +354,7 @@ export function generateSarifReport(
           driver: {
             name: 'DevGuard Adversarial Code Auditor',
             informationUri: 'https://github.com/OkyWoww/DevGuard',
-            version: '1.2.1',
+            version: getDevGuardVersion(),
             rules: Array.from(rulesMap.values())
           }
         },

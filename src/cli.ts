@@ -22,9 +22,13 @@ export {
   hasPartialAnalysisExtension,
 };
 import {
-  REPORT_SPEC_VERSION,
+  MAX_PR_PARTIAL_FILES_DISPLAY,
+  MAX_PR_SKIPPED_FILES_DISPLAY,
+  PARTIAL_COVERAGE_REASON_TEXT,
   detectPrEnvironment,
+  formatPrHeadline,
   formatSkippedReasonText,
+  getDevGuardVersion,
   postInlineReviewComments,
   postPullRequestComment,
   type FileAuditSummary,
@@ -35,7 +39,16 @@ import {
 } from './githubCommenter.js';
 import { generateSarifReport } from './sarifGenerator.js';
 
-export { REPORT_SPEC_VERSION, formatSkippedReasonText, type SkippedFileReportItem, type SkippedReason };
+export {
+  MAX_PR_PARTIAL_FILES_DISPLAY,
+  MAX_PR_SKIPPED_FILES_DISPLAY,
+  PARTIAL_COVERAGE_REASON_TEXT,
+  formatPrHeadline,
+  formatSkippedReasonText,
+  getDevGuardVersion,
+  type SkippedFileReportItem,
+  type SkippedReason,
+};
 
 function loadDotEnvIfPresent(): void {
   try {
@@ -563,7 +576,13 @@ export async function evaluateCodeHybrid(
       },
     };
   } catch (err: unknown) {
-    const errMsg = redactSecretsPreservingLayout(err instanceof Error ? err.message : String(err));
+    let errMsg = 'Layer 2 Gemini error fallback';
+    try {
+      const rawMsg = err instanceof Error ? err.message : String(err);
+      errMsg = redactSecretsPreservingLayout(rawMsg);
+    } catch {
+      errMsg = 'Layer 2 Gemini error fallback';
+    }
     console.warn(`⚠️  Gemini API error (${errMsg}). Otomatis dialihkan ke Layer 1 Single-Pass Lexical & Heuristic Engine.`);
     return {
       mode: 'zero-api',
@@ -586,12 +605,17 @@ function resolveCliFileArgs(args: string[]): string[] {
       const dir = path.dirname(rawArg);
       const pattern = path.basename(rawArg).replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
       const matcher = new RegExp(`^${pattern}$`);
+      let matchedAny = false;
       if (fs.existsSync(dir)) {
         for (const entry of fs.readdirSync(dir)) {
           if (matcher.test(entry)) {
             resolved.push(path.join(dir, entry));
+            matchedAny = true;
           }
         }
+      }
+      if (!matchedAny) {
+        resolved.push(rawArg);
       }
       continue;
     }
@@ -622,6 +646,7 @@ export interface ClassificationResult {
 
 export interface ClassifyFileOptions {
   cwd?: string;
+  sourceMode?: 'modified' | 'all' | 'explicit';
   statFn?: (filePath: string) => { exists: boolean; size: number; isDirectory?: boolean };
   hasShebangFn?: (filePath: string) => boolean;
   maxFileBytes?: number;
@@ -688,6 +713,9 @@ export function classifyFile(filePath: string, options?: ClassifyFileOptions): C
 
   const stat = options?.statFn ? options.statFn(filePath) : defaultStatFile(resolvedPath);
   if (!stat.exists) {
+    if (options?.sourceMode === 'explicit' || options?.sourceMode === 'all') {
+      throw new Error(`Target file not found: ${filePath}`);
+    }
     return { filePath, status: 'ignored', reason: 'deleted' };
   }
   if (stat.isDirectory) {
@@ -779,7 +807,7 @@ export function classifyInScopeFiles(
   const check = verifyClassificationInvariant(filePaths.length, analyzed.length, skipped.length, ignored.length);
   if (!check.valid) {
     console.error(`❌ ${check.error}`);
-    const missing = filePaths.length - (analyzed.length + skipped.length + ignored.length);
+    const missing = Math.max(1, filePaths.length - (analyzed.length + skipped.length + ignored.length));
     for (let i = 0; i < missing; i++) {
       const fallbackEntry: ClassifiedFileEntry & { status: 'skipped'; reason: SkippedReason } = {
         filePath: '<invariant-mismatch>',
@@ -919,18 +947,23 @@ export interface AuditExecutionOptions {
 export interface AuditExecutionOutput {
   summaries: FileAuditSummary[];
   hasFatalFailure: boolean;
+  hasFindingFailure: boolean;
+  analysisFailureCount: number;
   totalScoreSum: number;
   auditedCount: number;
 }
 
 function classifyAnalysisErrorReason(err: unknown): SkippedReason {
-  if (err instanceof SyntaxError || (err instanceof Error && err.name === 'ParseError')) {
-    return 'parse_error';
+  if (err instanceof Error) {
+    const isSyntaxOrParse = err instanceof SyntaxError || err.name === 'ParseError';
+    if (isSyntaxOrParse && !/\b(?:JSON|Gemini|package\.json)\b/i.test(err.message)) {
+      return 'parse_error';
+    }
   }
   return 'internal_error';
 }
 
-/** Reads and evaluates each analyzed entry, failing open per file as skipped/parse_error or skipped/internal_error. */
+/** Reads and evaluates each analyzed entry, isolating failures per file while failing closed overall. */
 export async function auditClassifiedFiles(
   classification: ClassificationResult,
   options: AuditExecutionOptions
@@ -939,7 +972,8 @@ export async function auditClassifiedFiles(
   const evaluate = options.evaluateFn ?? evaluateCodeHybrid;
   const { apiKey, minScore, isFork, verifiedAllowlist } = options;
 
-  let hasFatalFailure = false;
+  let hasFindingFailure = false;
+  let analysisFailureCount = 0;
   let totalScoreSum = 0;
   let auditedCount = 0;
   const summaries: FileAuditSummary[] = [];
@@ -967,9 +1001,7 @@ export async function auditClassifiedFiles(
       const hasInlineErrors = report.inlineFindings?.some((f) => f.severity === 'error') ?? false;
       const passed = !(score.totalScore < minScore || (!report.isHardened && score.security < 70) || hasInlineErrors);
 
-      auditedCount++;
-      totalScoreSum += score.totalScore;
-      summaries.push({
+      const summaryItem: FileAuditSummary = {
         filePath,
         security: score.security,
         correctness: score.correctness,
@@ -987,7 +1019,7 @@ export async function auditClassifiedFiles(
         invalidAllowlistEntries:
           verifiedAllowlist.invalidAllowlistEntries.length > 0 ? verifiedAllowlist.invalidAllowlistEntries : undefined,
         allowlistModifiedInPr: verifiedAllowlist.allowlistModifiedInPr || undefined,
-      });
+      };
 
       console.log(`   - Security        : ${score.security}/100`);
       console.log(`   - Correctness     : ${score.correctness}/100`);
@@ -1001,10 +1033,15 @@ export async function auditClassifiedFiles(
             `   💣 Temuan Fatal (${report.temuanUtama.line}): ${redactSecretsPreservingLayout(report.temuanUtama.description)}`
           );
         }
-        hasFatalFailure = true;
+        hasFindingFailure = true;
       } else {
         console.log(`   ✅ LOLOS: ${filePath} memenuhi standar keamanan dan mutu kode.`);
       }
+
+      // Commit metrics & summary last so an exception cannot leave a file in both analyzed and skipped.
+      auditedCount++;
+      totalScoreSum += score.totalScore;
+      summaries.push(summaryItem);
     } catch (err: unknown) {
       const reason = classifyAnalysisErrorReason(err);
       const errMsg = redactSecretsPreservingLayout(err instanceof Error ? err.message : String(err));
@@ -1014,24 +1051,53 @@ export async function auditClassifiedFiles(
         classification.analyzed.splice(idx, 1);
       }
       entry.status = 'skipped';
+      delete entry.coverage;
       entry.reason = reason;
       classification.skipped.push(entry as ClassifiedFileEntry & { status: 'skipped'; reason: SkippedReason });
-      hasFatalFailure = true;
+      analysisFailureCount++;
     }
   }
 
-  return { summaries, hasFatalFailure, totalScoreSum, auditedCount };
+  return {
+    summaries,
+    hasFatalFailure: hasFindingFailure || analysisFailureCount > 0,
+    hasFindingFailure,
+    analysisFailureCount,
+    totalScoreSum,
+    auditedCount,
+  };
 }
 
-/** Parses `fail_on_unanalyzable` input from `DEVGUARD_FAIL_ON_UNANALYZABLE`. */
+/** Strictly parses `fail_on_unanalyzable` from `DEVGUARD_FAIL_ON_UNANALYZABLE` (`'true'` / `'false'` / empty). */
 export function parseFailOnUnanalyzable(env: NodeJS.ProcessEnv = process.env): boolean {
-  const raw = (env.DEVGUARD_FAIL_ON_UNANALYZABLE ?? 'false').trim().toLowerCase();
-  return raw === 'true' || raw === '1';
+  const raw = env.DEVGUARD_FAIL_ON_UNANALYZABLE;
+  if (raw === undefined) return false;
+  const normalized = raw.trim().toLowerCase();
+  if (normalized === '' || normalized === 'false') return false;
+  if (normalized === 'true') return true;
+  throw new Error(
+    `Invalid DEVGUARD_FAIL_ON_UNANALYZABLE value "${raw.trim()}": expected "true" or "false".`
+  );
+}
+
+/** Records any coverage invariant violation and returns the total analysis failure count. */
+export function collectAnalysisFailures(
+  skippedFiles: SkippedFileReportItem[],
+  postCheckValid: boolean,
+  preInvariantError?: string
+): number {
+  if ((!postCheckValid || preInvariantError) && !skippedFiles.some((s) => s.filePath === '<invariant-mismatch>')) {
+    skippedFiles.push({ filePath: '<invariant-mismatch>', reason: 'internal_error' });
+  }
+  return skippedFiles.filter(
+    (s) => s.reason === 'parse_error' || s.reason === 'internal_error'
+  ).length;
 }
 
 export interface OverallGateVerdict {
   overallScore: number | null;
   overallScoreDisplay: string;
+  analysisFailureCount: number;
   unanalyzableFailed: boolean;
   gateFailed: boolean;
   auditStatus: 'PASS' | 'FAIL';
@@ -1043,15 +1109,17 @@ export function computeOverallGateVerdict(
   totalScoreSum: number,
   skippedCount: number,
   hasFatalFailure: boolean,
-  failOnUnanalyzable: boolean
+  failOnUnanalyzable: boolean,
+  analysisFailureCount: number = 0
 ): OverallGateVerdict {
   const overallScore = auditedCount > 0 ? Math.round(totalScoreSum / auditedCount) : null;
   const overallScoreDisplay = overallScore === null ? 'N/A' : String(overallScore);
   const unanalyzableFailed = failOnUnanalyzable && skippedCount > 0;
-  const gateFailed = hasFatalFailure || unanalyzableFailed;
+  const gateFailed = hasFatalFailure || analysisFailureCount > 0 || unanalyzableFailed;
   return {
     overallScore,
     overallScoreDisplay,
+    analysisFailureCount,
     unanalyzableFailed,
     gateFailed,
     auditStatus: gateFailed ? 'FAIL' : 'PASS',
@@ -1066,16 +1134,35 @@ export async function runAction() {
     process.exit(1);
   }
 
+  let failOnUnanalyzable = false;
+  try {
+    failOnUnanalyzable = parseFailOnUnanalyzable(process.env);
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`❌ Invalid configuration: ${msg}`);
+    process.exit(1);
+  }
+
   const apiKey = process.env.GEMINI_API_KEY;
   const minScore = parseInt(process.env.DEVGUARD_MIN_SCORE || '85', 10);
   const targetPattern = process.env.DEVGUARD_TARGET || 'modified';
-  const failOnUnanalyzable = parseFailOnUnanalyzable(process.env);
   const prEnv = resolvePrEnvironmentFromEnv();
   const explicitFileArgs = resolveCliFileArgs(process.argv.slice(2));
   const engineMode: 'HYBRID' | 'OFFLINE_AST' =
     !prEnv.isFork && apiKey && apiKey !== 'MY_GEMINI_API_KEY' && apiKey.startsWith('AIzaSy')
       ? 'HYBRID'
       : 'OFFLINE_AST';
+
+  // Explicit CLI target paths must exist on disk before classification (deleted status is diff-only)
+  if (explicitFileArgs.length > 0) {
+    for (const argPath of explicitFileArgs) {
+      const resolvedArg = path.isAbsolute(argPath) ? argPath : path.resolve(process.cwd(), argPath);
+      if (!fs.existsSync(resolvedArg)) {
+        console.error(`❌ Target file not found (explicit CLI argument): ${argPath}`);
+        process.exit(1);
+      }
+    }
+  }
 
   console.log('======================================================================');
   console.log('           🛡️  DEVGUARD ADVERSARIAL CODE AUDITOR (CI GATE)            ');
@@ -1090,28 +1177,16 @@ export async function runAction() {
     console.log('Mode Eksekusi             : 🤖 Hybrid Dual-Layer (Lexical & Heuristic + Gemini 3.8 Flash)');
   }
 
-  // 1. Enumerasi berkas in-scope SEBELUM filter ekstensi (Stage 5.1)
-  const inScopeFiles: string[] =
-    explicitFileArgs.length > 0
-      ? explicitFileArgs
-      : discoverInScopeFiles(targetPattern === 'all' ? 'all' : 'modified', process.cwd());
+  const targetMode: 'modified' | 'all' = targetPattern === 'all' ? 'all' : 'modified';
+  const isExplicitMode = explicitFileArgs.length > 0;
+  const inScopeFiles: string[] = isExplicitMode
+    ? explicitFileArgs
+    : discoverInScopeFiles(targetMode, process.cwd());
 
-  const classification = classifyInScopeFiles(inScopeFiles, { cwd: process.cwd() });
-
-  // Explicit CLI target paths that do not exist on disk must fail closed rather than pass as deleted diff entries
-  if (explicitFileArgs.length > 0) {
-    for (let i = classification.ignored.length - 1; i >= 0; i--) {
-      const ign = classification.ignored[i];
-      if (ign.reason === 'deleted') {
-        console.error(`❌ Target file not found: ${ign.filePath}`);
-        classification.ignored.splice(i, 1);
-        const errEntry: ClassifiedFileEntry = ign;
-        errEntry.status = 'skipped';
-        errEntry.reason = 'internal_error';
-        classification.skipped.push(errEntry as ClassifiedFileEntry & { status: 'skipped'; reason: SkippedReason });
-      }
-    }
-  }
+  const classification = classifyInScopeFiles(inScopeFiles, {
+    cwd: process.cwd(),
+    sourceMode: isExplicitMode ? 'explicit' : targetMode,
+  });
 
   for (const skippedEntry of classification.skipped) {
     if (skippedEntry.reason === 'file_too_large') {
@@ -1133,7 +1208,7 @@ export async function runAction() {
           allowlistModifiedInPr: false,
           sourceMode: 'empty' as const,
         };
-  const { summaries, hasFatalFailure, totalScoreSum, auditedCount } = await auditClassifiedFiles(
+  const { summaries, hasFindingFailure, totalScoreSum, auditedCount } = await auditClassifiedFiles(
     classification,
     {
       apiKey,
@@ -1154,25 +1229,28 @@ export async function runAction() {
     console.error(`❌ ${postCheck.error}`);
   }
 
+  const partialFiles = classification.analyzed
+    .filter((entry) => entry.coverage === 'partial')
+    .map((entry) => entry.filePath);
   const skippedFiles: SkippedFileReportItem[] = classification.skipped.map((s) => ({
     filePath: s.filePath,
     reason: s.reason,
   }));
   const ignoredNonCodeCount = classification.ignored.filter((i) => i.reason === 'non_code').length;
   const ignoredDeletedCount = classification.ignored.filter((i) => i.reason === 'deleted').length;
-
-  const hasExecutionErrors =
-    Boolean(classification.invariantError) ||
-    !postCheck.valid ||
-    skippedFiles.some((s) => s.reason === 'parse_error' || s.reason === 'internal_error');
-  const effectiveHasFatalFailure = hasFatalFailure || hasExecutionErrors;
+  const analysisFailureCount = collectAnalysisFailures(
+    skippedFiles,
+    postCheck.valid,
+    classification.invariantError
+  );
 
   const verdict = computeOverallGateVerdict(
     auditedCount,
     totalScoreSum,
     skippedFiles.length,
-    effectiveHasFatalFailure,
-    failOnUnanalyzable
+    hasFindingFailure,
+    failOnUnanalyzable,
+    analysisFailureCount
   );
 
   const codeFilesCount = classification.analyzed.length + skippedFiles.length;
@@ -1180,7 +1258,13 @@ export async function runAction() {
   console.log('\n======================================================================');
   console.log(`RATA-RATA SKOR KESELURUHAN: ${scoreDisplay}`);
   console.log(
-    `DevGuard ${REPORT_SPEC_VERSION} — Score: ${scoreDisplay}  (analyzed ${classification.analyzed.length} of ${codeFilesCount} code files · ${skippedFiles.length} skipped)`
+    formatPrHeadline({
+      analyzedCount: classification.analyzed.length,
+      codeFilesCount,
+      partialCount: partialFiles.length,
+      skippedCount: skippedFiles.length,
+      scoreDisplay,
+    })
   );
 
   // GitHub Actions Workflow Output Parameters
@@ -1197,7 +1281,9 @@ export async function runAction() {
 
   const coverageSummary: PrCoverageSummary = {
     analyzedCount: classification.analyzed.length,
+    partialFiles,
     skippedFiles,
+    analysisFailureCount,
     ignoredNonCodeCount,
     ignoredDeletedCount,
     overallScore: verdict.overallScore,
@@ -1211,22 +1297,26 @@ export async function runAction() {
 
   // Generate SARIF v2.1.0 report before process.exit so findings are always exported
   const sarifFile = process.env.DEVGUARD_SARIF_OUTPUT || 'devguard-results.sarif';
-  generateSarifReport(summaries, sarifFile, skippedFiles);
+  generateSarifReport(summaries, sarifFile, skippedFiles, {
+    partialFiles,
+    hasAnalysisFailure: analysisFailureCount > 0,
+  });
 
   writeGitHubOutput(outputFile, 'sarif_file', sarifFile);
 
   if (verdict.gateFailed) {
-    if (verdict.unanalyzableFailed && !effectiveHasFatalFailure) {
+    if (analysisFailureCount > 0) {
+      console.error(
+        `🚫 DevGuard Quality Gate Rejected: Terjadi ${analysisFailureCount} kesalahan analisis/internal (fail-closed gate).`
+      );
+    }
+    if (hasFindingFailure) {
+      console.error('🚫 DevGuard Quality Gate Rejected: Ditemukan celah keamanan atau regresi logika.');
+      console.error('   Perbaiki celah di atas atau terapkan patch perbaikan sebelum melakukan merge PR.\n');
+    } else if (verdict.unanalyzableFailed && analysisFailureCount === 0) {
       console.error(
         `🚫 DevGuard Quality Gate Rejected: ${skippedFiles.length} berkas tidak dapat dianalisis (fail_on_unanalyzable=true).`
       );
-    } else if (hasExecutionErrors && !hasFatalFailure) {
-      console.error(
-        '🚫 DevGuard Quality Gate Rejected: Terjadi kesalahan analisis/internal (fail-closed gate).'
-      );
-    } else {
-      console.error('🚫 DevGuard Quality Gate Rejected: Ditemukan celah keamanan atau regresi logika.');
-      console.error('   Perbaiki celah di atas atau terapkan patch perbaikan sebelum melakukan merge PR.\n');
     }
     process.exit(1);
   } else {

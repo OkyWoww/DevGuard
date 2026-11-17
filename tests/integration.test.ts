@@ -21,13 +21,17 @@ import {
   auditClassifiedFiles,
   classifyFile,
   classifyInScopeFiles,
+  collectAnalysisFailures,
   computeOverallGateVerdict,
   discoverInScopeFiles,
   discoverWorkspaceFiles,
   evaluateCodeHybrid,
+  formatPrHeadline,
+  getDevGuardVersion,
   hasAnalyzableExtension,
   hasPartialAnalysisExtension,
   isExcludedFromAutoDiscovery,
+  isExcludedPathFromScope,
   loadVerifiedAllowlist,
   matchAllowlistForFile,
   parseFailOnUnanalyzable,
@@ -37,7 +41,9 @@ import { generateSarifReport } from '../src/sarifGenerator.js';
 import { analyzeLexicalStructure } from '../src/rules/lexicalMasker.js';
 import {
   COMMENT_SIGNATURE,
+  MAX_PR_PARTIAL_FILES_DISPLAY,
   MAX_PR_SKIPPED_FILES_DISPLAY,
+  PARTIAL_COVERAGE_REASON_TEXT,
   buildPullRequestCommentMarkdown,
   detectPrEnvironment,
   formatLayer2StatusLabel,
@@ -2880,7 +2886,9 @@ test('37. PR containing only skipped languages (.go/.rb) produces N/A score, ski
     const prBody = postedBodies[0];
     assert.ok(prBody.includes('⚠️ NOT ANALYZED — no supported code files'));
     assert.ok(!prBody.includes('✅ PASSED (READY TO MERGE)'), 'Must never show PASSED badge when 0 files were analyzed');
-    assert.ok(prBody.includes('DevGuard v1.3.0 — Score: N/A  (analyzed 0 of 2 code files · 2 skipped)'));
+    assert.ok(
+      prBody.includes(`DevGuard v${getDevGuardVersion()} — Score: N/A  (analyzed 0 of 2 code files · 2 skipped)`)
+    );
     assert.ok(prBody.includes('- Analyzed: 0'));
     assert.ok(prBody.includes('- Skipped: 2'));
     assert.ok(prBody.includes('tools/deploy.go — Skipped: Unsupported language'));
@@ -3037,7 +3045,9 @@ test('39. Mixed PR (.ts + .go + >1MiB .js + .md) computes score solely from anal
     const prBody = postedBodies[0];
     assert.ok(prBody.includes('✅ PASSED (READY TO MERGE)'));
     assert.ok(
-      prBody.includes(`DevGuard v1.3.0 — Score: ${expectedTsScore}/100  (analyzed 1 of 3 code files · 2 skipped)`),
+      prBody.includes(
+        `DevGuard v${getDevGuardVersion()} — Score: ${expectedTsScore}/100  (analyzed 1 of 3 code files · 2 skipped)`
+      ),
       `Unexpected headline in PR body:\n${prBody}`
     );
     assert.ok(prBody.includes('- Analyzed: 1'));
@@ -3297,7 +3307,9 @@ test('42. Long skipped list truncates PR comment with +N more while SARIF keeps 
     };
 
     const markdown = buildPullRequestCommentMarkdown([summary], 85, 'OFFLINE_AST', coverage);
-    assert.ok(markdown.includes('DevGuard v1.3.0 — Score: 95/100  (analyzed 1 of 26 code files · 25 skipped)'));
+    assert.ok(
+      markdown.includes(`DevGuard v${getDevGuardVersion()} — Score: 95/100  (analyzed 1 of 26 code files · 25 skipped)`)
+    );
     assert.ok(markdown.includes(`tools/job_${MAX_PR_SKIPPED_FILES_DISPLAY}.go — Skipped: Unsupported language`));
     assert.ok(!markdown.includes('tools/job_21.go — Skipped: Unsupported language'));
     assert.ok(markdown.includes(`    - +${25 - MAX_PR_SKIPPED_FILES_DISPLAY} more`));
@@ -3326,6 +3338,10 @@ test('43. Contract consistency: fail_on_unanalyzable aligns across action.yml, R
   assert.match(readmeMd, /\*\*Input\*\*\s*\|\s*`fail_on_unanalyzable`\s*\|\s*`'false'`/);
   assert.match(readmeMd, /DEVGUARD_FAIL_ON_UNANALYZABLE/);
   assert.match(readmeMd, /\*\*Output\*\*\s*\|\s*`overall_score`.*N\/A/);
+  assert.match(readmeMd, /PARTIALLY ANALYZED/);
+  assert.match(readmeMd, /ANALYSIS ERROR/);
+  assert.match(readmeMd, /Known Limitations/);
+  assert.match(readmeMd, /Behavior Changes/);
 
   assert.equal(parseFailOnUnanalyzable({}), false);
   assert.equal(parseFailOnUnanalyzable({ DEVGUARD_FAIL_ON_UNANALYZABLE: 'false' }), false);
@@ -3408,7 +3424,7 @@ test('44. Per-file exception fails open for coverage while enforcing fail-closed
       overallScore: defaultVerdict.overallScore,
       failOnUnanalyzable: false,
     });
-    assert.ok(prComment.includes('🚫 REJECTED (SECURITY GATE FAILED)'));
+    assert.ok(prComment.includes('🚫 REJECTED (ANALYSIS ERROR)'));
 
     const sarifOut = path.join(tempDir, 'fail-closed-err.sarif');
     generateSarifReport(
@@ -3438,6 +3454,756 @@ test('44. Per-file exception fails open for coverage while enforcing fail-closed
     });
     assert.equal(missingPathRun.status, 1);
     assert.match(`${missingPathRun.stderr}\n${missingPathRun.stdout}`, /Target file not found/);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('45. Crash payload via evaluateFn fails closed without double-recording, while Layer 2 Gemini JSON/HTTP errors stay non-fatal', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-crash-eval-'));
+  try {
+    const cleanCode = [
+      'export function safeMul(a: number, b: number): number {',
+      '  if (typeof a !== "number" || typeof b !== "number") throw new TypeError("Invalid");',
+      '  try { return a * b; } catch (err) { throw err; }',
+      '}',
+    ].join('\n');
+
+    const classification = classifyInScopeFiles(['src/crashPayload.ts', 'src/jsonSyntaxCrash.ts', 'src/healthyAfter.ts'], {
+      statFn: () => ({ exists: true, size: 128 }),
+    });
+
+    const execRes = await auditClassifiedFiles(classification, {
+      apiKey: '',
+      minScore: 85,
+      isFork: false,
+      verifiedAllowlist: {
+        rulesByPath: new Map(),
+        invalidAllowlistEntries: [],
+        allowlistModifiedInPr: false,
+        sourceMode: 'empty',
+      },
+      readFileFn: () => cleanCode,
+      evaluateFn: async (code, apiKey, pre, filePath, allowlist, isFork) => {
+        if (filePath === 'src/crashPayload.ts') {
+          throw new Error('Unexpected lexical engine crash');
+        }
+        if (filePath === 'src/jsonSyntaxCrash.ts') {
+          throw new SyntaxError('Unexpected token < in JSON at position 0');
+        }
+        return evaluateCodeHybrid(code, apiKey, pre, filePath, allowlist, isFork);
+      },
+    });
+
+    // Healthy file after crash still gets analyzed, crashed files appear ONLY in skipped
+    assert.equal(execRes.auditedCount, 1);
+    assert.equal(execRes.summaries.length, 1);
+    assert.equal(execRes.summaries[0].filePath, 'src/healthyAfter.ts');
+    assert.equal(execRes.hasFindingFailure, false);
+    assert.equal(execRes.analysisFailureCount, 2);
+    assert.equal(classification.analyzed.length, 1);
+    assert.deepEqual(
+      classification.skipped.map((s) => [s.filePath, s.reason]),
+      [
+        ['src/crashPayload.ts', 'internal_error'],
+        ['src/jsonSyntaxCrash.ts', 'internal_error'],
+      ]
+    );
+
+    const verdict = computeOverallGateVerdict(
+      execRes.auditedCount,
+      execRes.totalScoreSum,
+      classification.skipped.length,
+      execRes.hasFindingFailure,
+      false,
+      execRes.analysisFailureCount
+    );
+    assert.equal(verdict.auditStatus, 'FAIL');
+    assert.equal(verdict.gateFailed, true);
+
+    const sarifOut = path.join(tempDir, 'crash-eval.sarif');
+    generateSarifReport(
+      execRes.summaries,
+      sarifOut,
+      classification.skipped.map((s) => ({ filePath: s.filePath, reason: s.reason })),
+      { hasAnalysisFailure: execRes.analysisFailureCount > 0 }
+    );
+    const sarif = JSON.parse(fs.readFileSync(sarifOut, 'utf-8'));
+    assert.equal(sarif.runs[0].invocations[0].executionSuccessful, false);
+    assert.deepEqual(
+      sarif.runs[0].invocations[0].toolExecutionNotifications.map((n: { level: string }) => n.level),
+      ['error', 'error']
+    );
+
+    // Layer 2 Gemini malformed JSON response must be caught inside evaluateCodeHybrid (non-fatal)
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = (async () =>
+      new Response('<<< not json from gemini >>>', {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })) as typeof globalThis.fetch;
+
+    try {
+      const l2Res = await evaluateCodeHybrid(
+        cleanCode,
+        'AIzaSy' + 'ValidFormatKeyForFallbackCheck01',
+        undefined,
+        'src/healthyAfter.ts',
+        undefined,
+        false
+      );
+      assert.equal(l2Res.mode, 'zero-api');
+      assert.equal(l2Res.isLiveApi, false);
+      assert.equal(l2Res.layer2Status, 'Skipped: Quota/Error Fallback');
+      assert.ok(l2Res.parsedReport.skor.totalScore >= 85);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('46. Coverage invariant violation is fatal (analysis failure, FAIL verdict, REJECTED ANALYSIS ERROR badge, SARIF error)', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-invariant-fatal-'));
+  try {
+    const skippedFiles: SkippedFileReportItem[] = [];
+    const postCheck = verifyClassificationInvariant(5, 2, 1, 1);
+    assert.equal(postCheck.valid, false);
+
+    const analysisFailureCount = collectAnalysisFailures(skippedFiles, postCheck.valid);
+    assert.equal(analysisFailureCount, 1);
+    assert.deepEqual(skippedFiles, [{ filePath: '<invariant-mismatch>', reason: 'internal_error' }]);
+
+    const cleanSummary: FileAuditSummary = {
+      filePath: 'src/ok.ts',
+      security: 95,
+      correctness: 95,
+      maintainability: 95,
+      overall: 95,
+      passed: true,
+      fatalFlaws: [],
+      defenseInDepth: [],
+    };
+
+    const verdict = computeOverallGateVerdict(1, 95, skippedFiles.length, false, false, analysisFailureCount);
+    assert.equal(verdict.gateFailed, true);
+    assert.equal(verdict.auditStatus, 'FAIL');
+
+    const md = buildPullRequestCommentMarkdown([cleanSummary], 85, 'OFFLINE_AST', {
+      analyzedCount: 1,
+      skippedFiles,
+      analysisFailureCount,
+      ignoredNonCodeCount: 0,
+      overallScore: verdict.overallScore,
+      failOnUnanalyzable: false,
+    });
+    assert.ok(md.includes('🚫 REJECTED (ANALYSIS ERROR)'));
+
+    const sarifOut = path.join(tempDir, 'invariant.sarif');
+    generateSarifReport([cleanSummary], sarifOut, skippedFiles, {
+      hasAnalysisFailure: analysisFailureCount > 0,
+    });
+    const sarif = JSON.parse(fs.readFileSync(sarifOut, 'utf-8'));
+    assert.equal(sarif.runs[0].invocations[0].executionSuccessful, false);
+    assert.equal(sarif.runs[0].invocations[0].toolExecutionNotifications[0].level, 'error');
+    assert.equal(sarif.runs[0].invocations[0].toolExecutionNotifications[0].message.text, 'Skipped: Internal error');
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('47. PR badge matrix evaluates all 6 SPEC §4.2 rows in priority order and caps partial/skipped display at 20 with +N more', () => {
+  const passSummary: FileAuditSummary = {
+    filePath: 'src/app.ts',
+    security: 95,
+    correctness: 95,
+    maintainability: 95,
+    overall: 95,
+    passed: true,
+    fatalFlaws: [],
+    defenseInDepth: [],
+  };
+  const passPySummary: FileAuditSummary = {
+    filePath: 'tools/etl.py',
+    security: 100,
+    correctness: 100,
+    maintainability: 90,
+    overall: 97,
+    passed: true,
+    fatalFlaws: [],
+    defenseInDepth: [],
+  };
+  const failSummary: FileAuditSummary = {
+    ...passSummary,
+    overall: 60,
+    passed: false,
+    fatalFlaws: ['Eval sink at Line 1'],
+  };
+
+  // Row 1: security gate failed overrides analysis error and fail_on_unanalyzable
+  const row1 = buildPullRequestCommentMarkdown([failSummary], 85, 'OFFLINE_AST', {
+    analyzedCount: 1,
+    skippedFiles: [{ filePath: 'src/broken.ts', reason: 'parse_error' }],
+    analysisFailureCount: 1,
+    ignoredNonCodeCount: 0,
+    overallScore: 60,
+    failOnUnanalyzable: true,
+  });
+  assert.ok(row1.includes('| **🚫 REJECTED (SECURITY GATE FAILED)** |'));
+
+  // Row 2: analysis failure overrides fail_on_unanalyzable and partial/not-analyzed
+  const row2 = buildPullRequestCommentMarkdown([passSummary], 85, 'OFFLINE_AST', {
+    analyzedCount: 1,
+    skippedFiles: [{ filePath: 'src/crash.ts', reason: 'internal_error' }],
+    analysisFailureCount: 1,
+    ignoredNonCodeCount: 0,
+    overallScore: 95,
+    failOnUnanalyzable: true,
+  });
+  assert.ok(row2.includes('| **🚫 REJECTED (ANALYSIS ERROR)** |'));
+
+  // Row 3: fail_on_unanalyzable active and skipped > 0
+  const row3 = buildPullRequestCommentMarkdown([passSummary], 85, 'OFFLINE_AST', {
+    analyzedCount: 1,
+    skippedFiles: [{ filePath: 'tools/deploy.go', reason: 'unsupported_language' }],
+    analysisFailureCount: 0,
+    ignoredNonCodeCount: 0,
+    overallScore: 95,
+    failOnUnanalyzable: true,
+  });
+  assert.ok(row3.includes('| **🚫 REJECTED (UNANALYZED FILES)** |'));
+
+  // Row 4: analyzed === 0
+  const row4 = buildPullRequestCommentMarkdown([], 85, 'OFFLINE_AST', {
+    analyzedCount: 0,
+    skippedFiles: [{ filePath: 'tools/deploy.go', reason: 'unsupported_language' }],
+    analysisFailureCount: 0,
+    ignoredNonCodeCount: 1,
+    overallScore: null,
+    failOnUnanalyzable: false,
+  });
+  assert.ok(row4.includes('| **⚠️ NOT ANALYZED — no supported code files** |'));
+
+  // Row 5: analyzed > 0 and all analyzed files are partial
+  const row5 = buildPullRequestCommentMarkdown([passPySummary], 85, 'OFFLINE_AST', {
+    analyzedCount: 1,
+    partialFiles: ['tools/etl.py'],
+    skippedFiles: [],
+    analysisFailureCount: 0,
+    ignoredNonCodeCount: 0,
+    overallScore: 97,
+    failOnUnanalyzable: false,
+  });
+  assert.ok(row5.includes('| **⚠️ PARTIALLY ANALYZED — language-agnostic rules only** |'));
+
+  // Row 6: full coverage or mixed JS/TS + partial passes READY TO MERGE
+  const row6 = buildPullRequestCommentMarkdown([passSummary, passPySummary], 85, 'OFFLINE_AST', {
+    analyzedCount: 2,
+    partialFiles: ['tools/etl.py'],
+    skippedFiles: [],
+    analysisFailureCount: 0,
+    ignoredNonCodeCount: 0,
+    overallScore: 96,
+    failOnUnanalyzable: false,
+  });
+  assert.ok(row6.includes('| **✅ PASSED (READY TO MERGE)** |'));
+  assert.ok(row6.includes(`(analyzed 2 of 2 code files · 1 partial · 0 skipped)`));
+
+  // Partial list cap at 20 + "+N more"
+  const manyPartials = Array.from({ length: 23 }, (_, i) => `tools/mod_${i + 1}.py`);
+  const capped = buildPullRequestCommentMarkdown([passPySummary], 85, 'OFFLINE_AST', {
+    analyzedCount: 23,
+    partialFiles: manyPartials,
+    skippedFiles: [],
+    ignoredNonCodeCount: 0,
+    overallScore: 97,
+  });
+  assert.ok(capped.includes(`tools/mod_${MAX_PR_PARTIAL_FILES_DISPLAY}.py — ${PARTIAL_COVERAGE_REASON_TEXT}`));
+  assert.ok(!capped.includes(`tools/mod_21.py — ${PARTIAL_COVERAGE_REASON_TEXT}`));
+  assert.ok(capped.includes(`    - +${23 - MAX_PR_PARTIAL_FILES_DISPLAY} more`));
+});
+
+test('48. PR containing only clean .py files exits 0, scores cleanly, renders PARTIALLY ANALYZED badge, Coverage line, and SARIF partial note', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-py-partial-e2e-'));
+  const postedBodies: string[] = [];
+  const server = http.createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on('data', (c: Buffer) => chunks.push(c));
+    req.on('end', () => {
+      const raw = Buffer.concat(chunks).toString('utf-8');
+      if (req.method === 'POST' && raw) {
+        postedBodies.push((JSON.parse(raw) as { body: string }).body);
+      }
+      res.writeHead(req.method === 'GET' ? 200 : 201, { 'Content-Type': 'application/json' });
+      res.end(req.method === 'GET' ? '[]' : JSON.stringify({ id: 480 }));
+    });
+  });
+
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const port = (server.address() as { port: number }).port;
+
+  try {
+    const repoDir = path.join(tempDir, 'repo');
+    fs.mkdirSync(path.join(repoDir, 'tools'), { recursive: true });
+    fs.writeFileSync(path.join(repoDir, 'README.md'), '# init\n', 'utf-8');
+
+    const git = (args: string[]) => spawnSync('git', args, { cwd: repoDir, encoding: 'utf-8' });
+    git(['init']);
+    git(['config', 'user.email', 'ci@devguard.local']);
+    git(['config', 'user.name', 'DevGuard Test']);
+    git(['add', '.']);
+    git(['commit', '-m', 'init']);
+
+    fs.writeFileSync(
+      path.join(repoDir, 'tools', 'etl.py'),
+      'def validate_age(age: int) -> int:\n    if not isinstance(age, int) or age < 0:\n        raise ValueError("invalid age")\n    return age\n',
+      'utf-8'
+    );
+    git(['add', '.']);
+    git(['commit', '-m', 'add clean python module']);
+
+    const eventPath = path.join(tempDir, 'event.json');
+    fs.writeFileSync(
+      eventPath,
+      JSON.stringify({
+        pull_request: { number: 481, head: { repo: { full_name: 'OkyWoww/DevGuard' } } },
+        repository: { full_name: 'OkyWoww/DevGuard' },
+      }),
+      'utf-8'
+    );
+    const ghOutput = path.join(tempDir, 'gh-output.txt');
+    const sarifOut = path.join(tempDir, 'py-partial.sarif');
+    fs.writeFileSync(ghOutput, '', 'utf-8');
+
+    const compiledCliPath = path.join(BUILD_ROOT, 'src', 'cli.js');
+    const runResult = await new Promise<{ status: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+      const child = spawn(process.execPath, [compiledCliPath], {
+        cwd: repoDir,
+        env: {
+          ...process.env,
+          GEMINI_API_KEY: '',
+          DEVGUARD_TARGET: 'modified',
+          GITHUB_TOKEN: 'test-token',
+          GITHUB_REPOSITORY: 'OkyWoww/DevGuard',
+          GITHUB_EVENT_PATH: eventPath,
+          GITHUB_API_URL: `http://127.0.0.1:${port}`,
+          GITHUB_OUTPUT: ghOutput,
+          DEVGUARD_SARIF_OUTPUT: sarifOut,
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', (d) => { stdout += d.toString(); });
+      child.stderr.on('data', (d) => { stderr += d.toString(); });
+      child.on('error', reject);
+      child.on('close', (code) => resolve({ status: code, stdout, stderr }));
+    });
+
+    assert.equal(runResult.status, 0, `Expected clean .py PR to exit 0, stderr: ${runResult.stderr}`);
+    const outText = fs.readFileSync(ghOutput, 'utf-8');
+    assert.match(outText, /^overall_score=97$/m);
+    assert.match(outText, /^audit_status=PASS$/m);
+
+    assert.equal(postedBodies.length, 1);
+    const prBody = postedBodies[0];
+    assert.ok(prBody.includes('⚠️ PARTIALLY ANALYZED — language-agnostic rules only'));
+    assert.ok(!prBody.includes('✅ PASSED (READY TO MERGE)'));
+    assert.ok(
+      prBody.includes(`DevGuard v${getDevGuardVersion()} — Score: 97/100  (analyzed 1 of 1 code files · 1 partial · 0 skipped)`)
+    );
+    assert.ok(prBody.includes(`tools/etl.py — ${PARTIAL_COVERAGE_REASON_TEXT}`));
+
+    const sarif = JSON.parse(fs.readFileSync(sarifOut, 'utf-8'));
+    assert.equal(sarif.runs[0].invocations[0].executionSuccessful, true);
+    assert.equal(sarif.runs[0].invocations[0].toolExecutionNotifications.length, 1);
+    assert.equal(sarif.runs[0].invocations[0].toolExecutionNotifications[0].level, 'note');
+    assert.equal(
+      sarif.runs[0].invocations[0].toolExecutionNotifications[0].message.text,
+      PARTIAL_COVERAGE_REASON_TEXT
+    );
+    assert.equal(
+      sarif.runs[0].invocations[0].toolExecutionNotifications[0].locations[0].physicalLocation.artifactLocation.uri,
+      'tools/etl.py'
+    );
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('49. Mixed PR (.ts + .py + .go + >1MiB .js + .md) emits accurate headline, Coverage partial+skipped blocks, and SARIF notifications', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-mixed-partial-'));
+  const postedBodies: string[] = [];
+  const server = http.createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on('data', (c: Buffer) => chunks.push(c));
+    req.on('end', () => {
+      const raw = Buffer.concat(chunks).toString('utf-8');
+      if (req.method === 'POST' && raw) {
+        postedBodies.push((JSON.parse(raw) as { body: string }).body);
+      }
+      res.writeHead(req.method === 'GET' ? 200 : 201, { 'Content-Type': 'application/json' });
+      res.end(req.method === 'GET' ? '[]' : JSON.stringify({ id: 490 }));
+    });
+  });
+
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const port = (server.address() as { port: number }).port;
+
+  try {
+    const repoDir = path.join(tempDir, 'repo');
+    fs.mkdirSync(path.join(repoDir, 'src'), { recursive: true });
+    fs.mkdirSync(path.join(repoDir, 'tools'), { recursive: true });
+    fs.writeFileSync(path.join(repoDir, 'README.md'), '# init\n', 'utf-8');
+
+    const git = (args: string[]) => spawnSync('git', args, { cwd: repoDir, encoding: 'utf-8' });
+    git(['init']);
+    git(['config', 'user.email', 'ci@devguard.local']);
+    git(['config', 'user.name', 'DevGuard Test']);
+    git(['add', '.']);
+    git(['commit', '-m', 'init']);
+
+    const safeTs = [
+      'export function subNumbers(a: number, b: number): number {',
+      '  if (typeof a !== "number" || typeof b !== "number") throw new TypeError("Invalid");',
+      '  try { return a - b; } catch (err) { throw err; }',
+      '}',
+    ].join('\n');
+    const cleanPy = 'def check_positive(n: int) -> int:\n    if not isinstance(n, int) or n <= 0:\n        raise ValueError("bad")\n    return n\n';
+
+    fs.writeFileSync(path.join(repoDir, 'src', 'math.ts'), safeTs, 'utf-8');
+    fs.writeFileSync(path.join(repoDir, 'tools', 'etl.py'), cleanPy, 'utf-8');
+    fs.writeFileSync(path.join(repoDir, 'tools', 'deploy.go'), 'package main\nfunc main() {}\n', 'utf-8');
+    const pad = '// bundle padding 0123456789abcdef\n';
+    fs.writeFileSync(
+      path.join(repoDir, 'tools', 'big.js'),
+      pad.repeat(Math.ceil((MAX_AUDIT_FILE_BYTES + 512) / Buffer.byteLength(pad, 'utf-8'))),
+      'utf-8'
+    );
+    fs.writeFileSync(path.join(repoDir, 'README.md'), '# updated docs\n', 'utf-8');
+
+    git(['add', '.']);
+    git(['commit', '-m', 'mixed PR with partial py']);
+
+    const expectedAvg = Math.round(
+      (analyzeCodeDeterministically(safeTs, { filePath: 'src/math.ts' }).skor.totalScore +
+        analyzeCodeDeterministically(cleanPy, { filePath: 'tools/etl.py' }).skor.totalScore) / 2
+    );
+
+    const eventPath = path.join(tempDir, 'event.json');
+    fs.writeFileSync(
+      eventPath,
+      JSON.stringify({
+        pull_request: { number: 491, head: { repo: { full_name: 'OkyWoww/DevGuard' } } },
+        repository: { full_name: 'OkyWoww/DevGuard' },
+      }),
+      'utf-8'
+    );
+    const ghOutput = path.join(tempDir, 'gh-output.txt');
+    const sarifOut = path.join(tempDir, 'mixed-partial.sarif');
+    fs.writeFileSync(ghOutput, '', 'utf-8');
+
+    const compiledCliPath = path.join(BUILD_ROOT, 'src', 'cli.js');
+    const runResult = await new Promise<{ status: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+      const child = spawn(process.execPath, [compiledCliPath], {
+        cwd: repoDir,
+        env: {
+          ...process.env,
+          GEMINI_API_KEY: '',
+          DEVGUARD_TARGET: 'modified',
+          GITHUB_TOKEN: 'test-token',
+          GITHUB_REPOSITORY: 'OkyWoww/DevGuard',
+          GITHUB_EVENT_PATH: eventPath,
+          GITHUB_API_URL: `http://127.0.0.1:${port}`,
+          GITHUB_OUTPUT: ghOutput,
+          DEVGUARD_SARIF_OUTPUT: sarifOut,
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', (d) => { stdout += d.toString(); });
+      child.stderr.on('data', (d) => { stderr += d.toString(); });
+      child.on('error', reject);
+      child.on('close', (code) => resolve({ status: code, stdout, stderr }));
+    });
+
+    assert.equal(runResult.status, 0, `Expected mixed PR with .py partial to exit 0, stderr: ${runResult.stderr}`);
+    assert.equal(postedBodies.length, 1);
+    const prBody = postedBodies[0];
+    assert.ok(prBody.includes('✅ PASSED (READY TO MERGE)'));
+    assert.ok(
+      prBody.includes(
+        `DevGuard v${getDevGuardVersion()} — Score: ${expectedAvg}/100  (analyzed 2 of 4 code files · 1 partial · 2 skipped)`
+      ),
+      `Unexpected headline:\n${prBody}`
+    );
+    assert.ok(prBody.includes(`tools/etl.py — ${PARTIAL_COVERAGE_REASON_TEXT}`));
+    assert.ok(prBody.includes('tools/deploy.go — Skipped: Unsupported language'));
+    assert.ok(prBody.includes('tools/big.js — Skipped: File too large (> 1 MiB)'));
+    assert.ok(prBody.includes('- Ignored (non-code): 1'));
+
+    const sarif = JSON.parse(fs.readFileSync(sarifOut, 'utf-8'));
+    assert.equal(sarif.runs[0].invocations[0].executionSuccessful, true);
+    const notifs = sarif.runs[0].invocations[0].toolExecutionNotifications as Array<{
+      level: string;
+      message: { text: string };
+      locations: Array<{ physicalLocation: { artifactLocation: { uri: string } } }>;
+    }>;
+    assert.equal(notifs.length, 3);
+    assert.ok(notifs.every((n) => n.level === 'note'));
+    assert.ok(notifs.some((n) => n.message.text === PARTIAL_COVERAGE_REASON_TEXT && n.locations[0].physicalLocation.artifactLocation.uri === 'tools/etl.py'));
+    assert.ok(notifs.some((n) => n.message.text === 'Skipped: Unsupported language' && n.locations[0].physicalLocation.artifactLocation.uri === 'tools/deploy.go'));
+    assert.ok(notifs.some((n) => n.message.text === 'Skipped: File too large (> 1 MiB)' && n.locations[0].physicalLocation.artifactLocation.uri === 'tools/big.js'));
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('50. parseFailOnUnanalyzable enforces strict true/false/empty values, ignores INPUT_*, and exits 1 cleanly on invalid CLI values', () => {
+  assert.equal(parseFailOnUnanalyzable({}), false);
+  assert.equal(parseFailOnUnanalyzable({ DEVGUARD_FAIL_ON_UNANALYZABLE: '' }), false);
+  assert.equal(parseFailOnUnanalyzable({ DEVGUARD_FAIL_ON_UNANALYZABLE: '   ' }), false);
+  assert.equal(parseFailOnUnanalyzable({ DEVGUARD_FAIL_ON_UNANALYZABLE: 'false' }), false);
+  assert.equal(parseFailOnUnanalyzable({ DEVGUARD_FAIL_ON_UNANALYZABLE: ' FALSE ' }), false);
+  assert.equal(parseFailOnUnanalyzable({ DEVGUARD_FAIL_ON_UNANALYZABLE: 'true' }), true);
+  assert.equal(parseFailOnUnanalyzable({ DEVGUARD_FAIL_ON_UNANALYZABLE: 'TRUE' }), true);
+  assert.equal(parseFailOnUnanalyzable({ DEVGUARD_FAIL_ON_UNANALYZABLE: ' True ' }), true);
+  assert.equal(parseFailOnUnanalyzable({ INPUT_FAIL_ON_UNANALYZABLE: 'true' }), false);
+
+  for (const invalidVal of ['yes', '1', '0', 'ture', 'on']) {
+    assert.throws(
+      () => parseFailOnUnanalyzable({ DEVGUARD_FAIL_ON_UNANALYZABLE: invalidVal }),
+      /Invalid DEVGUARD_FAIL_ON_UNANALYZABLE value/
+    );
+  }
+
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-strict-input-'));
+  try {
+    const cleanFile = path.join(tempDir, 'clean.ts');
+    fs.writeFileSync(cleanFile, 'export const ok = 1;\n', 'utf-8');
+    const compiledCliPath = path.join(BUILD_ROOT, 'src', 'cli.js');
+    const badRun = spawnSync(process.execPath, [compiledCliPath, cleanFile], {
+      cwd: tempDir,
+      encoding: 'utf-8',
+      env: {
+        ...process.env,
+        GEMINI_API_KEY: '',
+        GITHUB_TOKEN: '',
+        GITHUB_EVENT_PATH: '',
+        DEVGUARD_FAIL_ON_UNANALYZABLE: 'ture',
+      },
+    });
+    assert.equal(badRun.status, 1);
+    assert.match(`${badRun.stderr}\n${badRun.stdout}`, /Invalid DEVGUARD_FAIL_ON_UNANALYZABLE value "ture"/);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('51. Dynamic getDevGuardVersion resolves package.json across src/ (strip-types), .test-dist/, and bounded depth fallback', () => {
+  const rootPkg = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, 'package.json'), 'utf-8')) as {
+    name: string;
+    version: string;
+  };
+  assert.equal(rootPkg.name, 'devguard');
+  assert.equal(getDevGuardVersion(), rootPkg.version);
+  assert.equal(getDevGuardVersion(path.join(REPO_ROOT, 'src')), rootPkg.version);
+  assert.equal(getDevGuardVersion(path.join(BUILD_ROOT, 'src')), rootPkg.version);
+
+  const headline = formatPrHeadline({
+    analyzedCount: 1,
+    codeFilesCount: 1,
+    partialCount: 0,
+    skippedCount: 0,
+    scoreDisplay: '95/100',
+  });
+  assert.ok(headline.startsWith(`DevGuard v${rootPkg.version} — Score: 95/100`));
+
+  // Verify 4-level upward search limit & fallback 'unknown'
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-ver-depth-'));
+  try {
+    const fakeRoot = path.join(tempDir, 'root');
+    const depth4 = path.join(fakeRoot, 'a', 'b', 'c', 'd');
+    const depth5 = path.join(depth4, 'e');
+    fs.mkdirSync(depth5, { recursive: true });
+    fs.writeFileSync(
+      path.join(fakeRoot, 'package.json'),
+      JSON.stringify({ name: 'devguard', version: '9.9.9' }),
+      'utf-8'
+    );
+    assert.equal(getDevGuardVersion(depth4), '9.9.9');
+    assert.equal(getDevGuardVersion(depth5), 'unknown');
+
+    const wrongPkgDir = path.join(tempDir, 'other', 'sub');
+    fs.mkdirSync(wrongPkgDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(tempDir, 'other', 'package.json'),
+      JSON.stringify({ name: 'not-devguard', version: '2.0.0' }),
+      'utf-8'
+    );
+    assert.equal(getDevGuardVersion(wrongPkgDir), 'unknown');
+
+    // Run both src/loader.mjs (strip-types) and .test-dist/src/cli.js and verify headline version
+    const sampleFile = path.join(tempDir, 'clean.ts');
+    fs.writeFileSync(
+      sampleFile,
+      'export function okFn(x: number): number {\n  if (typeof x !== "number") throw new TypeError("x");\n  try { return x + 1; } catch (e) { throw e; }\n}\n',
+      'utf-8'
+    );
+    const sharedEnv = {
+      ...process.env,
+      GEMINI_API_KEY: '',
+      GITHUB_TOKEN: '',
+      GITHUB_EVENT_PATH: '',
+      GITHUB_ACTIONS: '',
+      DEVGUARD_SARIF_OUTPUT: path.join(tempDir, 'ver.sarif'),
+    };
+    const srcRun = spawnSync(
+      process.execPath,
+      ['--experimental-strip-types', path.join(REPO_ROOT, 'src', 'loader.mjs'), sampleFile],
+      { cwd: tempDir, encoding: 'utf-8', env: sharedEnv }
+    );
+    assert.equal(srcRun.status, 0, `src/loader.mjs failed: ${srcRun.stderr}`);
+    assert.ok(srcRun.stdout.includes(`DevGuard v${rootPkg.version} — Score:`));
+
+    const distRun = spawnSync(
+      process.execPath,
+      [path.join(BUILD_ROOT, 'src', 'cli.js'), sampleFile],
+      { cwd: tempDir, encoding: 'utf-8', env: sharedEnv }
+    );
+    assert.equal(distRun.status, 0, `.test-dist/src/cli.js failed: ${distRun.stderr}`);
+    assert.ok(distRun.stdout.includes(`DevGuard v${rootPkg.version} — Score:`));
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('52. Missing explicit CLI file/glob exits 1 before classification while deleted git diff files classify as ignored/deleted', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-explicit-vs-diff-'));
+  try {
+    assert.throws(
+      () =>
+        classifyFile('src/missing.ts', {
+          statFn: () => ({ exists: false, size: 0 }),
+          sourceMode: 'explicit',
+        }),
+      /Target file not found/
+    );
+
+    const compiledCliPath = path.join(BUILD_ROOT, 'src', 'cli.js');
+    const missingGlobRun = spawnSync(process.execPath, [compiledCliPath, path.join(tempDir, '*.missingext')], {
+      cwd: tempDir,
+      encoding: 'utf-8',
+      env: { ...process.env, GEMINI_API_KEY: '', GITHUB_TOKEN: '', GITHUB_EVENT_PATH: '' },
+    });
+    assert.equal(missingGlobRun.status, 1);
+    assert.match(`${missingGlobRun.stderr}\n${missingGlobRun.stdout}`, /Target file not found/);
+
+    // Deleted tracked file in modified mode must become ignored/deleted and exit 0
+    const repoDir = path.join(tempDir, 'repo');
+    fs.mkdirSync(path.join(repoDir, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(repoDir, 'src', 'removed.ts'), 'export const x = 1;\n', 'utf-8');
+    fs.writeFileSync(path.join(repoDir, 'README.md'), '# demo\n', 'utf-8');
+
+    const git = (args: string[]) => spawnSync('git', args, { cwd: repoDir, encoding: 'utf-8' });
+    git(['init']);
+    git(['config', 'user.email', 'ci@devguard.local']);
+    git(['config', 'user.name', 'DevGuard Test']);
+    git(['add', '.']);
+    git(['commit', '-m', 'init']);
+
+    fs.unlinkSync(path.join(repoDir, 'src', 'removed.ts'));
+    fs.writeFileSync(path.join(repoDir, 'README.md'), '# updated\n', 'utf-8');
+    git(['add', '-A']);
+    git(['commit', '-m', 'delete tracked ts']);
+
+    const diffFiles = discoverInScopeFiles('modified', repoDir);
+    assert.ok(diffFiles.includes('src/removed.ts'));
+    const classified = classifyInScopeFiles(diffFiles, { cwd: repoDir, sourceMode: 'modified' });
+    assert.deepEqual(
+      classified.ignored.filter((i) => i.filePath === 'src/removed.ts').map((i) => i.reason),
+      ['deleted']
+    );
+
+    const diffRun = spawnSync(process.execPath, [compiledCliPath], {
+      cwd: repoDir,
+      encoding: 'utf-8',
+      env: {
+        ...process.env,
+        GEMINI_API_KEY: '',
+        GITHUB_TOKEN: '',
+        GITHUB_EVENT_PATH: '',
+        DEVGUARD_TARGET: 'modified',
+        DEVGUARD_SARIF_OUTPUT: path.join(tempDir, 'deleted-diff.sarif'),
+      },
+    });
+    assert.equal(diffRun.status, 0, `Expected deleted diff PR to exit 0, stderr: ${diffRun.stderr}`);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('53. Path exclusion policy keeps scripts/*.js and scripts/*.py excluded in modified and all modes identically to BASE v1.2.1', () => {
+  const mustExclude = [
+    'scripts/corpus-report.ts',
+    'scripts/build.js',
+    'scripts/etl.py',
+    'scripts/nested/job.py',
+    'tests/unit.ts',
+    'devguard_verify.py',
+    'src/devguardAnalyzer.ts',
+    'src/types.d.ts',
+    'src/foo.test.ts',
+    'src/foo.spec.js',
+    '.github/workflows/devguard.yml',
+  ];
+  for (const p of mustExclude) {
+    assert.equal(isExcludedPathFromScope(p), true, `Expected isExcludedPathFromScope('${p}') === true`);
+    assert.equal(isExcludedFromAutoDiscovery(p), true, `Expected isExcludedFromAutoDiscovery('${p}') === true`);
+  }
+
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-path-policy-'));
+  try {
+    const repoDir = path.join(tempDir, 'repo');
+    fs.mkdirSync(path.join(repoDir, 'scripts'), { recursive: true });
+    fs.mkdirSync(path.join(repoDir, 'src'), { recursive: true });
+    fs.mkdirSync(path.join(repoDir, 'tools'), { recursive: true });
+    fs.writeFileSync(path.join(repoDir, 'scripts', 'helper.js'), 'export const a = 1;\n', 'utf-8');
+    fs.writeFileSync(path.join(repoDir, 'scripts', 'etl.py'), 'print(1)\n', 'utf-8');
+    fs.writeFileSync(path.join(repoDir, 'src', 'app.ts'), 'export const b = 1;\n', 'utf-8');
+    fs.writeFileSync(path.join(repoDir, 'tools', 'etl.py'), 'print(2)\n', 'utf-8');
+
+    const git = (args: string[]) => spawnSync('git', args, { cwd: repoDir, encoding: 'utf-8' });
+    git(['init']);
+    git(['config', 'user.email', 'ci@devguard.local']);
+    git(['config', 'user.name', 'DevGuard Test']);
+    git(['add', '.']);
+    git(['commit', '-m', 'init']);
+
+    fs.writeFileSync(path.join(repoDir, 'scripts', 'helper.js'), 'export const a = 2;\n', 'utf-8');
+    fs.writeFileSync(path.join(repoDir, 'scripts', 'etl.py'), 'print(3)\n', 'utf-8');
+    fs.writeFileSync(path.join(repoDir, 'src', 'app.ts'), 'export const b = 2;\n', 'utf-8');
+    fs.writeFileSync(path.join(repoDir, 'tools', 'etl.py'), 'print(4)\n', 'utf-8');
+    git(['add', '.']);
+    git(['commit', '-m', 'update scripts, src, tools']);
+
+    const modInScope = discoverInScopeFiles('modified', repoDir).sort();
+    const allInScope = discoverInScopeFiles('all', repoDir)
+      .map((p) => path.relative(repoDir, p).replace(/\\/g, '/'))
+      .sort();
+    const modWorkspace = discoverWorkspaceFiles('modified', repoDir).sort();
+    const allWorkspace = discoverWorkspaceFiles('all', repoDir)
+      .map((p) => path.relative(repoDir, p).replace(/\\/g, '/'))
+      .sort();
+
+    assert.deepEqual(modInScope, ['src/app.ts', 'tools/etl.py']);
+    assert.deepEqual(allInScope, ['src/app.ts', 'tools/etl.py']);
+    assert.deepEqual(modWorkspace, ['src/app.ts', 'tools/etl.py']);
+    assert.deepEqual(allWorkspace, ['src/app.ts', 'tools/etl.py']);
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }

@@ -1,6 +1,8 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
+  hasPartialAnalysisExtension,
   redactSecretsPreservingLayout,
   type InlineFinding,
   type ParsedSuppression,
@@ -74,20 +76,64 @@ export interface SkippedFileReportItem {
 
 export interface PrCoverageSummary {
   analyzedCount: number;
+  partialFiles?: ReadonlyArray<string>;
   skippedFiles: SkippedFileReportItem[];
+  analysisFailureCount?: number;
   ignoredNonCodeCount: number;
   ignoredDeletedCount?: number;
   overallScore?: number | null;
   failOnUnanalyzable?: boolean;
   maxSkippedDisplay?: number;
+  maxPartialDisplay?: number;
 }
 
 export const MAX_PR_SKIPPED_FILES_DISPLAY = 20;
+export const MAX_PR_PARTIAL_FILES_DISPLAY = 20;
+export const PARTIAL_COVERAGE_REASON_TEXT = 'Partial: language-agnostic rules only';
 
-/** Report headline version required by DevGuard v1.3.0 specification (§4.2). */
-export const REPORT_SPEC_VERSION = 'v1.3.0';
+let cachedDevGuardVersion: string | null = null;
 
-/** Formats canonical human-readable skipped reason text per DevGuard v1.3.0 spec. */
+/**
+ * Resolves DevGuard package version dynamically by walking upward up to 4 levels
+ * from `startDir` (or this module's directory) for a `package.json` named `devguard`.
+ */
+export function getDevGuardVersion(startDir?: string): string {
+  if (startDir === undefined && cachedDevGuardVersion !== null) {
+    return cachedDevGuardVersion;
+  }
+
+  let currentDir = path.resolve(startDir ?? path.dirname(fileURLToPath(import.meta.url)));
+  let resolvedVersion = 'unknown';
+
+  for (let depth = 0; depth <= 4; depth++) {
+    const pkgPath = path.join(currentDir, 'package.json');
+    if (fs.existsSync(pkgPath)) {
+      try {
+        const parsed = JSON.parse(fs.readFileSync(pkgPath, 'utf-8')) as {
+          name?: unknown;
+          version?: unknown;
+        };
+        if (parsed?.name === 'devguard' && typeof parsed.version === 'string' && parsed.version.trim().length > 0) {
+          resolvedVersion = parsed.version.trim();
+          break;
+        }
+      } catch {
+        // Malformed or unreadable package.json; continue walking up within bounded depth
+        resolvedVersion = 'unknown';
+      }
+    }
+    const parentDir = path.dirname(currentDir);
+    if (parentDir === currentDir) break;
+    currentDir = parentDir;
+  }
+
+  if (startDir === undefined) {
+    cachedDevGuardVersion = resolvedVersion;
+  }
+  return resolvedVersion;
+}
+
+/** Formats canonical human-readable skipped reason text for PR comments and SARIF notifications. */
 export function formatSkippedReasonText(reason: SkippedReason): string {
   switch (reason) {
     case 'unsupported_language':
@@ -99,6 +145,20 @@ export function formatSkippedReasonText(reason: SkippedReason): string {
     case 'internal_error':
       return 'Skipped: Internal error';
   }
+}
+
+/** Formats the single-line DevGuard headline with runtime version, score, and coverage counts. */
+export function formatPrHeadline(params: {
+  analyzedCount: number;
+  codeFilesCount: number;
+  partialCount: number;
+  skippedCount: number;
+  scoreDisplay: string;
+}): string {
+  const version = getDevGuardVersion();
+  const versionLabel = version === 'unknown' ? 'unknown' : `v${version}`;
+  const partialSegment = params.partialCount > 0 ? ` · ${params.partialCount} partial` : '';
+  return `DevGuard ${versionLabel} — Score: ${params.scoreDisplay}  (analyzed ${params.analyzedCount} of ${params.codeFilesCount} code files${partialSegment} · ${params.skippedCount} skipped)`;
 }
 
 export interface FileAuditSummary {
@@ -181,6 +241,18 @@ function resolvePrContext(): PrContext | null {
   return { token, repo, prNumber, apiBase, headers };
 }
 
+function formatTruncatedCoverageList<T>(
+  items: ReadonlyArray<T>,
+  limit: number,
+  renderItem: (item: T) => string
+): string[] {
+  const lines = items.slice(0, limit).map(renderItem);
+  if (items.length > limit) {
+    lines.push(`    - +${items.length - limit} more`);
+  }
+  return lines;
+}
+
 /** Builds the sticky PR comment Markdown body with score, coverage block, and detailed findings. */
 export function buildPullRequestCommentMarkdown(
   summaries: FileAuditSummary[],
@@ -189,6 +261,11 @@ export function buildPullRequestCommentMarkdown(
   coverage?: PrCoverageSummary
 ): string {
   const analyzedCount = coverage ? coverage.analyzedCount : summaries.length;
+  const partialFilesList =
+    coverage?.partialFiles !== undefined
+      ? [...coverage.partialFiles]
+      : summaries.filter((s) => hasPartialAnalysisExtension(s.filePath)).map((s) => s.filePath);
+  const partialCount = partialFilesList.length;
   const skippedFiles = coverage?.skippedFiles ?? [];
   const skippedCount = skippedFiles.length;
   const codeFilesCount = analyzedCount + skippedCount;
@@ -205,17 +282,29 @@ export function buildPullRequestCommentMarkdown(
           : null;
 
   const analyzedPassed = summaries.every((summary) => summary.passed);
-  const hasAnalysisErrors = skippedFiles.some(
-    (s) => s.reason === 'parse_error' || s.reason === 'internal_error'
-  );
+  const analysisFailureCount =
+    coverage?.analysisFailureCount ??
+    skippedFiles.filter((s) => s.reason === 'parse_error' || s.reason === 'internal_error').length;
+  const hasAnalysisErrors =
+    analysisFailureCount > 0 ||
+    skippedFiles.some((s) => s.reason === 'parse_error' || s.reason === 'internal_error');
   const unanalyzableFailed = Boolean(coverage?.failOnUnanalyzable && skippedCount > 0);
-  const allPassed = analyzedPassed && !hasAnalysisErrors && !unanalyzableFailed;
 
-  const badgeStatus = !allPassed
-    ? '🚫 REJECTED (SECURITY GATE FAILED)'
-    : analyzedCount === 0
-      ? '⚠️ NOT ANALYZED — no supported code files'
-      : '✅ PASSED (READY TO MERGE)';
+  let badgeStatus: string;
+  if (!analyzedPassed) {
+    badgeStatus = '🚫 REJECTED (SECURITY GATE FAILED)';
+  } else if (hasAnalysisErrors) {
+    badgeStatus = '🚫 REJECTED (ANALYSIS ERROR)';
+  } else if (unanalyzableFailed) {
+    badgeStatus = '🚫 REJECTED (UNANALYZED FILES)';
+  } else if (analyzedCount === 0) {
+    badgeStatus = '⚠️ NOT ANALYZED — no supported code files';
+  } else if (analyzedCount > 0 && partialCount === analyzedCount) {
+    badgeStatus = '⚠️ PARTIALLY ANALYZED — language-agnostic rules only';
+  } else {
+    badgeStatus = '✅ PASSED (READY TO MERGE)';
+  }
+
   const engineLabel = mode === 'HYBRID'
     ? 'Hybrid Dual-Layer (Single-Pass Lexical & Heuristic Engine + Gemini 3.8 Flash)'
     : '100% Offline Single-Pass Lexical & Heuristic Engine';
@@ -227,22 +316,33 @@ export function buildPullRequestCommentMarkdown(
     headerStatuses.length > 0 ? headerStatuses.join(' / ') : formatLayer2StatusLabel(undefined, mode);
 
   const scoreDisplay = overallScore === null ? 'N/A' : `${overallScore}/100`;
-  const scoreHeadline = `DevGuard ${REPORT_SPEC_VERSION} — Score: ${scoreDisplay}  (analyzed ${analyzedCount} of ${codeFilesCount} code files · ${skippedCount} skipped)`;
+  const scoreHeadline = formatPrHeadline({
+    analyzedCount,
+    codeFilesCount,
+    partialCount,
+    skippedCount,
+    scoreDisplay,
+  });
 
-  const maxDisplay = Math.max(1, coverage?.maxSkippedDisplay ?? MAX_PR_SKIPPED_FILES_DISPLAY);
-  const skippedLines = skippedFiles
-    .slice(0, maxDisplay)
-    .map(
-      (item) =>
-        `    - ${sanitizeMarkdownText(normalizePosixRepoPath(item.filePath).replace(/[\r\n]+/g, ' '))} — ${formatSkippedReasonText(item.reason)}`
-    );
-  if (skippedFiles.length > maxDisplay) {
-    skippedLines.push(`    - +${skippedFiles.length - maxDisplay} more`);
-  }
+  const maxPartialDisplay = Math.max(1, coverage?.maxPartialDisplay ?? MAX_PR_PARTIAL_FILES_DISPLAY);
+  const maxSkippedDisplay = Math.max(1, coverage?.maxSkippedDisplay ?? MAX_PR_SKIPPED_FILES_DISPLAY);
+  const partialLines = formatTruncatedCoverageList(
+    partialFilesList,
+    maxPartialDisplay,
+    (filePath) =>
+      `    - ${sanitizeMarkdownText(normalizePosixRepoPath(filePath).replace(/[\r\n]+/g, ' '))} — ${PARTIAL_COVERAGE_REASON_TEXT}`
+  );
+  const skippedLines = formatTruncatedCoverageList(
+    skippedFiles,
+    maxSkippedDisplay,
+    (item) =>
+      `    - ${sanitizeMarkdownText(normalizePosixRepoPath(item.filePath).replace(/[\r\n]+/g, ' '))} — ${formatSkippedReasonText(item.reason)}`
+  );
 
   const coverageLines: string[] = [
     'Coverage',
     `- Analyzed: ${analyzedCount}`,
+    ...partialLines,
     `- Skipped: ${skippedCount}`,
     ...skippedLines,
     `- Ignored (non-code): ${ignoredNonCodeCount}`,

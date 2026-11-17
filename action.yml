@@ -16,13 +16,13 @@ inputs:
     required: false
     default: 'modified'
   fail_on_unanalyzable:
-    description: 'Fail the CI gate if any in-scope code file is skipped (unsupported language, > 1 MiB, parse error, or internal error)'
+    description: 'Fail the CI gate if any in-scope code file is skipped (strict "true" or "false", default "false"; invalid values exit 1). Analysis failures (parse_error/internal_error) always fail closed regardless of this setting.'
     required: false
     default: 'false'
 
 outputs:
   overall_score:
-    description: 'The average Overall Guard score calculated across analyzed files, or N/A when 0 files were analyzed'
+    description: 'The average Overall Guard score (0-100) across analyzed files, or string "N/A" when 0 files were analyzed (numeric downstream consumers must handle "N/A")'
     value: ${{ steps.audit_gate.outputs.overall_score }}
   audit_status:
     description: 'PASS or FAIL status for branch merge eligibility'

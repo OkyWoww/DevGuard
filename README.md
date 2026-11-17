@@ -25,7 +25,7 @@ Modern AI coding assistants accelerate delivery, but frequently introduce subtle
 
 ## 📋 Deterministic Gatekeeper Rules (`DG001`–`DG008`)
 
-Layer 1 runs **100% offline with zero third-party runtime dependencies** (`package.json` `"dependencies": {}`). Operating as a **Single-Pass Lexical & Heuristic Engine** (`analyzeLexicalStructure` + rule heuristics), it is deterministic and immune to LLM prompt-injection comments inside source code, with documented lexical evasion boundaries listed in the [Benchmark Corpus section](#benchmark-corpus--known-limitations-jsts--npm-scope).
+Layer 1 runs **100% offline with zero third-party runtime dependencies** (`package.json` `"dependencies": {}`). Operating as a **Single-Pass Lexical & Heuristic Engine** (`analyzeLexicalStructure` + rule heuristics), it is deterministic and immune to LLM prompt-injection comments inside source code, with documented lexical evasion boundaries listed in the [Benchmark Corpus section](#benchmark-corpus-known-limitations--behavior-changes).
 
 | Rule ID | Category | Detection Target | SARIF Severity Rating | Default Severity | Inline Auto-Fix Suggestion |
 | :--- | :--- | :--- | :---: | :---: | :---: |
@@ -50,10 +50,22 @@ Layer 1 runs **100% offline with zero third-party runtime dependencies** (`packa
    * `totalScore < minScore` (default `minScore = 85`, configurable via `DEVGUARD_MIN_SCORE` or Action input `min_score`)
    * `!isHardened && security < 70`
    * `inlineFindings` contains any item with `severity === 'error'`
-5. **Coverage Classification & `N/A` Score Semantics:**
-   * Every in-scope file is classified once into `Analyzed` (supported JS/TS extensions `.ts`, `.tsx`, `.js`, `.jsx`, `.mjs`, `.cjs`, `.mts`, `.cts` within the `1_048_576`-byte limit), `Skipped` (recognized non-JS/TS code languages, `.vue`/`.svelte`/`.astro`/`.ipynb`, extensionless files with `#!` shebang, `> 1 MiB` files, parse errors, or per-file internal errors), or `Ignored` (non-code files such as docs, configs, lockfiles, `.html`/`.htm`, or deleted diff entries).
-   * When `analyzed === 0` (for example, a PR modifying only `.py` or `.md` files), `overall_score` is reported as **`N/A`** (never `100/100`), the `min_score` comparison is skipped, and the gate passes by default unless `fail_on_unanalyzable: 'true'` and `skipped > 0`.
-   * Full skipped-file notifications (`level: "note"`) are recorded in `runs[0].invocations[0].toolExecutionNotifications[]` inside `devguard-results.sarif` without altering `results[]`.
+5. **Coverage Classification, Partial `.py`, & `N/A` Score Semantics:**
+   * Every in-scope file (after pre-existing path exclusions) is classified once into:
+     * **Analyzed (`full`):** Supported JS/TS extensions (`.ts`, `.tsx`, `.js`, `.jsx`, `.mjs`, `.cjs`, `.mts`, `.cts`) within the `1_048_576`-byte (`1 MiB`) limit.
+     * **Analyzed (`partial`):** `.py` files within the `1_048_576`-byte limit are analyzed with language-agnostic rules only (`DG007` secrets, generic `eval`/`exec`/`os.system` `DG001` sinks, and domain heuristics; `DG004`–`DG008` JS/TS detectors are skipped) and explicitly labeled `Partial: language-agnostic rules only`.
+     * **Skipped:** Recognized non-analyzed code languages (`.pyw`, `.go`, `.java`, `.rb`, `.php`, `.rs`, `.vue`, `.svelte`, `.astro`, `.ipynb`, extensionless `#!` scripts), files exceeding `1_048_576` bytes (`file_too_large`, checked via `stat`), `parse_error`, or `internal_error`.
+     * **Ignored:** Non-code files (`.md`, `.json`, `.yml`, lockfiles, `.html`/`.htm`) or `deleted` entries returned by `git diff` in `modified` mode (missing explicit CLI file paths always fail immediately with `exit 1`).
+   * **Fail-Closed Analysis Errors:** If an individual file raises a `parse_error` or `internal_error` during classification/audit (or triggers a runtime coverage invariant mismatch), remaining analyzed files still run for visibility, **but the overall gate fails closed** (`audit_status=FAIL`, `exit 1`, and SARIF `runs[0].invocations[0].executionSuccessful=false` with `level: "error"` notifications), even when `fail_on_unanalyzable` is `'false'`.
+   * **`N/A` Score for Zero Analyzed Files & Numeric Consumers:** When `analyzed === 0` (for example, a PR modifying only `.go` or `.md` files), `overall_score` in `GITHUB_OUTPUT` and the sticky PR comment is reported as the literal string **`N/A`** (never `100/100`), the `min_score` comparison is skipped, and the gate passes (`exit 0`) unless `fail_on_unanalyzable` is `'true'` with `skipped > 0` or an analysis error occurred. **Downstream workflow consumers parsing `steps.<id>.outputs.overall_score` numerically must handle the string `N/A` explicitly.**
+   * **PR Status Badges (Evaluated in Strict Priority Order):**
+     1. `🚫 REJECTED (SECURITY GATE FAILED)` — an analyzed file failed `min_score`, security floor, or error-level findings.
+     2. `🚫 REJECTED (ANALYSIS ERROR)` — `parse_error`, `internal_error`, or coverage invariant mismatch occurred.
+     3. `🚫 REJECTED (UNANALYZED FILES)` — `fail_on_unanalyzable: 'true'` and `skipped > 0`.
+     4. `⚠️ NOT ANALYZED — no supported code files` — `analyzed === 0` (exit `0` when no analysis/strict errors).
+     5. `⚠️ PARTIALLY ANALYZED — language-agnostic rules only` — `analyzed > 0` and every analyzed file is `partial` (`.py` only; exit `0` when passing thresholds).
+     6. `✅ PASSED (READY TO MERGE)` — full JS/TS coverage (or mixed JS/TS + `.py`) passed all checks.
+   * **Strict `fail_on_unanalyzable` Parsing & SARIF:** `DEVGUARD_FAIL_ON_UNANALYZABLE` accepts strictly `'true'`, `'false'`, or empty/unset (trimmed, case-insensitive, without `INPUT_*` fallback); invalid values (such as `'yes'`, `'1'`, `'ture'`) fail immediately with `exit 1`. Full partial (`level: "note"`), skipped (`level: "note"`), and error (`level: "error"`) notifications are written to `runs[0].invocations[0].toolExecutionNotifications[]` in `devguard-results.sarif` without altering `results[]`.
 
 ### Exact Escalation Criteria for `DG005` & `DG008`
 * **`DG005` (`warning` → `error`):**
@@ -187,8 +199,8 @@ jobs:
 | **Input** | `gemini_api_key` | `""` | Optional Google Gemini API key for Layer 2 reasoning (falls back cleanly to Offline Single-Pass Lexical & Heuristic mode if omitted, forked, or rate-limited). |
 | **Input** | `min_score` | `'85'` | Minimum Overall Guard score (`0`–`100`) required to pass CI (`DEVGUARD_MIN_SCORE`). |
 | **Input** | `target_files` | `'modified'` | Audit scope: `'modified'` (git diff), `'all'` (workspace scan), or a specific file path (`DEVGUARD_TARGET`). |
-| **Input** | `fail_on_unanalyzable` | `'false'` | Set to `'true'` to fail the CI gate (`exit 1`) when any in-scope code file is skipped (`DEVGUARD_FAIL_ON_UNANALYZABLE`). |
-| **Output** | `overall_score` | `96` / `N/A` | Aggregate Overall Guard score across analyzed files (`0`–`100`), or `N/A` when `0` files were analyzed. |
+| **Input** | `fail_on_unanalyzable` | `'false'` | Strict `'true'` or `'false'` (`DEVGUARD_FAIL_ON_UNANALYZABLE`); when `'true'`, fail (`exit 1`) if any in-scope code file is skipped (`unsupported_language` / `file_too_large`). Invalid values exit `1`. |
+| **Output** | `overall_score` | `96` / `N/A` | Aggregate Overall Guard score across analyzed files (`0`–`100`), or string `N/A` when `0` files were analyzed (numeric consumers must guard against `N/A`). |
 | **Output** | `audit_status` | `PASS` / `FAIL` | Final gate verdict written to `GITHUB_OUTPUT`. |
 | **Output** | `sarif_file` | `devguard-results.sarif` | Path to generated OASIS SARIF v2.1.0 report (`%SRCROOT%` POSIX URIs & GitHub Code Scanning `security-severity` rating (`5.0`–`9.5`)). |
 
@@ -209,9 +221,21 @@ jobs:
 
 ---
 
-## 📊 Benchmark Corpus & Known Limitations (JS/TS & NPM Scope)
+## 📊 Benchmark Corpus, Known Limitations, & Behavior Changes
 
-DevGuard tracks detector precision, recall, and known evasion gaps transparently in [tests/corpus/cases.ts](tests/corpus/cases.ts) (`npm run corpus:report`). Because Layer 1 operates as a single-pass lexical and heuristic engine without full inter-procedural data-flow analysis, complex obfuscation or multi-hop aliasing remains out-of-scope for Layer 1 (`knownMiss` below). Current deterministic rules `DG004`–`DG008` target JS/TS & NPM ecosystems.
+DevGuard tracks detector precision, recall, and known evasion gaps transparently in [tests/corpus/cases.ts](tests/corpus/cases.ts) (`npm run corpus:report`). Because Layer 1 operates as a single-pass lexical and heuristic engine without full inter-procedural data-flow analysis, complex obfuscation or multi-hop aliasing remains out-of-scope for Layer 1 (`knownMiss` below). Current deterministic rules `DG004`–`DG008` target JS/TS & NPM ecosystems; `.py` files receive language-agnostic `partial` coverage only.
+
+### Known Limitations (Path Exclusions & CLI Scope)
+* **Pre-classification Path Exclusions:** Dot-prefixed paths (`.github/`, `.husky/`), `node_modules`, `dist`, `build`, `coverage`, `remotion`, `out`, `tests`, all files inside `scripts/`, self-reference files (`devguardAnalyzer.ts`, `devguard_verify.py`), `*.d.ts`, `*.test.*`, and `*.spec.*` are excluded before coverage classification and do not appear in PR Coverage counts.
+* **Explicit CLI Arguments:** Explicit file arguments passed on the CLI now follow the coverage classifier (`.py` is analyzed with `partial` coverage; unsupported extensions like `.go` are marked `skipped`). Missing explicit CLI paths exit `1` before classification rather than counting as `ignored/deleted`.
+* **`target_files` Values Outside `all`/`modified`:** `action.yml` forwards custom `target_files` values as explicit CLI arguments; calling the CLI with `DEVGUARD_TARGET` set to a value other than `'all'` passes through to `'modified'` diff mode when no positional CLI args are provided.
+
+### Behavior Changes from `v1.2.1`
+* `.mjs`, `.cjs`, `.mts`, and `.cts` are now discovered automatically in workspace and PR diff scans (previously skipped by the legacy auto-discovery regex).
+* Pull Requests with `0` analyzed files now output `overall_score=N/A` (previously `100`) and post a sticky PR comment (`⚠️ NOT ANALYZED — no supported code files`) instead of omitting the comment; numeric consumers of `overall_score` must handle `N/A`.
+* Per-file analysis exceptions (`parse_error`, `internal_error`) and coverage invariant mismatches now fail closed (`exit 1`, `executionSuccessful: false`) after continuing visibility across remaining files.
+* Files exceeding `1_048_576` bytes (`> 1 MiB`) are now reported explicitly in PR Coverage and SARIF as `Skipped: File too large (> 1 MiB)`.
+* `.py` files remain audited identically to `v1.2.1` rules and are now explicitly labeled as `partial` coverage (`⚠️ PARTIALLY ANALYZED — language-agnostic rules only` when a PR modifies `.py` files only).
 
 ### Automated Corpus Report (`npm run corpus:report`)
 
