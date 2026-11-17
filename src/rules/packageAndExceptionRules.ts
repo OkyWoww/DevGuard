@@ -477,6 +477,24 @@ function findLiteralsInSpan(
   return matches;
 }
 
+function getEnclosingOpenDelimiter(maskedCode: string, idx: number): string {
+  let parenDepth = 0;
+  let braceDepth = 0;
+  for (let i = idx - 1; i >= 0; i--) {
+    const ch = maskedCode[i];
+    if (ch === ')') parenDepth++;
+    else if (ch === '(') {
+      if (parenDepth === 0) return '(';
+      parenDepth--;
+    } else if (ch === '}') braceDepth++;
+    else if (ch === '{') {
+      if (braceDepth === 0) return '{';
+      braceDepth--;
+    }
+  }
+  return '';
+}
+
 function hasShadowedRequireInCode(maskedCode: string): boolean {
   let pos = 0;
   while (pos < maskedCode.length) {
@@ -494,23 +512,26 @@ function hasShadowedRequireInCode(maskedCode: string): boolean {
 
     const afterIdx = skipWsForward(maskedCode, idx + 7);
     const nextCh = maskedCode[afterIdx];
+    if (
+      nextCh === ':' &&
+      prev.prevWord !== 'case' &&
+      prev.prevWord !== 'const' &&
+      prev.prevWord !== 'let' &&
+      prev.prevWord !== 'var' &&
+      getEnclosingOpenDelimiter(maskedCode, idx) === '{'
+    ) {
+      continue; // Object literal / TypeScript interface property key `{ require: ... }`
+    }
     if (nextCh === '.' || (nextCh === '?' && maskedCode[afterIdx + 1] === '.')) {
       continue; // require.resolve, require.cache, require.main, etc.
     }
     if (nextCh === '(') {
       const span = findCallParenSpan(maskedCode, afterIdx);
-      if (
-        span &&
-        !isMethodOrFunctionDef(
-          maskedCode,
-          idx,
-          span.closeParenIdx,
-          prev.prevWord,
-          prev.prevNonWsChar,
-          prev.prevNonWsIdx
-        )
-      ) {
-        continue; // valid call require(...)
+      const isFunctionDecl =
+        prev.prevWord === 'function' ||
+        (prev.prevNonWsChar === '*' && readPrevTokenInfo(maskedCode, prev.prevNonWsIdx - 1).prevWord === 'function');
+      if (span && !isFunctionDecl) {
+        continue; // valid call require(...) or non-shadowing class/object method definition
       }
     }
     return true;

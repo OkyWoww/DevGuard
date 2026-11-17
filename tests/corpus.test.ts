@@ -6,7 +6,16 @@ import { CORPUS_CASES, type CorpusCase } from './corpus/cases.js';
 
 type RuleId = CorpusCase['rule'];
 
-const RULES: readonly RuleId[] = ['DG001', 'DG004', 'DG005', 'DG006', 'DG007', 'DG008'];
+const RULES: readonly RuleId[] = [
+  'DG001',
+  'DG004',
+  'DG004-DYN-01',
+  'DG004-DYN-02',
+  'DG005',
+  'DG006',
+  'DG007',
+  'DG008',
+];
 
 function isRuleFlagged(c: CorpusCase): boolean {
   const report = analyzeCodeDeterministically(c.code, {

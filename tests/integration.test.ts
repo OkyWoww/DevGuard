@@ -57,6 +57,8 @@ import {
   type PrCoverageSummary,
   type SkippedFileReportItem,
 } from '../src/githubCommenter.js';
+import { MAX_GLOB_PATTERN_LENGTH, matchLinearGlob } from '../src/devguardAnalyzer.js';
+import { MAX_DYN_FINDINGS_PER_FILE } from '../src/githubCommenter.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -4459,6 +4461,393 @@ test('56. Early exit paths write overall_score=N/A & audit_status=FAIL to GITHUB
     assert.equal(sarif.runs[0].invocations[0].toolExecutionNotifications[0].level, 'error');
     assert.equal(sarif.runs[0].invocations[0].toolExecutionNotifications[0].message.text, 'Skipped: Internal error');
     assert.equal(sarif.runs[0].invocations[0].toolExecutionNotifications[0].locations, undefined);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('57. DG004-DYN-01 and DG004-DYN-02 detect all non-literal variants and ignore safe literals, member calls, method definitions, and comments', () => {
+  const mixedCode = [
+    '// Comment: import(commentedOut) and require(ignoredVar)',
+    'const textSample = "import(inString) require(inString)";',
+    'const reSample = /import\\(inRegex\\)|require\\(inRegex\\)/;',
+    'export class DynamicHost {',
+    '  import(source: string): string {',
+    '    return source;',
+    '  }',
+    '  require(name: string) {',
+    '    return name;',
+    '  }',
+    '  async customMethod(loader: { import: (v: string) => Promise<unknown>; require: (v: string) => unknown }, target: string) {',
+    "    await import('./literalChunk.js');",
+    '    await import(`lodash`);',
+    "    await import('./manifest.json', { with: { type: 'json' } });",
+    "    const fsMod = require('node:fs');",
+    '    const pathMod = require(`path`);',
+    '    const metaUrl = import.meta.url;',
+    '    const resolved = require.resolve(target);',
+    '    const modReq = module.require(target);',
+    '    const optReq = loader?.require(target);',
+    '    const hostImp = loader.import(target);',
+    '    const emptyA = (import as unknown as () => unknown)();',
+    '    return { fsMod, pathMod, metaUrl, resolved, modReq, optReq, hostImp, emptyA };',
+    '  }',
+    '}',
+    'export async function loadDynamicSpecifiers(modName: string, lang: string, cfg: { entry: string }, resolveName: () => string) {',
+    '  const a = await import(modName);',
+    '  const b = await import(`./locales/${lang}.js`);',
+    '  const c = await import(resolveName());',
+    '  const d = await import(cfg.entry);',
+    '  const e = require(modName);',
+    "  const f = require('./locales/' + lang);",
+    '  const g = require(`@org/${lang}`);',
+    '  const h = require(resolveName());',
+    '  const i = require(cfg.entry);',
+    '  return { a, b, c, d, e, f, g, h, i };',
+    '}',
+  ].join('\n');
+
+  const report = analyzeCodeDeterministically(mixedCode, {
+    filePath: 'src/plugins/dynamicHost.ts',
+    declaredDependencies: ['lodash'],
+  });
+  const inline = report.inlineFindings || [];
+  const dyn1 = inline.filter((f) => f.ruleId === 'DG004-DYN-01');
+  const dyn2 = inline.filter((f) => f.ruleId === 'DG004-DYN-02');
+
+  assert.deepEqual(
+    dyn1.map((f) => f.line),
+    [27, 28, 29, 30],
+    `Expected DG004-DYN-01 only on non-literal import() lines, got lines ${dyn1.map((f) => f.line).join(', ')}`
+  );
+  assert.deepEqual(
+    dyn2.map((f) => f.line),
+    [31, 32, 33, 34, 35],
+    `Expected DG004-DYN-02 only on non-literal require() lines, got lines ${dyn2.map((f) => f.line).join(', ')}`
+  );
+  for (const f of [...dyn1, ...dyn2]) {
+    assert.equal(f.severity, 'warning');
+    assert.equal(f.scoring, false);
+    assert.equal(f.suggestion, undefined);
+  }
+  assert.equal(report.dynScopeUncertain, undefined, 'Class/object method require() must not falsely mark scope uncertain');
+});
+
+test('58. Shadow guard skips DG004-DYN-02 and increments dynScopeUncertain on shadowed require while still scanning DG004-DYN-01', () => {
+  const shadowedVariants = [
+    [
+      "import { createRequire } from 'node:module';",
+      'const require = createRequire(import.meta.url);',
+      'export async function loadBoth(dynMod: string) {',
+      '  const a = require(dynMod);',
+      '  const b = await import(dynMod);',
+      '  return { a, b };',
+      '}',
+    ].join('\n'),
+    [
+      'function require(id: string) { return id; }',
+      'export function run(dynMod: string) {',
+      '  return require(dynMod);',
+      '}',
+    ].join('\n'),
+    [
+      'export const loadWithParam = (require: (x: string) => unknown, dynMod: string) => require(dynMod);',
+    ].join('\n'),
+    [
+      "import { helperObj } from './helper.js';",
+      'const { require } = helperObj as { require: (x: string) => unknown };',
+      'export function runDestructured(dynMod: string) {',
+      '  return require(dynMod);',
+      '}',
+    ].join('\n'),
+  ];
+
+  shadowedVariants.forEach((code, idx) => {
+    const report = analyzeCodeDeterministically(code, { filePath: `src/shadow_${idx}.ts` });
+    const inline = report.inlineFindings || [];
+    assert.equal(
+      inline.filter((f) => f.ruleId === 'DG004-DYN-02').length,
+      0,
+      `Variant ${idx}: shadowed require must skip DG004-DYN-02`
+    );
+    assert.equal(
+      report.dynScopeUncertain,
+      1,
+      `Variant ${idx}: shadowed require must record dynScopeUncertain = 1`
+    );
+    if (idx === 0) {
+      assert.equal(
+        inline.filter((f) => f.ruleId === 'DG004-DYN-01').length,
+        1,
+        'Variant 0: shadowed require must still allow DG004-DYN-01 import(dynMod) detection'
+      );
+    }
+  });
+
+  const nonShadowedSafe = [
+    'export function checkRuntimeRequire(target: string) {',
+    "  if (typeof require !== 'undefined') {",
+    '    return require.resolve(target);',
+    '  }',
+    '  return target;',
+    '}',
+  ].join('\n');
+  const safeReport = analyzeCodeDeterministically(nonShadowedSafe, { filePath: 'src/safeRequireResolve.ts' });
+  assert.equal(safeReport.dynScopeUncertain, undefined, 'typeof require + require.resolve must not mark dynScopeUncertain');
+  assert.equal((safeReport.inlineFindings || []).length, 0);
+});
+
+test('59. Non-scoring guarantee: 0, 1, 5, and 25 DG004-DYN findings yield identical scores, isHardened, and exit code 0 under high min_score', async () => {
+  const buildFile = (dynCount: number): string => {
+    const calls = Array.from({ length: dynCount }, (_, idx) =>
+      idx % 2 === 0
+        ? `  results.push(await import(targets[${idx}]));`
+        : `  results.push(require(targets[${idx}]));`
+    );
+    return [
+      'export async function loadAll(targets: string[]) {',
+      '  const results: unknown[] = [];',
+      ...calls,
+      '  return results;',
+      '}',
+    ].join('\n');
+  };
+
+  const baseReport = analyzeCodeDeterministically(buildFile(0), { filePath: 'src/zero.ts' });
+  for (const count of [1, 5, 25]) {
+    const rpt = analyzeCodeDeterministically(buildFile(count), { filePath: `src/count_${count}.ts` });
+    assert.deepEqual(rpt.skor, baseReport.skor, `Scores with ${count} DYN findings must equal 0-DYN baseline`);
+    assert.equal(rpt.isHardened, baseReport.isHardened, `isHardened with ${count} DYN findings must remain unchanged`);
+    assert.equal((rpt.inlineFindings || []).length, count, `Expected ${count} DYN inlineFindings`);
+  }
+
+  const verdict = computeOverallGateVerdict(1, baseReport.skor.totalScore, 0, false, false, 0);
+  assert.equal(verdict.auditStatus, 'PASS');
+  assert.equal(verdict.gateFailed, false);
+
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-dyn-nonscore-'));
+  try {
+    fs.mkdirSync(path.join(tempDir, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'src', 'plugins.ts'), buildFile(5), 'utf-8');
+    const loaderPath = path.join(REPO_ROOT, 'src', 'loader.mjs');
+    const run = spawnSync(
+      process.execPath,
+      ['--experimental-strip-types', loaderPath, 'src/plugins.ts'],
+      {
+        cwd: tempDir,
+        encoding: 'utf-8',
+        env: {
+          ...process.env,
+          GEMINI_API_KEY: '',
+          GITHUB_TOKEN: '',
+          DEVGUARD_MIN_SCORE: String(baseReport.skor.totalScore),
+          DEVGUARD_SARIF_OUTPUT: path.join(tempDir, 'dyn.sarif'),
+        },
+      }
+    );
+    assert.equal(run.status, 0, `CLI must exit 0 with only non-scoring DYN warnings:\n${run.stdout}\n${run.stderr}`);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('60. DYN suppression policy rejects inline devguard-ignore, honors base-branch .devguard.json globs, and matchLinearGlob runs in linear time against ReDoS', () => {
+  const inlineAttemptCode = [
+    'export async function badInlineDyn1(x: string) {',
+    '  // devguard-ignore DG004-DYN-01: pretending dynamic import is vetted',
+    '  return import(x);',
+    '}',
+    'export function badInlineDyn2(y: string) {',
+    '  // devguard-ignore DG004: pretending parent DG004 inline suppresses DYN',
+    '  return require(y);',
+    '}',
+  ].join('\n');
+
+  const inlineReport = analyzeCodeDeterministically(inlineAttemptCode, { filePath: 'src/i18n/inlineBypass.ts' });
+  const inline = inlineReport.inlineFindings || [];
+  assert.equal(inline.length, 2);
+  assert.equal(inlineReport.suppressions, undefined, 'Inline suppressions for DG004-DYN-* and DG004 must never activate');
+  assert.match(inline[0].message, /cannot be suppressed inline/i);
+  assert.match(inline[1].message, /cannot be suppressed inline/i);
+
+  const baseAllowlistJson = JSON.stringify({
+    ignoreRulesByPath: {
+      'src/i18n/**': [{ rule: 'DG004-DYN-01', reason: 'Locale bundles loaded lazily by validated runtime map' }],
+      'packages/*/plugins/*.ts': [{ rule: 'DG004-DYN-02', reason: 'Legacy plugin host requires verified local manifest paths' }],
+      '**/*.locale.js': [{ rule: 'DG004', reason: 'Parent DG004 rule safely allows vetted locale loaders' }],
+      ['a'.repeat(MAX_GLOB_PATTERN_LENGTH + 1)]: [{ rule: 'DG004-DYN-01', reason: 'Overlength pattern must be rejected safely' }],
+    },
+  });
+
+  const loaded = loadVerifiedAllowlist({
+    baseRef: 'main',
+    eventName: 'pull_request',
+    isCi: true,
+    readBaseFile: () => baseAllowlistJson,
+    readWorkingFile: () => baseAllowlistJson,
+  });
+
+  assert.equal(loaded.invalidAllowlistEntries.length, 1, 'Overlength glob pattern (>512) must be rejected');
+
+  const i18nMatches = matchAllowlistForFile(loaded, 'src/i18n/nested/id.ts');
+  assert.equal(i18nMatches.length, 1);
+  const suppressedDyn1 = analyzeCodeDeterministically('export const load = (p: string) => import(p);', {
+    filePath: 'src/i18n/nested/id.ts',
+    externalAllowlist: i18nMatches,
+  });
+  assert.equal((suppressedDyn1.inlineFindings || []).length, 0);
+  assert.equal(suppressedDyn1.suppressions?.[0]?.ruleId, 'DG004-DYN-01');
+  assert.equal(suppressedDyn1.suppressions?.[0]?.kind, 'external');
+
+  const pkgMatches = matchAllowlistForFile(loaded, 'packages/core/plugins/auth.ts');
+  assert.equal(pkgMatches.length, 1);
+  const suppressedDyn2 = analyzeCodeDeterministically('export const load = (p: string) => require(p);', {
+    filePath: 'packages/core/plugins/auth.ts',
+    externalAllowlist: pkgMatches,
+  });
+  assert.equal((suppressedDyn2.inlineFindings || []).length, 0);
+  assert.equal(suppressedDyn2.suppressions?.[0]?.ruleId, 'DG004-DYN-02');
+
+  const parentMatches = matchAllowlistForFile(loaded, 'apps/web/locales/en.locale.js');
+  assert.equal(parentMatches.length, 1);
+  const suppressedViaParent = analyzeCodeDeterministically('export const load = (p: string) => import(p);', {
+    filePath: 'apps/web/locales/en.locale.js',
+    externalAllowlist: parentMatches,
+  });
+  assert.equal((suppressedViaParent.inlineFindings || []).length, 0);
+  assert.equal(suppressedViaParent.suppressions?.[0]?.ruleId, 'DG004-DYN-01');
+
+  assert.equal(matchLinearGlob('**/plugins/*.ts', 'plugins/root.ts'), true);
+  assert.equal(matchLinearGlob('**/plugins/*.ts', 'a/b/plugins/nested.ts'), true);
+  assert.equal(matchLinearGlob('packages/*/src/**/*.js', 'packages/ui/src/a/b.js'), true);
+  assert.equal(matchLinearGlob('packages/*/plugins/*.ts', 'packages/a/b/plugins/x.ts'), false);
+
+  const startMs = performance.now();
+  const redosMatch = matchLinearGlob('a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*b', 'a'.repeat(200));
+  const elapsedMs = performance.now() - startMs;
+  assert.equal(redosMatch, false);
+  assert.ok(elapsedMs < 20, `Expected linear-time ReDoS glob evaluation < 20ms, took ${elapsedMs.toFixed(2)}ms`);
+});
+
+test('61. PR comment caps DYN findings at MAX_DYN_FINDINGS_PER_FILE=20 with +N more, SARIF emits all unclipped with properties.scoring=false, and secrets never leak', async () => {
+  assert.equal(MAX_DYN_FINDINGS_PER_FILE, 20);
+  const fakeStripe = 'sk_live_' + 'Zx9Yz8Wv7Ut6Sr5Qp4On3Nm2Lk1';
+  const fakeGh = 'ghp_' + 'A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8';
+  const lines: string[] = [
+    'export async function secretBearingDynCalls(dynSuffix: string) {',
+    `  await import("${fakeGh}" + dynSuffix);`,
+    `  require("${fakeStripe}" + dynSuffix);`,
+  ];
+  for (let i = 0; i < 23; i++) {
+    lines.push(i % 2 === 0 ? `  await import(dynSuffix + "${i}");` : `  require(dynSuffix + "${i}");`);
+  }
+  lines.push('}');
+
+  const report = analyzeCodeDeterministically(lines.join('\n'), { filePath: 'src/manyDyn.ts' });
+  const dynFindings = (report.inlineFindings || []).filter(
+    (f) => f.ruleId === 'DG004-DYN-01' || f.ruleId === 'DG004-DYN-02'
+  );
+  assert.equal(dynFindings.length, 25);
+  for (const f of dynFindings) {
+    assert.ok(!f.message.includes(fakeStripe), 'Planted Stripe token must never leak in DG004-DYN message');
+    assert.ok(!f.message.includes(fakeGh), 'Planted GitHub token must never leak in DG004-DYN message');
+    assert.equal(f.scoring, false);
+  }
+
+  const summary: FileAuditSummary = {
+    filePath: 'src/manyDyn.ts',
+    security: report.skor.security,
+    correctness: report.skor.correctness,
+    maintainability: report.skor.maintainability,
+    overall: report.skor.totalScore,
+    passed: true,
+    fatalFlaws: [],
+    defenseInDepth: report.residualNotes || [],
+    inlineFindings: report.inlineFindings,
+    layer2Status: 'Skipped [Offline]',
+  };
+
+  const md = buildPullRequestCommentMarkdown([summary], 85, 'OFFLINE_AST', {
+    analyzedCount: 1,
+    skippedFiles: [],
+    ignoredNonCodeCount: 0,
+  });
+  assert.ok(md.includes('Warnings (non-scoring)'), 'PR comment must render separate Warnings (non-scoring) section');
+  assert.ok(md.includes('- ... +5 more'), 'PR comment must truncate DYN findings beyond 20 with - ... +5 more');
+  assert.equal((md.match(/\[DG004-DYN-0[12]\]/g) || []).length, 20, 'PR comment must cap rendered DYN lines per file at 20');
+  assert.ok(!md.includes(fakeStripe) && !md.includes(fakeGh), 'Secrets must not appear in PR comment');
+
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-dyn-sarif-'));
+  try {
+    const sarifPath = path.join(tempDir, 'dyn.sarif');
+    generateSarifReport([summary], sarifPath);
+    const sarifRaw = fs.readFileSync(sarifPath, 'utf-8');
+    assert.ok(!sarifRaw.includes(fakeStripe) && !sarifRaw.includes(fakeGh), 'Secrets must not appear anywhere in SARIF JSON');
+
+    const sarif = JSON.parse(sarifRaw) as {
+      runs: Array<{
+        tool: { driver: { rules: Array<{ id: string }> } };
+        results: Array<{ ruleId: string; level: string; properties?: { scoring?: boolean } }>;
+      }>;
+    };
+    const ruleIds = new Set(sarif.runs[0].tool.driver.rules.map((r) => r.id));
+    assert.ok(ruleIds.has('DG004-DYN-01') && ruleIds.has('DG004-DYN-02'), 'SARIF driver.rules must register DG004-DYN-01 and DG004-DYN-02');
+
+    const dynResults = sarif.runs[0].results.filter(
+      (r) => r.ruleId === 'DG004-DYN-01' || r.ruleId === 'DG004-DYN-02'
+    );
+    assert.equal(dynResults.length, 25, 'SARIF results[] must keep every DYN finding without 20-item truncation');
+    for (const r of dynResults) {
+      assert.equal(r.level, 'warning');
+      assert.equal(r.properties?.scoring, false);
+    }
+
+    let postedInlineReviewCount = 0;
+    const server = http.createServer((req, res) => {
+      if (req.method === 'GET') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify([]));
+        return;
+      }
+      if (req.method === 'POST') {
+        let body = '';
+        req.on('data', (chunk) => { body += chunk; });
+        req.on('end', () => {
+          const parsed = JSON.parse(body) as { comments?: unknown[] };
+          postedInlineReviewCount += parsed.comments?.length ?? 0;
+          res.writeHead(201, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ id: 1 }));
+        });
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+    const addr = server.address();
+    if (!addr || typeof addr === 'string') throw new Error('Failed to bind test HTTP server');
+    const eventFile = path.join(tempDir, 'event.json');
+    fs.writeFileSync(eventFile, JSON.stringify({ pull_request: { number: 58 } }), 'utf-8');
+
+    const prevToken = process.env.GITHUB_TOKEN;
+    const prevRepo = process.env.GITHUB_REPOSITORY;
+    const prevEvent = process.env.GITHUB_EVENT_PATH;
+    const prevApi = process.env.GITHUB_API_URL;
+    try {
+      process.env.GITHUB_TOKEN = 'test-token';
+      process.env.GITHUB_REPOSITORY = 'owner/repo';
+      process.env.GITHUB_EVENT_PATH = eventFile;
+      process.env.GITHUB_API_URL = `http://127.0.0.1:${addr.port}`;
+      await postInlineReviewComments([summary]);
+      assert.ok(postedInlineReviewCount <= MAX_DYN_FINDINGS_PER_FILE, 'postInlineReviewComments must not flood Review API with >20 DYN comments');
+    } finally {
+      process.env.GITHUB_TOKEN = prevToken;
+      process.env.GITHUB_REPOSITORY = prevRepo;
+      process.env.GITHUB_EVENT_PATH = prevEvent;
+      process.env.GITHUB_API_URL = prevApi;
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }

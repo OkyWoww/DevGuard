@@ -90,6 +90,7 @@ export interface PrCoverageSummary {
 
 export const MAX_PR_SKIPPED_FILES_DISPLAY = 20;
 export const MAX_PR_PARTIAL_FILES_DISPLAY = 20;
+export const MAX_DYN_FINDINGS_PER_FILE = 20;
 export const PARTIAL_COVERAGE_REASON_TEXT = 'Partial: language-agnostic rules only';
 export const INVARIANT_MISMATCH_SENTINEL = '<invariant-mismatch>';
 
@@ -177,6 +178,7 @@ export interface FileAuditSummary {
   invalidAllowlistEntries?: string[];
   allowlistModifiedInPr?: boolean;
   layer2Status?: string;
+  dynScopeUncertain?: number;
 }
 
 export const COMMENT_SIGNATURE = '<!-- devguard-adversarial-audit-sticky-comment -->';
@@ -416,6 +418,29 @@ export function buildPullRequestCommentMarkdown(
     });
   }
 
+  const dynWarningGroups = summaries
+    .map((summary) => ({
+      filePath: normalizePosixRepoPath(summary.filePath).replace(/[\r\n]+/g, ' '),
+      warnings: (summary.inlineFindings || []).filter((f) => f.scoring === false),
+    }))
+    .filter((group) => group.warnings.length > 0);
+
+  let nonScoringWarningsSection = '';
+  if (dynWarningGroups.length > 0) {
+    const lines: string[] = ['', '### ⚠️ Warnings (non-scoring)'];
+    for (const group of dynWarningGroups) {
+      lines.push(`- \`${escapeTableCell(group.filePath)}\``);
+      const visible = group.warnings.slice(0, MAX_DYN_FINDINGS_PER_FILE);
+      for (const warning of visible) {
+        lines.push(`  - Line ${warning.line}: ${sanitizeMarkdownText(warning.message)}`);
+      }
+      if (group.warnings.length > MAX_DYN_FINDINGS_PER_FILE) {
+        lines.push(`  - ... +${group.warnings.length - MAX_DYN_FINDINGS_PER_FILE} more`);
+      }
+    }
+    nonScoringWarningsSection = `${lines.join('\n')}\n`;
+  }
+
   return `${COMMENT_SIGNATURE}
 ## 🛡️ DevGuard Adversarial Security Gatekeeper
 
@@ -431,7 +456,7 @@ ${coverageBlock}
 | Berkas | Skor Akhir | Security | Correctness | Maintainability | Layer 2 |
 | :--- | :---: | :---: | :---: | :---: | :--- |
 ${tableRows || '| Tidak ada berkas yang diaudit | — | — | — | — | — |'}
-${suppressionSection}${detailsSection}
+${suppressionSection}${nonScoringWarningsSection}${detailsSection}
 
 ---
 *Diinspeksi secara otomatis oleh [DevGuard Zero-Leniency Auditor](https://github.com/marketplace/actions/devguard-adversarial-code-auditor).*`;
@@ -520,8 +545,14 @@ export async function postInlineReviewComments(summaries: FileAuditSummary[]): P
   for (const summary of summaries) {
     if (!summary.inlineFindings || summary.inlineFindings.length === 0) continue;
     const normalizedPath = normalizePosixRepoPath(summary.filePath);
+    let dynPostedForFile = 0;
 
     for (const finding of summary.inlineFindings) {
+      if (finding.scoring === false && !finding.suggestion) continue;
+      if (finding.ruleId === 'DG004-DYN-01' || finding.ruleId === 'DG004-DYN-02') {
+        if (dynPostedForFile >= MAX_DYN_FINDINGS_PER_FILE) continue;
+        dynPostedForFile++;
+      }
       const targetLine = Math.max(1, finding.line);
       const safeMessage = sanitizeMarkdownText(finding.message);
       let body = `🛡️ **[DevGuard ${finding.ruleId}]** (${finding.severity.toUpperCase()}): ${safeMessage}`;
@@ -567,7 +598,7 @@ export async function postInlineReviewComments(summaries: FileAuditSummary[]): P
       for (const item of existing) {
         const commentLine = item.line ?? item.original_line;
         if (!item.path || !commentLine || !item.body) continue;
-        const ruleMatch = item.body.match(/\[(?:DevGuard\s+)?(DG\d{3})\]/);
+        const ruleMatch = item.body.match(/\[(?:DevGuard\s+)?(DG\d{3}(?:-DYN-0[12])?)\]/);
         if (ruleMatch?.[1]) {
           existingKeys.add(`${item.path}:${commentLine}:${ruleMatch[1]}`);
         }

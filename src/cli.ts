@@ -29,6 +29,7 @@ export {
 };
 import {
   INVARIANT_MISMATCH_SENTINEL,
+  MAX_DYN_FINDINGS_PER_FILE,
   MAX_PR_PARTIAL_FILES_DISPLAY,
   MAX_PR_SKIPPED_FILES_DISPLAY,
   PARTIAL_COVERAGE_REASON_TEXT,
@@ -48,6 +49,7 @@ import { generateSarifReport } from './sarifGenerator.js';
 
 export {
   INVARIANT_MISMATCH_SENTINEL,
+  MAX_DYN_FINDINGS_PER_FILE,
   MAX_PR_PARTIAL_FILES_DISPLAY,
   MAX_PR_SKIPPED_FILES_DISPLAY,
   PARTIAL_COVERAGE_REASON_TEXT,
@@ -1062,6 +1064,7 @@ export async function auditClassifiedFiles(
         invalidAllowlistEntries:
           verifiedAllowlist.invalidAllowlistEntries.length > 0 ? verifiedAllowlist.invalidAllowlistEntries : undefined,
         allowlistModifiedInPr: verifiedAllowlist.allowlistModifiedInPr || undefined,
+        dynScopeUncertain: report.dynScopeUncertain,
       };
 
       console.log(`   - Security        : ${score.security}/100`);

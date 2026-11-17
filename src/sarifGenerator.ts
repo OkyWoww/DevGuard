@@ -44,7 +44,8 @@ function createSarifResult(
   text: string,
   uri: string,
   startLine: number,
-  endLine?: number
+  endLine?: number,
+  scoring?: boolean
 ): Record<string, unknown> {
   const safeStartLine = Math.max(1, startLine);
   const region: Record<string, number> = {
@@ -55,7 +56,7 @@ function createSarifResult(
     region.endLine = endLine;
   }
 
-  return {
+  const result: Record<string, unknown> = {
     ruleId,
     level,
     message: { text: redactSecretsPreservingLayout(text) },
@@ -71,6 +72,12 @@ function createSarifResult(
       },
     ],
   };
+
+  if (scoring === false) {
+    result.properties = { scoring: false };
+  }
+
+  return result;
 }
 
 export interface GenerateSarifOptions {
@@ -232,14 +239,63 @@ export function generateSarifReport(
     }
   });
 
+  const dynRuleDescriptors: Record<
+    'DG004-DYN-01' | 'DG004-DYN-02',
+    {
+      id: string;
+      name: string;
+      shortDescription: { text: string };
+      fullDescription: { text: string };
+      defaultConfiguration: { level: 'error' | 'warning' | 'note' };
+      properties: { tags: string[]; 'security-severity': string };
+    }
+  > = {
+    'DG004-DYN-01': {
+      id: 'DG004-DYN-01',
+      name: 'UnanalyzableDynamicImportSpecifier',
+      shortDescription: {
+        text: 'Non-scoring warning: dynamic import() specifier prevents static supply-chain verification.',
+      },
+      fullDescription: {
+        text: 'Non-scoring informational warning emitted when dynamic import() uses a non-literal specifier that cannot be statically checked against package.json or known typosquatting targets. Does not penalize repository scores.',
+      },
+      defaultConfiguration: { level: 'warning' },
+      properties: {
+        tags: ['security', 'supply-chain', 'non-scoring', 'external/cwe/cwe-829'],
+        'security-severity': '3.5',
+      },
+    },
+    'DG004-DYN-02': {
+      id: 'DG004-DYN-02',
+      name: 'UnanalyzableDynamicRequireSpecifier',
+      shortDescription: {
+        text: 'Non-scoring warning: dynamic require() specifier prevents static supply-chain verification.',
+      },
+      fullDescription: {
+        text: 'Non-scoring informational warning emitted when CommonJS require() uses a non-literal specifier that cannot be statically checked against package.json or known typosquatting targets. Does not penalize repository scores.',
+      },
+      defaultConfiguration: { level: 'warning' },
+      properties: {
+        tags: ['security', 'supply-chain', 'non-scoring', 'external/cwe/cwe-829'],
+        'security-severity': '3.5',
+      },
+    },
+  };
+
   const results: Array<Record<string, unknown>> = [];
 
   for (const summary of summaries) {
     const normalizedUri = normalizeSarifUri(summary.filePath);
 
-    // 1. Emit inlineFindings directly when present (DG001-DG008)
+    // 1. Emit inlineFindings directly when present (DG001-DG008, DG004-DYN-01/02)
     const inlineFindings = summary.inlineFindings || [];
     for (const finding of inlineFindings) {
+      if (
+        (finding.ruleId === 'DG004-DYN-01' || finding.ruleId === 'DG004-DYN-02') &&
+        !rulesMap.has(finding.ruleId)
+      ) {
+        rulesMap.set(finding.ruleId, dynRuleDescriptors[finding.ruleId]);
+      }
       results.push(
         createSarifResult(
           finding.ruleId,
@@ -247,7 +303,8 @@ export function generateSarifReport(
           finding.message,
           normalizedUri,
           finding.line,
-          finding.endLine
+          finding.endLine,
+          finding.scoring
         )
       );
     }
@@ -295,12 +352,20 @@ export function generateSarifReport(
 
     // 5. Stage 3a: Emit active suppressions with standard SARIF v2.1.0 suppressions metadata
     for (const sup of summary.suppressions || []) {
+      if (
+        (sup.ruleId === 'DG004-DYN-01' || sup.ruleId === 'DG004-DYN-02') &&
+        !rulesMap.has(sup.ruleId)
+      ) {
+        rulesMap.set(sup.ruleId, dynRuleDescriptors[sup.ruleId]);
+      }
       const suppressedResult = createSarifResult(
         sup.ruleId,
         sup.severity || 'warning',
         sup.message || `Suppressed ${sup.ruleId} finding: ${sup.reason}`,
         normalizedUri,
-        sup.targetLine
+        sup.targetLine,
+        undefined,
+        sup.ruleId === 'DG004-DYN-01' || sup.ruleId === 'DG004-DYN-02' ? false : undefined
       );
       suppressedResult.suppressions = [
         {

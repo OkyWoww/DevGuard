@@ -12,13 +12,18 @@
 
 export interface CorpusCase {
   id: string;
-  rule: 'DG001' | 'DG004' | 'DG005' | 'DG006' | 'DG007' | 'DG008';
+  rule: 'DG001' | 'DG004' | 'DG004-DYN-01' | 'DG004-DYN-02' | 'DG005' | 'DG006' | 'DG007' | 'DG008';
   label: 'TP' | 'TN' | 'EVASION';
   filePath: string;
   code: string;
   declaredDependencies?: string[];
   status: 'expected' | 'knownMiss' | 'knownFP';
   note: string;
+  provenance?: {
+    source: string;
+    license: string;
+    commit: string;
+  };
 }
 
 const FAKE_GEMINI_KEY = 'AIza' + 'SyD9k8L7m6N5p4Q3r2S1t0U9v8W7x6Y5z4';
@@ -990,5 +995,265 @@ export const CORPUS_CASES: readonly CorpusCase[] = [
     ].join('\n'),
     status: 'knownMiss',
     note: 'while (running) async loop where boolean guard is never mutated or broken',
+  },
+
+  // ===========================================================================
+  // DG004-DYN-01: Dynamic import(<non-literal>) Specifier (Non-Scoring Warning)
+  // ===========================================================================
+  {
+    id: 'DG004-DYN-01-TP-01',
+    rule: 'DG004-DYN-01',
+    label: 'TP',
+    filePath: 'src/plugins/loader.ts',
+    code: [
+      'export async function loadPlugin(pluginPath: string) {',
+      '  return await import(pluginPath);',
+      '}',
+    ].join('\n'),
+    status: 'expected',
+    note: 'Dynamic import(pluginPath) variable specifier triggers DG004-DYN-01',
+  },
+  {
+    id: 'DG004-DYN-01-TP-02',
+    rule: 'DG004-DYN-01',
+    label: 'TP',
+    filePath: 'src/i18n/messages.ts',
+    code: [
+      'export async function loadLocaleMessages(locale: string) {',
+      '  return await import(`./locales/${locale}.js`);',
+      '}',
+    ].join('\n'),
+    status: 'expected',
+    note: 'Interpolated template literal import(`./locales/${locale}.js`) triggers DG004-DYN-01',
+  },
+  {
+    id: 'DG004-DYN-01-TP-03',
+    rule: 'DG004-DYN-01',
+    label: 'TP',
+    filePath: 'src/plugins/resolver.ts',
+    code: [
+      'export function resolveExtension(getModuleName: () => string) {',
+      '  return import(getModuleName());',
+      '}',
+    ].join('\n'),
+    status: 'expected',
+    note: 'Function call expression import(getModuleName()) triggers DG004-DYN-01',
+  },
+  {
+    id: 'DG004-DYN-01-TN-01',
+    rule: 'DG004-DYN-01',
+    label: 'TN',
+    filePath: 'src/api/async/client.js',
+    code: [
+      '// Provenance: https://github.com/microsoft/TypeScript (Apache-2.0, commit 2bd066d87f5bafd315be9f40889d0a60b9e58e0b)',
+      'export async function spawnLanguageService() {',
+      '  const { spawn } = await import("node:child_process");',
+      '  return spawn;',
+      '}',
+    ].join('\n'),
+    status: 'expected',
+    note: 'Static literal import("node:child_process") adapted from TypeScript API client is safe',
+    provenance: {
+      source: 'https://github.com/microsoft/TypeScript',
+      license: 'Apache-2.0',
+      commit: '2bd066d87f5bafd315be9f40889d0a60b9e58e0b',
+    },
+  },
+  {
+    id: 'DG004-DYN-01-TN-02',
+    rule: 'DG004-DYN-01',
+    label: 'TN',
+    filePath: 'src/node/cli.js',
+    code: [
+      '// Provenance: https://github.com/vitejs/vite (MIT, commit 981f07fa4580fb88b333c4450431e4715d2a0b82)',
+      'export async function attachInspector() {',
+      '  const inspector = await import("node:inspector").then((r) => r.default);',
+      '  return { inspector, entryUrl: import.meta.url };',
+      '}',
+    ].join('\n'),
+    status: 'expected',
+    note: 'Literal import("node:inspector") + import.meta.url adapted from Vite CLI is safe',
+    provenance: {
+      source: 'https://github.com/vitejs/vite',
+      license: 'MIT',
+      commit: '981f07fa4580fb88b333c4450431e4715d2a0b82',
+    },
+  },
+  {
+    id: 'DG004-DYN-01-TN-03',
+    rule: 'DG004-DYN-01',
+    label: 'TN',
+    filePath: 'src/vendor/loadLodash.ts',
+    code: [
+      'export async function loadUtility() {',
+      '  const mod = await import(`lodash`);',
+      '  return mod;',
+      '}',
+    ].join('\n'),
+    status: 'expected',
+    note: 'No-interpolation template literal import(`lodash`) is statically analyzable and safe',
+  },
+  {
+    id: 'DG004-DYN-01-TN-04',
+    rule: 'DG004-DYN-01',
+    label: 'TN',
+    filePath: 'src/features/loadManifest.ts',
+    code: [
+      'export async function loadFeatureManifest() {',
+      "  return await import('./feature.json', { with: { type: 'json' } });",
+      '}',
+    ].join('\n'),
+    status: 'expected',
+    note: 'Literal specifier import with second import-attributes options object is safe',
+  },
+  {
+    id: 'DG004-DYN-01-TN-05',
+    rule: 'DG004-DYN-01',
+    label: 'TN',
+    filePath: 'src/plugins/registry.ts',
+    code: [
+      'export class RegistryLoader {',
+      '  import(source: string): string {',
+      '    return source;',
+      '  }',
+      '}',
+      'export function invokeLoader(loader: { import: (v: string) => Promise<unknown> }, dynamicVar: string) {',
+      '  return loader.import(dynamicVar);',
+      '}',
+    ].join('\n'),
+    status: 'expected',
+    note: 'Class method named import() and member method call loader.import(dynamicVar) must not trigger DG004-DYN-01',
+  },
+
+  // ===========================================================================
+  // DG004-DYN-02: Dynamic require(<non-literal>) Specifier (Non-Scoring Warning)
+  // ===========================================================================
+  {
+    id: 'DG004-DYN-02-TP-01',
+    rule: 'DG004-DYN-02',
+    label: 'TP',
+    filePath: 'src/db/loadDriver.js',
+    code: [
+      'function connectDriver(driverName) {',
+      '  return require(driverName);',
+      '}',
+      'module.exports = { connectDriver };',
+    ].join('\n'),
+    status: 'expected',
+    note: 'Dynamic require(driverName) variable specifier triggers DG004-DYN-02',
+  },
+  {
+    id: 'DG004-DYN-02-TP-02',
+    rule: 'DG004-DYN-02',
+    label: 'TP',
+    filePath: 'src/i18n/loadLocale.js',
+    code: [
+      'function loadLocale(lang) {',
+      "  return require('./locales/' + lang);",
+      '}',
+      'module.exports = { loadLocale };',
+    ].join('\n'),
+    status: 'expected',
+    note: 'Concatenated require("./locales/" + lang) expression triggers DG004-DYN-02',
+  },
+  {
+    id: 'DG004-DYN-02-TP-03',
+    rule: 'DG004-DYN-02',
+    label: 'TP',
+    filePath: 'src/plugins/loadScoped.ts',
+    code: [
+      'export function loadScopedPlugin(pkg: string) {',
+      '  return require(`@scope/${pkg}`);',
+      '}',
+    ].join('\n'),
+    status: 'expected',
+    note: 'Interpolated template literal require(`@scope/${pkg}`) triggers DG004-DYN-02',
+  },
+  {
+    id: 'DG004-DYN-02-TN-01',
+    rule: 'DG004-DYN-02',
+    label: 'TN',
+    filePath: 'src/worker/pool.js',
+    code: [
+      '// Provenance: https://github.com/facebook/jest (MIT, commit 67c1aa20c5fec31366d733e901fee2b981cb1850)',
+      'function resolveWorkerEntry(workerPath) {',
+      "  if (typeof require !== 'undefined') {",
+      '    return require.resolve(workerPath);',
+      '  }',
+      '  return workerPath;',
+      '}',
+      'module.exports = { resolveWorkerEntry };',
+    ].join('\n'),
+    status: 'expected',
+    note: 'typeof require check and require.resolve(workerPath) adapted from jest-worker are safe',
+    provenance: {
+      source: 'https://github.com/facebook/jest',
+      license: 'MIT',
+      commit: '67c1aa20c5fec31366d733e901fee2b981cb1850',
+    },
+  },
+  {
+    id: 'DG004-DYN-02-TN-02',
+    rule: 'DG004-DYN-02',
+    label: 'TN',
+    filePath: 'src/node/esmCompat.mjs',
+    code: [
+      '// Provenance: https://github.com/vitejs/vite (MIT, commit 981f07fa4580fb88b333c4450431e4715d2a0b82)',
+      "import { createRequire } from 'node:module';",
+      'const require = createRequire(import.meta.url);',
+      'export function loadConfigFile(dynamicPath) {',
+      '  return require(dynamicPath);',
+      '}',
+    ].join('\n'),
+    status: 'expected',
+    note: 'File-level shadowed createRequire(import.meta.url) adapted from Vite triggers shadow guard cleanly',
+    provenance: {
+      source: 'https://github.com/vitejs/vite',
+      license: 'MIT',
+      commit: '981f07fa4580fb88b333c4450431e4715d2a0b82',
+    },
+  },
+  {
+    id: 'DG004-DYN-02-TN-03',
+    rule: 'DG004-DYN-02',
+    label: 'TN',
+    filePath: 'src/config/readConfig.js',
+    code: [
+      "const fs = require('node:fs');",
+      "const cfg = require('./config.json');",
+      'module.exports = { fs, cfg };',
+    ].join('\n'),
+    status: 'expected',
+    note: 'Single-quoted static literal require() specifiers are safe',
+  },
+  {
+    id: 'DG004-DYN-02-TN-04',
+    rule: 'DG004-DYN-02',
+    label: 'TN',
+    filePath: 'src/path/joiner.js',
+    code: [
+      'const path = require(`path`);',
+      'module.exports = path;',
+    ].join('\n'),
+    status: 'expected',
+    note: 'No-interpolation template literal require(`path`) is safe',
+  },
+  {
+    id: 'DG004-DYN-02-TN-05',
+    rule: 'DG004-DYN-02',
+    label: 'TN',
+    filePath: 'src/plugins/memberRequire.ts',
+    code: [
+      'export class PluginHost {',
+      '  require(name: string) {',
+      '    return name;',
+      '  }',
+      '}',
+      'export function loadViaModule(dynamicId: string) {',
+      '  return module.require(dynamicId);',
+      '}',
+    ].join('\n'),
+    status: 'expected',
+    note: 'Class method named require() and module.require(dynamicId) member call must not trigger DG004-DYN-02',
   },
 ];
