@@ -5,15 +5,22 @@ import { execFileSync } from 'node:child_process';
 import { builtinModules } from 'node:module';
 import {
   ANALYZABLE_EXTENSIONS,
+  PARTIAL_ANALYSIS_EXTENSIONS,
   analyzeCodeDeterministically,
   hasAnalyzableExtension,
+  hasPartialAnalysisExtension,
   isValidSuppressionReason,
   prepareRedactedCodeForLlm,
   redactSecretsPreservingLayout,
   type ParsedDevGuardReport,
 } from './devguardAnalyzer.js';
 
-export { ANALYZABLE_EXTENSIONS, hasAnalyzableExtension };
+export {
+  ANALYZABLE_EXTENSIONS,
+  PARTIAL_ANALYSIS_EXTENSIONS,
+  hasAnalyzableExtension,
+  hasPartialAnalysisExtension,
+};
 import {
   REPORT_SPEC_VERSION,
   detectPrEnvironment,
@@ -600,6 +607,7 @@ export type IgnoredReason = 'non_code' | 'deleted';
 export interface ClassifiedFileEntry {
   filePath: string;
   status: 'analyzed' | 'skipped' | 'ignored';
+  coverage?: 'full' | 'partial';
   reason?: SkippedReason | IgnoredReason;
   sizeBytes?: number;
 }
@@ -620,7 +628,7 @@ export interface ClassifyFileOptions {
 }
 
 export const KNOWN_UNSUPPORTED_CODE_EXTENSIONS = [
-  '.py', '.pyw',
+  '.pyw',
   '.go',
   '.java', '.kt', '.kts', '.scala', '.groovy',
   '.rb', '.erb',
@@ -695,7 +703,14 @@ export function classifyFile(filePath: string, options?: ClassifyFileOptions): C
     if (stat.size > maxFileBytes) {
       return { filePath, status: 'skipped', reason: 'file_too_large', sizeBytes: stat.size };
     }
-    return { filePath, status: 'analyzed', sizeBytes: stat.size };
+    return { filePath, status: 'analyzed', coverage: 'full', sizeBytes: stat.size };
+  }
+
+  if (hasPartialAnalysisExtension(fileName)) {
+    if (stat.size > maxFileBytes) {
+      return { filePath, status: 'skipped', reason: 'file_too_large', sizeBytes: stat.size };
+    }
+    return { filePath, status: 'analyzed', coverage: 'partial', sizeBytes: stat.size };
   }
 
   if (KNOWN_UNSUPPORTED_CODE_EXT_SET.has(ext)) {
@@ -788,7 +803,6 @@ export function classifyInScopeFiles(
 const AUTO_DISCOVERY_EXCLUDED_DIRS = new Set([
   'node_modules',
   'dist',
-  '.test-dist',
   'build',
   'coverage',
   'remotion',
@@ -797,12 +811,7 @@ const AUTO_DISCOVERY_EXCLUDED_DIRS = new Set([
   'scripts',
 ]);
 
-const SELF_REFERENCE_EXCLUDED_FILES = new Set([
-  'devguardAnalyzer.ts',
-  'devguard_verify.py',
-]);
-
-/** Returns true when a path belongs to tests, internal scripts, build artifacts, or excluded self-reference files. */
+/** Returns true when a path belongs to tests, scripts, build artifacts, or excluded self-reference files. */
 export function isExcludedPathFromScope(filePath: string, cwd: string = process.cwd()): boolean {
   const rel = path.isAbsolute(filePath) ? path.relative(cwd, filePath) : filePath;
   const posix = rel.replace(/\\/g, '/').replace(/^\.\//, '');
@@ -817,13 +826,17 @@ export function isExcludedPathFromScope(filePath: string, cwd: string = process.
     fileName.endsWith('.d.ts') ||
     fileName.includes('.test.') ||
     fileName.includes('.spec.') ||
-    SELF_REFERENCE_EXCLUDED_FILES.has(fileName)
+    fileName === 'devguardAnalyzer.ts' ||
+    fileName === 'devguard_verify.py'
   );
 }
 
-/** Returns true when a path is excluded from analyzable auto-discovery (path exclusion or non-JS/TS extension). */
+/** Returns true when a path is excluded from analyzable auto-discovery (path exclusion or non-supported extension). */
 export function isExcludedFromAutoDiscovery(filePath: string, cwd: string = process.cwd()): boolean {
-  return isExcludedPathFromScope(filePath, cwd) || !hasAnalyzableExtension(filePath);
+  return (
+    isExcludedPathFromScope(filePath, cwd) ||
+    (!hasAnalyzableExtension(filePath) && !hasPartialAnalysisExtension(filePath))
+  );
 }
 
 /** Discovers all in-scope files BEFORE extension filtering for `'modified'` (git diff) or `'all'` mode. */

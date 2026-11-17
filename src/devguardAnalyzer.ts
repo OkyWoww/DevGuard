@@ -57,11 +57,22 @@ export const ANALYZABLE_EXTENSIONS = [
   '.cts',
 ] as const;
 
-/** Returns true when the file path ends with one of the supported JS/TS extensions. */
-export function hasAnalyzableExtension(filePath: string): boolean {
+export const PARTIAL_ANALYSIS_EXTENSIONS = ['.py'] as const;
+
+function hasMatchingExtension(filePath: string, extensions: readonly string[]): boolean {
   const normalized = filePath.replace(/\\/g, '/').toLowerCase();
   const fileName = normalized.split('/').pop() || '';
-  return ANALYZABLE_EXTENSIONS.some((ext) => fileName.endsWith(ext));
+  return extensions.some((ext) => fileName.endsWith(ext));
+}
+
+/** Returns true when the file path ends with one of the supported JS/TS extensions. */
+export function hasAnalyzableExtension(filePath: string): boolean {
+  return hasMatchingExtension(filePath, ANALYZABLE_EXTENSIONS);
+}
+
+/** Returns true when the file path ends with a partially supported extension covered by language-agnostic rules only. */
+export function hasPartialAnalysisExtension(filePath: string): boolean {
+  return hasMatchingExtension(filePath, PARTIAL_ANALYSIS_EXTENSIONS);
 }
 
 export interface ParsedScores {
@@ -442,7 +453,7 @@ export function analyzeCodeDeterministically(
     );
 
   const isExplicitJsTsFile = hasAnalyzableExtension(normalizedFilePath);
-  const isExplicitPyFile = /\.py$/i.test(normalizedFilePath);
+  const isExplicitPyFile = hasPartialAnalysisExtension(normalizedFilePath);
   const hasJsTsSyntax =
     isExplicitJsTsFile ||
     isSelfAnalyzerModule ||

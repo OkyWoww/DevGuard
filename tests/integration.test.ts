@@ -17,6 +17,7 @@ import {
 import {
   ANALYZABLE_EXTENSIONS,
   MAX_AUDIT_FILE_BYTES,
+  PARTIAL_ANALYSIS_EXTENSIONS,
   auditClassifiedFiles,
   classifyFile,
   classifyInScopeFiles,
@@ -25,6 +26,7 @@ import {
   discoverWorkspaceFiles,
   evaluateCodeHybrid,
   hasAnalyzableExtension,
+  hasPartialAnalysisExtension,
   isExcludedFromAutoDiscovery,
   loadVerifiedAllowlist,
   matchAllowlistForFile,
@@ -389,13 +391,12 @@ test('4. end-to-end cli.ts exits with code 1 after writing valid devguard-result
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-cli-e2e-'));
 
   try {
-    const fixturePath = path.join(tempDir, 'vulnerable_fixture.ts');
+    const fixturePath = path.join(tempDir, 'vulnerable_fixture.py');
     fs.writeFileSync(
       fixturePath,
       [
-        'export function executeUserExpr(userInput: string) {',
-        '  return eval(userInput);',
-        '}',
+        'def execute_user_expr(user_input):',
+        '    return eval(user_input)',
         '',
       ].join('\n'),
       'utf-8'
@@ -445,7 +446,7 @@ test('4. end-to-end cli.ts exits with code 1 after writing valid devguard-result
 
     const errorFinding = results.find((r) => r.ruleId === 'DG001' && r.level === 'error');
     assert.ok(errorFinding, 'Expected DG001 error finding in SARIF output');
-    assert.equal(errorFinding.locations[0].physicalLocation.artifactLocation.uri, 'vulnerable_fixture.ts');
+    assert.equal(errorFinding.locations[0].physicalLocation.artifactLocation.uri, 'vulnerable_fixture.py');
     assert.ok(errorFinding.locations[0].physicalLocation.region.startLine >= 1);
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
@@ -568,10 +569,9 @@ test('6. SPOF graceful degradation (GitHub API + Gemini LLM fallback) and action
     assert.ok(llmFallback.parsedReport.skor.security < 70);
 
     // 6c. Verify CLI with invalid GEMINI_API_KEY and multi-line DEVGUARD_SARIF_OUTPUT degrades cleanly & sanitizes output
-    const fixturePath = path.join(tempDir, 'vuln_fallback.ts');
+    const fixturePath = path.join(tempDir, 'vuln_fallback.py');
     const githubOutputPath = path.join(tempDir, 'github_output.txt');
-    const vulnerableTsCode = 'export function runEval(x: string) {\n  return eval(x);\n}\n';
-    fs.writeFileSync(fixturePath, vulnerableTsCode, 'utf-8');
+    fs.writeFileSync(fixturePath, vulnerableCode, 'utf-8');
     fs.writeFileSync(githubOutputPath, '', 'utf-8');
 
     const compiledCliPath = path.join(BUILD_ROOT, 'src', 'cli.js');
@@ -599,7 +599,7 @@ test('6. SPOF graceful degradation (GitHub API + Gemini LLM fallback) and action
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
 
-  // Verify action.yml exposes required inputs/outputs wired to steps.audit_gate.outputs and documented in README
+  // Verify action.yml exposes overall_score, audit_status, and sarif_file wired to steps.audit_gate.outputs
   const actionYml = fs.readFileSync(path.join(REPO_ROOT, 'action.yml'), 'utf-8');
   const readmeMd = fs.readFileSync(path.join(REPO_ROOT, 'README.md'), 'utf-8');
   assert.match(actionYml, /id:\s*audit_gate/);
@@ -2624,7 +2624,7 @@ test('34. CLI rejects pull_request_target at runtime and skips files exceeding 1
   }
 });
 
-test('35. Pre-filter classifier preserves count invariant across mixed languages, components, configs, shebangs, and deleted files', () => {
+test('35. Pre-filter classifier preserves count invariant across mixed languages, partial .py, components, configs, shebangs, and deleted files', () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-classify-mixed-'));
   try {
     const repoDir = path.join(tempDir, 'repo');
@@ -2638,7 +2638,9 @@ test('35. Pre-filter classifier preserves count invariant across mixed languages
     fs.writeFileSync(path.join(repoDir, 'src', 'app.ts'), 'export const ok = 1;\n', 'utf-8');
     fs.writeFileSync(path.join(repoDir, 'src', 'util.mjs'), 'export const u = 2;\n', 'utf-8');
     fs.writeFileSync(path.join(repoDir, 'tools', 'deploy.py'), 'print("deploy")\n', 'utf-8');
+    fs.writeFileSync(path.join(repoDir, 'tools', 'worker.go'), 'package main\nfunc work() {}\n', 'utf-8');
     fs.writeFileSync(path.join(repoDir, 'scripts', 'internal.py'), 'print("excluded")\n', 'utf-8');
+    fs.writeFileSync(path.join(repoDir, 'scripts', 'helper.js'), 'export const h = 1;\n', 'utf-8');
     fs.writeFileSync(path.join(repoDir, 'cmd', 'main.go'), 'package main\nfunc main() {}\n', 'utf-8');
     fs.writeFileSync(path.join(repoDir, 'src', 'App.vue'), '<script setup>\nconst a = 1;\n</script>\n', 'utf-8');
     fs.writeFileSync(path.join(repoDir, 'src', 'Widget.svelte'), '<script>\nlet x = 1;\n</script>\n', 'utf-8');
@@ -2661,7 +2663,9 @@ test('35. Pre-filter classifier preserves count invariant across mixed languages
     // Update files and delete one tracked file to verify diff in-scope BEFORE extension filter
     fs.writeFileSync(path.join(repoDir, 'src', 'app.ts'), 'export const ok = 2;\n', 'utf-8');
     fs.writeFileSync(path.join(repoDir, 'tools', 'deploy.py'), 'print("deploy v2")\n', 'utf-8');
+    fs.writeFileSync(path.join(repoDir, 'tools', 'worker.go'), 'package main\nfunc work() { println(1) }\n', 'utf-8');
     fs.writeFileSync(path.join(repoDir, 'scripts', 'internal.py'), 'print("excluded v2")\n', 'utf-8');
+    fs.writeFileSync(path.join(repoDir, 'scripts', 'helper.js'), 'export const h = 2;\n', 'utf-8');
     fs.writeFileSync(path.join(repoDir, 'notebooks', 'exp.ipynb'), '{"cells":[1]}\n', 'utf-8');
     fs.unlinkSync(path.join(repoDir, 'cmd', 'main.go'));
     git(['add', '-A']);
@@ -2669,14 +2673,24 @@ test('35. Pre-filter classifier preserves count invariant across mixed languages
 
     const diffInScope = discoverInScopeFiles('modified', repoDir);
     assert.ok(diffInScope.includes('tools/deploy.py'), 'Classifier must receive .py before extension filter');
+    assert.ok(diffInScope.includes('tools/worker.go'), 'Classifier must receive .go before extension filter');
     assert.ok(diffInScope.includes('notebooks/exp.ipynb'), 'Classifier must receive .ipynb before extension filter');
     assert.ok(diffInScope.includes('cmd/main.go'), 'Classifier must receive deleted file from diff');
     assert.ok(!diffInScope.includes('scripts/internal.py'), 'Auto-discovery must exclude scripts/** uniformly');
+    assert.ok(!diffInScope.includes('scripts/helper.js'), 'Auto-discovery must exclude scripts/** uniformly');
+
+    const allDiscovered = discoverWorkspaceFiles('all', repoDir).map((p) =>
+      path.relative(repoDir, p).replace(/\\/g, '/')
+    );
+    assert.ok(allDiscovered.includes('tools/deploy.py'), 'Mode all must keep .py discovery parity with v1.2.1');
+    assert.ok(!allDiscovered.includes('scripts/internal.py'));
+    assert.ok(!allDiscovered.includes('scripts/helper.js'));
 
     const fullMixedList = [
       'src/app.ts',
       'src/util.mjs',
       'tools/deploy.py',
+      'tools/worker.go',
       'src/App.vue',
       'src/Widget.svelte',
       'src/Page.astro',
@@ -2699,11 +2713,15 @@ test('35. Pre-filter classifier preserves count invariant across mixed languages
       'Invariant analyzed + skipped + ignored === total must hold'
     );
 
-    assert.deepEqual(
-      res.analyzed.map((e) => e.filePath).sort(),
-      ['src/app.ts', 'src/util.mjs']
-    );
     const byPath = (a: string[], b: string[]) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0);
+    assert.deepEqual(
+      res.analyzed.map((e) => [e.filePath, e.coverage || '']).sort(byPath),
+      [
+        ['src/app.ts', 'full'],
+        ['src/util.mjs', 'full'],
+        ['tools/deploy.py', 'partial'],
+      ]
+    );
     assert.deepEqual(
       res.skipped.map((e) => [e.filePath, e.reason]).sort(byPath),
       [
@@ -2712,7 +2730,7 @@ test('35. Pre-filter classifier preserves count invariant across mixed languages
         ['src/App.vue', 'unsupported_language'],
         ['src/Page.astro', 'unsupported_language'],
         ['src/Widget.svelte', 'unsupported_language'],
-        ['tools/deploy.py', 'unsupported_language'],
+        ['tools/worker.go', 'unsupported_language'],
       ]
     );
     assert.deepEqual(
@@ -2735,33 +2753,51 @@ test('35. Pre-filter classifier preserves count invariant across mixed languages
   }
 });
 
-test('36. Classifier enforces exact 1_048_576 byte boundary via stat before reading file content', () => {
+test('36. Classifier enforces exact 1_048_576 byte boundary for full JS/TS and partial .py via stat before reading file content', () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-size-boundary-'));
   try {
     const exactLimitFile = path.join(tempDir, 'exact.ts');
+    const exactPyFile = path.join(tempDir, 'exact.py');
     const overLimitFile = path.join(tempDir, 'over.js');
+    const overPyFile = path.join(tempDir, 'over.py');
     fs.writeFileSync(exactLimitFile, Buffer.alloc(MAX_AUDIT_FILE_BYTES, 0x20));
+    fs.writeFileSync(exactPyFile, Buffer.alloc(MAX_AUDIT_FILE_BYTES, 0x20));
     fs.writeFileSync(overLimitFile, Buffer.alloc(MAX_AUDIT_FILE_BYTES + 1, 0x20));
+    fs.writeFileSync(overPyFile, Buffer.alloc(MAX_AUDIT_FILE_BYTES + 1, 0x20));
 
     assert.equal(fs.statSync(exactLimitFile).size, 1_048_576);
+    assert.equal(fs.statSync(exactPyFile).size, 1_048_576);
     assert.equal(fs.statSync(overLimitFile).size, 1_048_577);
+    assert.equal(fs.statSync(overPyFile).size, 1_048_577);
 
     const exactEntry = classifyFile(exactLimitFile);
     assert.equal(exactEntry.status, 'analyzed');
+    assert.equal(exactEntry.coverage, 'full');
     assert.equal(exactEntry.reason, undefined);
     assert.equal(exactEntry.sizeBytes, 1_048_576);
+
+    const exactPyEntry = classifyFile(exactPyFile);
+    assert.equal(exactPyEntry.status, 'analyzed');
+    assert.equal(exactPyEntry.coverage, 'partial');
+    assert.equal(exactPyEntry.reason, undefined);
+    assert.equal(exactPyEntry.sizeBytes, 1_048_576);
 
     const overEntry = classifyFile(overLimitFile);
     assert.equal(overEntry.status, 'skipped');
     assert.equal(overEntry.reason, 'file_too_large');
     assert.equal(overEntry.sizeBytes, 1_048_577);
+
+    const overPyEntry = classifyFile(overPyFile);
+    assert.equal(overPyEntry.status, 'skipped');
+    assert.equal(overPyEntry.reason, 'file_too_large');
+    assert.equal(overPyEntry.sizeBytes, 1_048_577);
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
 });
 
-test('37. PR containing only .py files produces N/A score, skips min_score check, posts coverage summary, and exits 0 by default', async () => {
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-py-only-pass-'));
+test('37. PR containing only skipped languages (.go/.rb) produces N/A score, skips min_score check, posts coverage summary, and exits 0 by default', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-go-only-pass-'));
   const postedBodies: string[] = [];
   const server = http.createServer((req, res) => {
     const chunks: Buffer[] = [];
@@ -2790,10 +2826,10 @@ test('37. PR containing only .py files produces N/A score, skips min_score check
     git(['add', '.']);
     git(['commit', '-m', 'init']);
 
-    fs.writeFileSync(path.join(repoDir, 'tools', 'deploy.py'), 'def deploy():\n    return True\n', 'utf-8');
-    fs.writeFileSync(path.join(repoDir, 'tools', 'migrate.py'), 'def migrate():\n    return True\n', 'utf-8');
+    fs.writeFileSync(path.join(repoDir, 'tools', 'deploy.go'), 'package main\nfunc deploy() bool { return true }\n', 'utf-8');
+    fs.writeFileSync(path.join(repoDir, 'tools', 'migrate.rb'), 'def migrate\n  true\nend\n', 'utf-8');
     git(['add', '.']);
-    git(['commit', '-m', 'add python scripts only']);
+    git(['commit', '-m', 'add go and ruby scripts only']);
 
     const eventPath = path.join(tempDir, 'event.json');
     fs.writeFileSync(
@@ -2805,7 +2841,7 @@ test('37. PR containing only .py files produces N/A score, skips min_score check
       'utf-8'
     );
     const ghOutput = path.join(tempDir, 'gh-output.txt');
-    const sarifOut = path.join(tempDir, 'py-only.sarif');
+    const sarifOut = path.join(tempDir, 'go-only.sarif');
     fs.writeFileSync(ghOutput, '', 'utf-8');
 
     const compiledCliPath = path.join(BUILD_ROOT, 'src', 'cli.js');
@@ -2835,7 +2871,7 @@ test('37. PR containing only .py files produces N/A score, skips min_score check
       child.on('close', (code) => resolve({ status: code, stdout, stderr }));
     });
 
-    assert.equal(runResult.status, 0, `Expected exit 0 when only .py files changed, stderr: ${runResult.stderr}`);
+    assert.equal(runResult.status, 0, `Expected exit 0 when only skipped-language files changed, stderr: ${runResult.stderr}`);
     const outText = fs.readFileSync(ghOutput, 'utf-8');
     assert.match(outText, /^overall_score=N\/A$/m);
     assert.match(outText, /^audit_status=PASS$/m);
@@ -2847,8 +2883,8 @@ test('37. PR containing only .py files produces N/A score, skips min_score check
     assert.ok(prBody.includes('DevGuard v1.3.0 — Score: N/A  (analyzed 0 of 2 code files · 2 skipped)'));
     assert.ok(prBody.includes('- Analyzed: 0'));
     assert.ok(prBody.includes('- Skipped: 2'));
-    assert.ok(prBody.includes('tools/deploy.py — Skipped: Unsupported language'));
-    assert.ok(prBody.includes('tools/migrate.py — Skipped: Unsupported language'));
+    assert.ok(prBody.includes('tools/deploy.go — Skipped: Unsupported language'));
+    assert.ok(prBody.includes('tools/migrate.rb — Skipped: Unsupported language'));
     assert.ok(!prBody.includes('100/100'), 'Must never display 100/100 when 0 files were analyzed');
 
     const sarif = JSON.parse(fs.readFileSync(sarifOut, 'utf-8'));
@@ -2861,17 +2897,17 @@ test('37. PR containing only .py files produces N/A score, skips min_score check
   }
 });
 
-test('38. PR containing only .py files with fail_on_unanalyzable=true fails with exit code 1', () => {
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-py-only-fail-'));
+test('38. PR containing only skipped language (.go) with fail_on_unanalyzable=true fails with exit code 1', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-go-only-fail-'));
   try {
-    const pyFile = path.join(tempDir, 'service.py');
+    const goFile = path.join(tempDir, 'service.go');
     const ghOutput = path.join(tempDir, 'gh-output.txt');
-    const sarifOut = path.join(tempDir, 'py-fail.sarif');
-    fs.writeFileSync(pyFile, 'def handler():\n    return 42\n', 'utf-8');
+    const sarifOut = path.join(tempDir, 'go-fail.sarif');
+    fs.writeFileSync(goFile, 'package main\nfunc handler() int { return 42 }\n', 'utf-8');
     fs.writeFileSync(ghOutput, '', 'utf-8');
 
     const compiledCliPath = path.join(BUILD_ROOT, 'src', 'cli.js');
-    const runResult = spawnSync(process.execPath, [compiledCliPath, pyFile], {
+    const runResult = spawnSync(process.execPath, [compiledCliPath, goFile], {
       cwd: tempDir,
       encoding: 'utf-8',
       env: {
@@ -2895,7 +2931,7 @@ test('38. PR containing only .py files with fail_on_unanalyzable=true fails with
   }
 });
 
-test('39. Mixed PR (.ts + .py + >1MiB .js + .md) computes score solely from analyzed files and renders Coverage block', async () => {
+test('39. Mixed PR (.ts + .go + >1MiB .js + .md) computes score solely from analyzed files and renders Coverage block', async () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-mixed-pr-'));
   const postedBodies: string[] = [];
   const server = http.createServer((req, res) => {
@@ -2942,7 +2978,7 @@ test('39. Mixed PR (.ts + .py + >1MiB .js + .md) computes score solely from anal
     const expectedTsScore = analyzeCodeDeterministically(safeTsSource, { filePath: 'src/math.ts' }).skor.totalScore;
 
     fs.writeFileSync(path.join(repoDir, 'src', 'math.ts'), safeTsSource, 'utf-8');
-    fs.writeFileSync(path.join(repoDir, 'tools', 'deploy.py'), 'print("ok")\n', 'utf-8');
+    fs.writeFileSync(path.join(repoDir, 'tools', 'deploy.go'), 'package main\nfunc main() { println("ok") }\n', 'utf-8');
     const pad = '// bundle padding 0123456789abcdef\n';
     fs.writeFileSync(
       path.join(repoDir, 'tools', 'big.js'),
@@ -3006,7 +3042,7 @@ test('39. Mixed PR (.ts + .py + >1MiB .js + .md) computes score solely from anal
     );
     assert.ok(prBody.includes('- Analyzed: 1'));
     assert.ok(prBody.includes('- Skipped: 2'));
-    assert.ok(prBody.includes('tools/deploy.py — Skipped: Unsupported language'));
+    assert.ok(prBody.includes('tools/deploy.go — Skipped: Unsupported language'));
     assert.ok(prBody.includes('tools/big.js — Skipped: File too large (> 1 MiB)'));
     assert.ok(prBody.includes('- Ignored (non-code): 1'));
   } finally {
@@ -3015,12 +3051,15 @@ test('39. Mixed PR (.ts + .py + >1MiB .js + .md) computes score solely from anal
   }
 });
 
-test('40. Analyzed JS/TS rule outputs remain identical to baseline v1.2.1 and share single ANALYZABLE_EXTENSIONS list', () => {
+test('40. Analyzed JS/TS and golden .py rule outputs remain identical to baseline v1.2.1 and share extension constants', () => {
   assert.deepEqual(ANALYZABLE_EXTENSIONS, ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.mts', '.cts']);
+  assert.deepEqual(PARTIAL_ANALYSIS_EXTENSIONS, ['.py']);
   for (const ext of ANALYZABLE_EXTENSIONS) {
     assert.equal(hasAnalyzableExtension(`src/sample${ext}`), true);
   }
   assert.equal(hasAnalyzableExtension('src/sample.py'), false);
+  assert.equal(hasPartialAnalysisExtension('src/sample.py'), true);
+  assert.equal(hasPartialAnalysisExtension('src/sample.pyw'), false);
 
   const baselineSamples = [
     {
@@ -3062,6 +3101,64 @@ test('40. Analyzed JS/TS rule outputs remain identical to baseline v1.2.1 and sh
     const rules = Array.from(new Set((r1.inlineFindings || []).map((f) => f.ruleId))).sort();
     assert.deepEqual(rules, sample.expectedRules);
   }
+
+  // Golden .py parity against baseline v1.2.1 (e67c869)
+  const goldenTempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-golden-py-'));
+  try {
+    const pyGoldenCases = [
+      {
+        filePath: 'secret.py',
+        code: 'def connect():\n    api_key = "sk-live-1234567890abcdef1234567890abcdef"\n    return api_key\n',
+        expectedScore: 75,
+        expectedPrimaryRule: 'DG007',
+        expectedPrimaryLine: 2,
+        expectedPassed: false,
+      },
+      {
+        filePath: 'eval_sink.py',
+        code: 'def run_dynamic(payload):\n    exec(payload)\n    return eval(payload)\n',
+        expectedScore: 75,
+        expectedPrimaryRule: 'DG001',
+        expectedPrimaryLine: 2,
+        expectedPassed: false,
+      },
+      {
+        filePath: 'cmd.py',
+        code: 'import os\ndef run_shell(arg):\n    return os.system(arg)\n',
+        expectedScore: 62,
+        expectedPrimaryRule: 'DG001',
+        expectedPrimaryLine: 3,
+        expectedPassed: false,
+      },
+      {
+        filePath: 'clean.py',
+        code: 'def validate_age(age: int) -> int:\n    if not isinstance(age, int) or age < 0:\n        raise ValueError("invalid age")\n    return age\n',
+        expectedScore: 97,
+        expectedPrimaryRule: 'DG002',
+        expectedPrimaryLine: 1,
+        expectedPassed: true,
+      },
+    ];
+
+    for (const g of pyGoldenCases) {
+      const summary = toFileAuditSummary(g.filePath, g.code);
+      assert.equal(summary.overall, g.expectedScore, `${g.filePath} score mismatch`);
+      assert.equal(summary.passed, g.expectedPassed, `${g.filePath} passed mismatch`);
+      const sarifOut = path.join(goldenTempDir, `${g.filePath}.sarif`);
+      generateSarifReport([summary], sarifOut);
+      const sarif = JSON.parse(fs.readFileSync(sarifOut, 'utf-8'));
+      const results = sarif.runs[0].results as Array<{
+        ruleId: string;
+        level: string;
+        locations: Array<{ physicalLocation: { region: { startLine: number } } }>;
+      }>;
+      const match = results.find((r) => r.ruleId === g.expectedPrimaryRule);
+      assert.ok(match, `Expected ${g.expectedPrimaryRule} for golden ${g.filePath}`);
+      assert.equal(match.locations[0].physicalLocation.region.startLine, g.expectedPrimaryLine);
+    }
+  } finally {
+    fs.rmSync(goldenTempDir, { recursive: true, force: true });
+  }
 });
 
 test('41. SARIF emits runs[0].invocations[0].toolExecutionNotifications with note/error levels and executionSuccessful semantics without altering results count', () => {
@@ -3082,7 +3179,7 @@ test('41. SARIF emits runs[0].invocations[0].toolExecutionNotifications with not
     };
 
     const nonErrorSkipped: SkippedFileReportItem[] = [
-      { filePath: 'tools\\deploy.py', reason: 'unsupported_language' },
+      { filePath: 'tools\\deploy.go', reason: 'unsupported_language' },
       { filePath: '.\\tools\\big.js', reason: 'file_too_large' },
     ];
     const withErrorsSkipped: SkippedFileReportItem[] = [
@@ -3139,7 +3236,7 @@ test('41. SARIF emits runs[0].invocations[0].toolExecutionNotifications with not
         {
           level: 'note',
           text: 'Skipped: Unsupported language',
-          uri: 'tools/deploy.py',
+          uri: 'tools/deploy.go',
           uriBaseId: '%SRCROOT%',
         },
         {
@@ -3177,7 +3274,7 @@ test('42. Long skipped list truncates PR comment with +N more while SARIF keeps 
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-long-skipped-'));
   try {
     const skippedItems: SkippedFileReportItem[] = Array.from({ length: 25 }, (_, idx) => ({
-      filePath: `scripts/job_${idx + 1}.py`,
+      filePath: `tools/job_${idx + 1}.go`,
       reason: 'unsupported_language' as const,
     }));
 
@@ -3201,8 +3298,8 @@ test('42. Long skipped list truncates PR comment with +N more while SARIF keeps 
 
     const markdown = buildPullRequestCommentMarkdown([summary], 85, 'OFFLINE_AST', coverage);
     assert.ok(markdown.includes('DevGuard v1.3.0 — Score: 95/100  (analyzed 1 of 26 code files · 25 skipped)'));
-    assert.ok(markdown.includes(`scripts/job_${MAX_PR_SKIPPED_FILES_DISPLAY}.py — Skipped: Unsupported language`));
-    assert.ok(!markdown.includes('scripts/job_21.py — Skipped: Unsupported language'));
+    assert.ok(markdown.includes(`tools/job_${MAX_PR_SKIPPED_FILES_DISPLAY}.go — Skipped: Unsupported language`));
+    assert.ok(!markdown.includes('tools/job_21.go — Skipped: Unsupported language'));
     assert.ok(markdown.includes(`    - +${25 - MAX_PR_SKIPPED_FILES_DISPLAY} more`));
 
     const sarifOut = path.join(tempDir, 'long-skipped.sarif');
@@ -3211,7 +3308,7 @@ test('42. Long skipped list truncates PR comment with +N more while SARIF keeps 
     assert.equal(sarif.runs[0].invocations[0].toolExecutionNotifications.length, 25);
     assert.equal(
       sarif.runs[0].invocations[0].toolExecutionNotifications[24].locations[0].physicalLocation.artifactLocation.uri,
-      'scripts/job_25.py'
+      'tools/job_25.go'
     );
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
