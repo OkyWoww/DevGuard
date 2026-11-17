@@ -50,6 +50,10 @@ Layer 1 runs **100% offline with zero third-party runtime dependencies** (`packa
    * `totalScore < minScore` (default `minScore = 85`, configurable via `DEVGUARD_MIN_SCORE` or Action input `min_score`)
    * `!isHardened && security < 70`
    * `inlineFindings` contains any item with `severity === 'error'`
+5. **Coverage Classification & `N/A` Score Semantics:**
+   * Every in-scope file is classified once into `Analyzed` (supported JS/TS extensions `.ts`, `.tsx`, `.js`, `.jsx`, `.mjs`, `.cjs`, `.mts`, `.cts` within the `1_048_576`-byte limit), `Skipped` (recognized non-JS/TS code languages, `.vue`/`.svelte`/`.astro`/`.ipynb`, extensionless files with `#!` shebang, `> 1 MiB` files, parse errors, or per-file internal errors), or `Ignored` (non-code files such as docs, configs, lockfiles, `.html`/`.htm`, or deleted diff entries).
+   * When `analyzed === 0` (for example, a PR modifying only `.py` or `.md` files), `overall_score` is reported as **`N/A`** (never `100/100`), the `min_score` comparison is skipped, and the gate passes by default unless `fail_on_unanalyzable: 'true'` and `skipped > 0`.
+   * Full skipped-file notifications (`level: "note"`) are recorded in `runs[0].invocations[0].toolExecutionNotifications[]` inside `devguard-results.sarif` without altering `results[]`.
 
 ### Exact Escalation Criteria for `DG005` & `DG008`
 * **`DG005` (`warning` → `error`):**
@@ -167,6 +171,7 @@ jobs:
           gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
           min_score: '85'
           target_files: 'modified'
+          fail_on_unanalyzable: 'false'
 
       - name: Upload DevGuard SARIF Report to GitHub Code Scanning
         uses: github/codeql-action/upload-sarif@v3
@@ -182,7 +187,8 @@ jobs:
 | **Input** | `gemini_api_key` | `""` | Optional Google Gemini API key for Layer 2 reasoning (falls back cleanly to Offline Single-Pass Lexical & Heuristic mode if omitted, forked, or rate-limited). |
 | **Input** | `min_score` | `'85'` | Minimum Overall Guard score (`0`–`100`) required to pass CI (`DEVGUARD_MIN_SCORE`). |
 | **Input** | `target_files` | `'modified'` | Audit scope: `'modified'` (git diff), `'all'` (workspace scan), or a specific file path (`DEVGUARD_TARGET`). |
-| **Output** | `overall_score` | `96` | Aggregate Overall Guard score across audited files (`0`–`100`). |
+| **Input** | `fail_on_unanalyzable` | `'false'` | Set to `'true'` to fail the CI gate (`exit 1`) when any in-scope code file is skipped (`DEVGUARD_FAIL_ON_UNANALYZABLE`). |
+| **Output** | `overall_score` | `96` / `N/A` | Aggregate Overall Guard score across analyzed files (`0`–`100`), or `N/A` when `0` files were analyzed. |
 | **Output** | `audit_status` | `PASS` / `FAIL` | Final gate verdict written to `GITHUB_OUTPUT`. |
 | **Output** | `sarif_file` | `devguard-results.sarif` | Path to generated OASIS SARIF v2.1.0 report (`%SRCROOT%` POSIX URIs & GitHub Code Scanning `security-severity` rating (`5.0`–`9.5`)). |
 

@@ -61,6 +61,43 @@ export function formatLayer2StatusLabel(status?: string, mode?: 'HYBRID' | 'OFFL
   return mode === 'HYBRID' ? 'Layer 2 (Gemini): Verified' : 'Layer 2 (Gemini): Skipped [No API Key]';
 }
 
+export type SkippedReason =
+  | 'unsupported_language'
+  | 'file_too_large'
+  | 'parse_error'
+  | 'internal_error';
+
+export interface SkippedFileReportItem {
+  filePath: string;
+  reason: SkippedReason;
+}
+
+export interface PrCoverageSummary {
+  analyzedCount: number;
+  skippedFiles: SkippedFileReportItem[];
+  ignoredNonCodeCount: number;
+  ignoredDeletedCount?: number;
+  overallScore?: number | null;
+  failOnUnanalyzable?: boolean;
+  maxSkippedDisplay?: number;
+}
+
+export const MAX_PR_SKIPPED_FILES_DISPLAY = 20;
+
+/** Formats canonical human-readable skipped reason text per DevGuard v1.3.0 spec. */
+export function formatSkippedReasonText(reason: SkippedReason): string {
+  switch (reason) {
+    case 'unsupported_language':
+      return 'Skipped: Unsupported language';
+    case 'file_too_large':
+      return 'Skipped: File too large (> 1 MiB)';
+    case 'parse_error':
+      return 'Skipped: Parse error';
+    case 'internal_error':
+      return 'Skipped: Internal error';
+  }
+}
+
 export interface FileAuditSummary {
   filePath: string;
   security: number;
@@ -141,19 +178,33 @@ function resolvePrContext(): PrContext | null {
   return { token, repo, prNumber, apiBase, headers };
 }
 
-export async function postPullRequestComment(
+/** Builds the sticky PR comment Markdown body with score, coverage block, and detailed findings. */
+export function buildPullRequestCommentMarkdown(
   summaries: FileAuditSummary[],
   minScore: number,
-  mode: 'HYBRID' | 'OFFLINE_AST'
-): Promise<void> {
-  const ctx = resolvePrContext();
-  if (!ctx) {
-    console.log('ℹ️  Bukan konteks Pull Request GitHub atau GITHUB_TOKEN tidak tersedia. Melewati Auto-PR Comment.');
-    return;
-  }
+  mode: 'HYBRID' | 'OFFLINE_AST',
+  coverage?: PrCoverageSummary
+): string {
+  const analyzedCount = coverage ? coverage.analyzedCount : summaries.length;
+  const skippedFiles = coverage?.skippedFiles ?? [];
+  const skippedCount = skippedFiles.length;
+  const codeFilesCount = analyzedCount + skippedCount;
+  const ignoredNonCodeCount = coverage?.ignoredNonCodeCount ?? 0;
+  const ignoredDeletedCount = coverage?.ignoredDeletedCount ?? 0;
 
-  const { repo, prNumber, apiBase, headers } = ctx;
-  const allPassed = summaries.every((summary) => summary.passed);
+  const overallScore: number | null =
+    analyzedCount === 0
+      ? null
+      : coverage?.overallScore !== undefined
+        ? coverage.overallScore
+        : summaries.length > 0
+          ? Math.round(summaries.reduce((acc, s) => acc + s.overall, 0) / summaries.length)
+          : null;
+
+  const analyzedPassed = summaries.every((summary) => summary.passed);
+  const unanalyzableFailed = Boolean(coverage?.failOnUnanalyzable && skippedCount > 0);
+  const allPassed = analyzedPassed && !unanalyzableFailed;
+
   const badgeStatus = allPassed ? '✅ PASSED (READY TO MERGE)' : '🚫 REJECTED (SECURITY GATE FAILED)';
   const engineLabel = mode === 'HYBRID'
     ? 'Hybrid Dual-Layer (Single-Pass Lexical & Heuristic Engine + Gemini 3.8 Flash)'
@@ -164,6 +215,32 @@ export async function postPullRequestComment(
   );
   const headerLayer2Status =
     headerStatuses.length > 0 ? headerStatuses.join(' / ') : formatLayer2StatusLabel(undefined, mode);
+
+  const scoreDisplay = overallScore === null ? 'N/A' : `${overallScore}/100`;
+  const scoreHeadline = `DevGuard v1.3.0 — Score: ${scoreDisplay}  (analyzed ${analyzedCount} of ${codeFilesCount} code files · ${skippedCount} skipped)`;
+
+  const maxDisplay = Math.max(1, coverage?.maxSkippedDisplay ?? MAX_PR_SKIPPED_FILES_DISPLAY);
+  const skippedLines = skippedFiles
+    .slice(0, maxDisplay)
+    .map(
+      (item) =>
+        `    - ${sanitizeMarkdownText(normalizePosixRepoPath(item.filePath).replace(/[\r\n]+/g, ' '))} — ${formatSkippedReasonText(item.reason)}`
+    );
+  if (skippedFiles.length > maxDisplay) {
+    skippedLines.push(`    - +${skippedFiles.length - maxDisplay} more`);
+  }
+
+  const coverageLines: string[] = [
+    'Coverage',
+    `- Analyzed: ${analyzedCount}`,
+    `- Skipped: ${skippedCount}`,
+    ...skippedLines,
+    `- Ignored (non-code): ${ignoredNonCodeCount}`,
+  ];
+  if (ignoredDeletedCount > 0) {
+    coverageLines.push(`- Ignored (deleted): ${ignoredDeletedCount}`);
+  }
+  const coverageBlock = coverageLines.join('\n');
 
   const tableRows = summaries.map((summary) => {
     const icon = summary.passed ? '🟢' : '🔴';
@@ -221,12 +298,16 @@ export async function postPullRequestComment(
     });
   }
 
-  const markdownBody = `${COMMENT_SIGNATURE}
+  return `${COMMENT_SIGNATURE}
 ## 🛡️ DevGuard Adversarial Security Gatekeeper
+
+${scoreHeadline}
 
 | Status Gerbang | Ambang Batas Skor | Mode Mesin | Status Analisis |
 | :--- | :--- | :--- | :--- |
 | **${badgeStatus}** | \`${minScore}/100\` | \`${engineLabel}\` | **${headerLayer2Status}** |
+
+${coverageBlock}
 
 ### 📊 Skor Evaluasi Berkas
 | Berkas | Skor Akhir | Security | Correctness | Maintainability | Layer 2 |
@@ -236,6 +317,22 @@ ${suppressionSection}${detailsSection}
 
 ---
 *Diinspeksi secara otomatis oleh [DevGuard Zero-Leniency Auditor](https://github.com/marketplace/actions/devguard-adversarial-code-auditor).*`;
+}
+
+export async function postPullRequestComment(
+  summaries: FileAuditSummary[],
+  minScore: number,
+  mode: 'HYBRID' | 'OFFLINE_AST',
+  coverage?: PrCoverageSummary
+): Promise<void> {
+  const ctx = resolvePrContext();
+  if (!ctx) {
+    console.log('ℹ️  Bukan konteks Pull Request GitHub atau GITHUB_TOKEN tidak tersedia. Melewati Auto-PR Comment.');
+    return;
+  }
+
+  const { repo, prNumber, apiBase, headers } = ctx;
+  const markdownBody = buildPullRequestCommentMarkdown(summaries, minScore, mode, coverage);
 
   const commentsUrl = `${apiBase}/repos/${repo}/issues/${prNumber}/comments`;
 

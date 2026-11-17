@@ -38,6 +38,7 @@ jobs:
         with:
           min_score: '85'
           target_files: 'modified'
+          fail_on_unanalyzable: 'false'
 
       - name: Upload DevGuard SARIF Report to GitHub Code Scanning
         uses: github/codeql-action/upload-sarif@v3

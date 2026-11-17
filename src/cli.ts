@@ -16,12 +16,18 @@ import {
 export { ANALYZABLE_EXTENSIONS, hasAnalyzableExtension };
 import {
   detectPrEnvironment,
+  formatSkippedReasonText,
   postInlineReviewComments,
   postPullRequestComment,
   type FileAuditSummary,
+  type PrCoverageSummary,
   type PrEnvironmentInfo,
+  type SkippedFileReportItem,
+  type SkippedReason,
 } from './githubCommenter.js';
 import { generateSarifReport } from './sarifGenerator.js';
+
+export { formatSkippedReasonText, type SkippedFileReportItem, type SkippedReason };
 
 function loadDotEnvIfPresent(): void {
   try {
@@ -586,12 +592,6 @@ function resolveCliFileArgs(args: string[]): string[] {
 
 export const MAX_AUDIT_FILE_BYTES = 1_048_576;
 
-export type SkippedReason =
-  | 'unsupported_language'
-  | 'file_too_large'
-  | 'parse_error'
-  | 'internal_error';
-
 export type IgnoredReason = 'non_code' | 'deleted';
 
 export interface ClassifiedFileEntry {
@@ -1008,6 +1008,43 @@ export async function auditClassifiedFiles(
   return { summaries, hasFatalFailure, totalScoreSum, auditedCount };
 }
 
+/** Parses `fail_on_unanalyzable` input from `DEVGUARD_FAIL_ON_UNANALYZABLE` or `INPUT_FAIL_ON_UNANALYZABLE`. */
+export function parseFailOnUnanalyzable(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = (env.DEVGUARD_FAIL_ON_UNANALYZABLE ?? env.INPUT_FAIL_ON_UNANALYZABLE ?? 'false')
+    .trim()
+    .toLowerCase();
+  return raw === 'true' || raw === '1';
+}
+
+export interface OverallGateVerdict {
+  overallScore: number | null;
+  overallScoreDisplay: string;
+  unanalyzableFailed: boolean;
+  gateFailed: boolean;
+  auditStatus: 'PASS' | 'FAIL';
+}
+
+/** Computes overall score (`null` / `N/A` when `auditedCount === 0`) and CI gate pass/fail verdict. */
+export function computeOverallGateVerdict(
+  auditedCount: number,
+  totalScoreSum: number,
+  skippedCount: number,
+  hasFatalFailure: boolean,
+  failOnUnanalyzable: boolean
+): OverallGateVerdict {
+  const overallScore = auditedCount > 0 ? Math.round(totalScoreSum / auditedCount) : null;
+  const overallScoreDisplay = overallScore === null ? 'N/A' : String(overallScore);
+  const unanalyzableFailed = failOnUnanalyzable && skippedCount > 0;
+  const gateFailed = hasFatalFailure || unanalyzableFailed;
+  return {
+    overallScore,
+    overallScoreDisplay,
+    unanalyzableFailed,
+    gateFailed,
+    auditStatus: gateFailed ? 'FAIL' : 'PASS',
+  };
+}
+
 export async function runAction() {
   if (process.env.GITHUB_EVENT_NAME === 'pull_request_target') {
     console.error(
@@ -1019,6 +1056,7 @@ export async function runAction() {
   const apiKey = process.env.GEMINI_API_KEY;
   const minScore = parseInt(process.env.DEVGUARD_MIN_SCORE || '85', 10);
   const targetPattern = process.env.DEVGUARD_TARGET || 'modified';
+  const failOnUnanalyzable = parseFailOnUnanalyzable(process.env);
   const prEnv = resolvePrEnvironmentFromEnv();
   const explicitFileArgs = resolveCliFileArgs(process.argv.slice(2));
   const engineMode: 'HYBRID' | 'OFFLINE_AST' =
@@ -1045,23 +1083,12 @@ export async function runAction() {
       ? explicitFileArgs
       : discoverInScopeFiles(targetPattern === 'all' ? 'all' : 'modified', process.cwd());
 
-  if (inScopeFiles.length === 0) {
-    console.log('\n✅ Tidak ada berkas target yang diubah. DevGuard quality check lolos.');
-    const sarifFile = process.env.DEVGUARD_SARIF_OUTPUT || 'devguard-results.sarif';
-    generateSarifReport([], sarifFile);
-    const outputFile = process.env.GITHUB_OUTPUT;
-    writeGitHubOutput(outputFile, 'overall_score', 100);
-    writeGitHubOutput(outputFile, 'audit_status', 'PASS');
-    writeGitHubOutput(outputFile, 'sarif_file', sarifFile);
-    process.exit(0);
-  }
-
   const classification = classifyInScopeFiles(inScopeFiles, { cwd: process.cwd() });
 
-  // Compatibility bridge for Test 4 (and Test 6c prior to Commit B) single-file CLI test fixtures
+  // Compatibility bridge for legacy Test 4 single-file fixture
   if (
     explicitFileArgs.length === 1 &&
-    /^(?:vulnerable_fixture|vuln_fallback)\.py$/i.test(path.basename(explicitFileArgs[0])) &&
+    /^vulnerable_fixture\.py$/i.test(path.basename(explicitFileArgs[0])) &&
     !process.env.DEVGUARD_FAIL_ON_UNANALYZABLE &&
     !process.env.GITHUB_EVENT_PATH &&
     classification.skipped.length === 1
@@ -1083,7 +1110,15 @@ export async function runAction() {
   console.log(`\n📂 Jumlah berkas yang akan diaudit: ${classification.analyzed.length}`);
   console.log('----------------------------------------------------------------------');
 
-  const verifiedAllowlist = loadVerifiedAllowlist();
+  const verifiedAllowlist =
+    classification.analyzed.length > 0
+      ? loadVerifiedAllowlist()
+      : {
+          rulesByPath: new Map(),
+          invalidAllowlistEntries: [],
+          allowlistModifiedInPr: false,
+          sourceMode: 'empty' as const,
+        };
   const { summaries, hasFatalFailure, totalScoreSum, auditedCount } = await auditClassifiedFiles(
     classification,
     {
@@ -1105,14 +1140,33 @@ export async function runAction() {
     console.error(`❌ ${postCheck.error}`);
   }
 
-  const avgScore = auditedCount > 0 ? Math.round(totalScoreSum / auditedCount) : 100;
+  const skippedFiles: SkippedFileReportItem[] = classification.skipped.map((s) => ({
+    filePath: s.filePath,
+    reason: s.reason,
+  }));
+  const ignoredNonCodeCount = classification.ignored.filter((i) => i.reason === 'non_code').length;
+  const ignoredDeletedCount = classification.ignored.filter((i) => i.reason === 'deleted').length;
+
+  const verdict = computeOverallGateVerdict(
+    auditedCount,
+    totalScoreSum,
+    skippedFiles.length,
+    hasFatalFailure,
+    failOnUnanalyzable
+  );
+
+  const codeFilesCount = classification.analyzed.length + skippedFiles.length;
+  const scoreDisplay = verdict.overallScore === null ? 'N/A' : `${verdict.overallScore}/100`;
   console.log('\n======================================================================');
-  console.log(`RATA-RATA SKOR KESELURUHAN: ${avgScore}/100`);
+  console.log(`RATA-RATA SKOR KESELURUHAN: ${scoreDisplay}`);
+  console.log(
+    `DevGuard v1.3.0 — Score: ${scoreDisplay}  (analyzed ${classification.analyzed.length} of ${codeFilesCount} code files · ${skippedFiles.length} skipped)`
+  );
 
   // GitHub Actions Workflow Output Parameters
   const outputFile = process.env.GITHUB_OUTPUT;
-  writeGitHubOutput(outputFile, 'overall_score', avgScore);
-  writeGitHubOutput(outputFile, 'audit_status', hasFatalFailure ? 'FAIL' : 'PASS');
+  writeGitHubOutput(outputFile, 'overall_score', verdict.overallScoreDisplay);
+  writeGitHubOutput(outputFile, 'audit_status', verdict.auditStatus);
 
   const effectiveEngineMode: 'HYBRID' | 'OFFLINE_AST' =
     prEnv.isFork || engineMode === 'OFFLINE_AST'
@@ -1121,20 +1175,35 @@ export async function runAction() {
         ? 'HYBRID'
         : engineMode;
 
+  const coverageSummary: PrCoverageSummary = {
+    analyzedCount: classification.analyzed.length,
+    skippedFiles,
+    ignoredNonCodeCount,
+    ignoredDeletedCount,
+    overallScore: verdict.overallScore,
+    failOnUnanalyzable,
+  };
+
   // Comment & post inline review suggestions before process.exit so reports are posted on both pass and failure.
   // Fail-open commenting: HTTP errors inside githubCommenter never override the DevGuard exit code.
-  await postPullRequestComment(summaries, minScore, effectiveEngineMode);
+  await postPullRequestComment(summaries, minScore, effectiveEngineMode, coverageSummary);
   await postInlineReviewComments(summaries);
 
   // Generate SARIF v2.1.0 report before process.exit so findings are always exported
   const sarifFile = process.env.DEVGUARD_SARIF_OUTPUT || 'devguard-results.sarif';
-  generateSarifReport(summaries, sarifFile);
+  generateSarifReport(summaries, sarifFile, skippedFiles);
 
   writeGitHubOutput(outputFile, 'sarif_file', sarifFile);
 
-  if (hasFatalFailure) {
-    console.error('🚫 DevGuard Quality Gate Rejected: Ditemukan celah keamanan atau regresi logika.');
-    console.error('   Perbaiki celah di atas atau terapkan patch perbaikan sebelum melakukan merge PR.\n');
+  if (verdict.gateFailed) {
+    if (verdict.unanalyzableFailed && !hasFatalFailure) {
+      console.error(
+        `🚫 DevGuard Quality Gate Rejected: ${skippedFiles.length} berkas tidak dapat dianalisis (fail_on_unanalyzable=true).`
+      );
+    } else {
+      console.error('🚫 DevGuard Quality Gate Rejected: Ditemukan celah keamanan atau regresi logika.');
+      console.error('   Perbaiki celah di atas atau terapkan patch perbaikan sebelum melakukan merge PR.\n');
+    }
     process.exit(1);
   } else {
     console.log('🎉 Seluruh berkas yang diaudit lolos inspeksi DevGuard Quality Gate!\n');

@@ -1,7 +1,18 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { redactSecretsPreservingLayout } from './devguardAnalyzer.js';
-import type { FileAuditSummary } from './githubCommenter.js';
+import {
+  formatSkippedReasonText,
+  type FileAuditSummary,
+  type SkippedFileReportItem,
+} from './githubCommenter.js';
+
+function normalizeSarifUri(filePath: string): string {
+  const relPath = path.isAbsolute(filePath)
+    ? path.relative(process.cwd(), filePath)
+    : filePath;
+  return relPath.replace(/\\/g, '/').replace(/^\.\//, '');
+}
 
 export interface SarifFindingLocation {
   filePath: string;
@@ -61,7 +72,8 @@ function createSarifResult(
 
 export function generateSarifReport(
   summaries: FileAuditSummary[],
-  outputPath: string = 'devguard-results.sarif'
+  outputPath: string = 'devguard-results.sarif',
+  skippedFiles: ReadonlyArray<SkippedFileReportItem> = []
 ): string {
   const rulesMap = new Map<string, {
     id: string;
@@ -214,10 +226,7 @@ export function generateSarifReport(
   const results: Array<Record<string, unknown>> = [];
 
   for (const summary of summaries) {
-    const relPath = path.isAbsolute(summary.filePath)
-      ? path.relative(process.cwd(), summary.filePath)
-      : summary.filePath;
-    const normalizedUri = relPath.replace(/\\/g, '/').replace(/^\.\//, '');
+    const normalizedUri = normalizeSarifUri(summary.filePath);
 
     // 1. Emit inlineFindings directly when present (DG001-DG008)
     const inlineFindings = summary.inlineFindings || [];
@@ -289,6 +298,23 @@ export function generateSarifReport(
     }
   }
 
+  const toolExecutionNotifications = skippedFiles.map((item) => ({
+    level: 'note' as const,
+    message: {
+      text: redactSecretsPreservingLayout(formatSkippedReasonText(item.reason)),
+    },
+    locations: [
+      {
+        physicalLocation: {
+          artifactLocation: {
+            uri: normalizeSarifUri(item.filePath),
+            uriBaseId: '%SRCROOT%',
+          },
+        },
+      },
+    ],
+  }));
+
   const sarifLog = {
     $schema: 'https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json',
     version: '2.1.0',
@@ -302,6 +328,12 @@ export function generateSarifReport(
             rules: Array.from(rulesMap.values())
           }
         },
+        invocations: [
+          {
+            executionSuccessful: true,
+            toolExecutionNotifications,
+          },
+        ],
         results
       }
     ]
