@@ -46,6 +46,24 @@ export {
   redactSecretsPreservingLayout,
 };
 
+export const ANALYZABLE_EXTENSIONS = [
+  '.ts',
+  '.tsx',
+  '.js',
+  '.jsx',
+  '.mjs',
+  '.cjs',
+  '.mts',
+  '.cts',
+] as const;
+
+/** Returns true when the file path ends with one of the supported JS/TS extensions. */
+export function hasAnalyzableExtension(filePath: string): boolean {
+  const normalized = filePath.replace(/\\/g, '/').toLowerCase();
+  const fileName = normalized.split('/').pop() || '';
+  return ANALYZABLE_EXTENSIONS.some((ext) => fileName.endsWith(ext));
+}
+
 export interface ParsedScores {
   security: number;
   securityDeductions: string[];
@@ -423,7 +441,7 @@ export function analyzeCodeDeterministically(
       codeWithoutComments
     );
 
-  const isExplicitJsTsFile = /\.(?:[cm]?[jt]sx?)$/i.test(normalizedFilePath);
+  const isExplicitJsTsFile = hasAnalyzableExtension(normalizedFilePath);
   const isExplicitPyFile = /\.py$/i.test(normalizedFilePath);
   const hasJsTsSyntax =
     isExplicitJsTsFile ||
