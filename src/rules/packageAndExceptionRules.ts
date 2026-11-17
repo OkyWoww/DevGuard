@@ -2,9 +2,12 @@ import {
   damerauLevenshtein,
   isCommentOrEmptyLine,
   type AuditAnalyzeOptions,
+  type DevGuardRuleId,
+  type ExtractedStringLiteral,
   type InlineFinding,
   type LineFinding,
 } from './lexicalMasker.js';
+import { redactSecretsPreservingLayout } from './secretAndResilienceRules.js';
 
 export const POPULAR_NPM_PACKAGES = [
   'express', 'lodash', 'axios', 'zod', 'jsonwebtoken', 'stripe', 'prisma',
@@ -261,6 +264,354 @@ export function detectHallucinatedPackages(
       }
     }
   }
+}
+
+const METHOD_PREFIX_KEYWORDS = new Set(['function', 'async', 'get', 'set', 'static']);
+
+function isIdentCharCode(code: number): boolean {
+  return (
+    (code >= 48 && code <= 57) ||
+    (code >= 65 && code <= 90) ||
+    (code >= 97 && code <= 122) ||
+    code === 95 ||
+    code === 36
+  );
+}
+
+function buildLineStarts(text: string): number[] {
+  const starts: number[] = [0];
+  for (let i = 0; i < text.length; i++) {
+    if (text.charCodeAt(i) === 10) {
+      starts.push(i + 1);
+    }
+  }
+  return starts;
+}
+
+function offsetToLine(offset: number, lineStarts: number[]): number {
+  let lo = 0;
+  let hi = lineStarts.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >>> 1;
+    if (lineStarts[mid] <= offset) {
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return Math.max(1, hi + 1);
+}
+
+function skipWsForward(str: string, idx: number): number {
+  let i = idx;
+  while (i < str.length && /\s/.test(str[i])) i++;
+  return i;
+}
+
+function skipWsBackward(str: string, idx: number): number {
+  let i = idx;
+  while (i >= 0 && /\s/.test(str[i])) i--;
+  return i;
+}
+
+function readPrevTokenInfo(str: string, idxBeforeIdent: number): {
+  prevNonWsChar: string;
+  prevNonWsIdx: number;
+  prevWord: string;
+} {
+  const prevNonWsIdx = skipWsBackward(str, idxBeforeIdent);
+  if (prevNonWsIdx < 0) {
+    return { prevNonWsChar: '', prevNonWsIdx: -1, prevWord: '' };
+  }
+  const prevNonWsChar = str[prevNonWsIdx];
+  let prevWord = '';
+  if (isIdentCharCode(str.charCodeAt(prevNonWsIdx))) {
+    let start = prevNonWsIdx;
+    while (start > 0 && isIdentCharCode(str.charCodeAt(start - 1))) {
+      start--;
+    }
+    prevWord = str.slice(start, prevNonWsIdx + 1);
+  }
+  return { prevNonWsChar, prevNonWsIdx, prevWord };
+}
+
+function findCallParenSpan(
+  maskedCode: string,
+  openParenIdx: number
+): { closeParenIdx: number; firstCommaIdx: number } | null {
+  let parenDepth = 1;
+  let braceDepth = 0;
+  let bracketDepth = 0;
+  let firstCommaIdx = -1;
+
+  for (let i = openParenIdx + 1; i < maskedCode.length; i++) {
+    const ch = maskedCode[i];
+    if (ch === '(') parenDepth++;
+    else if (ch === ')') {
+      parenDepth--;
+      if (parenDepth === 0) {
+        return { closeParenIdx: i, firstCommaIdx };
+      }
+    } else if (ch === '{') braceDepth++;
+    else if (ch === '}') {
+      if (braceDepth > 0) braceDepth--;
+    } else if (ch === '[') bracketDepth++;
+    else if (ch === ']') {
+      if (bracketDepth > 0) bracketDepth--;
+    } else if (ch === ',' && parenDepth === 1 && braceDepth === 0 && bracketDepth === 0 && firstCommaIdx === -1) {
+      firstCommaIdx = i;
+    }
+  }
+  return null;
+}
+
+function hasTernaryOrCaseColonContext(maskedCode: string, identStart: number, prevWord: string): boolean {
+  if (prevWord === 'case') return true;
+  let parenDepth = 0;
+  let bracketDepth = 0;
+  let braceDepth = 0;
+
+  for (let i = identStart - 1; i >= 0; i--) {
+    const ch = maskedCode[i];
+    if (ch === ')') parenDepth++;
+    else if (ch === '(') {
+      if (parenDepth === 0) return false;
+      parenDepth--;
+    } else if (ch === ']') bracketDepth++;
+    else if (ch === '[') {
+      if (bracketDepth === 0) return false;
+      bracketDepth--;
+    } else if (ch === '}') braceDepth++;
+    else if (ch === '{') {
+      if (braceDepth === 0) return false;
+      braceDepth--;
+    } else if (parenDepth === 0 && bracketDepth === 0 && braceDepth === 0) {
+      if (ch === ';' || ch === ',' || ch === '=') {
+        if (ch === '=' && maskedCode[i + 1] === '>') continue;
+        return false;
+      }
+      if (ch === '?') {
+        const nextCh = maskedCode[i + 1];
+        const prevCh = i > 0 ? maskedCode[i - 1] : '';
+        if (nextCh !== '.' && nextCh !== '?' && prevCh !== '?') {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+function isMethodOrFunctionDef(
+  maskedCode: string,
+  identStart: number,
+  closeParenIdx: number,
+  prevWord: string,
+  prevNonWsChar: string,
+  prevNonWsIdx: number
+): boolean {
+  if (METHOD_PREFIX_KEYWORDS.has(prevWord)) {
+    return true;
+  }
+  if (prevNonWsChar === '*') {
+    const beforeStar = readPrevTokenInfo(maskedCode, prevNonWsIdx - 1);
+    if (beforeStar.prevWord === 'function' || METHOD_PREFIX_KEYWORDS.has(beforeStar.prevWord)) {
+      return true;
+    }
+  }
+
+  const afterParen = skipWsForward(maskedCode, closeParenIdx + 1);
+  if (afterParen >= maskedCode.length) return false;
+  if (maskedCode[afterParen] === '{') return true;
+  if (maskedCode[afterParen] !== ':') return false;
+  if (hasTernaryOrCaseColonContext(maskedCode, identStart, prevWord)) return false;
+
+  let parenDepth = 0;
+  let bracketDepth = 0;
+  let angleDepth = 0;
+
+  for (let i = afterParen + 1; i < maskedCode.length; i++) {
+    const ch = maskedCode[i];
+    if (ch === '(') parenDepth++;
+    else if (ch === ')') {
+      if (parenDepth === 0) return false;
+      parenDepth--;
+    } else if (ch === '[') bracketDepth++;
+    else if (ch === ']') {
+      if (bracketDepth === 0) return false;
+      bracketDepth--;
+    } else if (ch === '<') angleDepth++;
+    else if (ch === '>') {
+      if (maskedCode[i - 1] !== '=' && angleDepth > 0) angleDepth--;
+    } else if (parenDepth === 0 && bracketDepth === 0 && angleDepth === 0) {
+      if (ch === '{' || ch === ';') return true;
+      if (ch === ',' || (ch === '=' && maskedCode[i + 1] !== '>')) return false;
+    }
+  }
+  return false;
+}
+
+function findLiteralsInSpan(
+  stringLiterals: ReadonlyArray<ExtractedStringLiteral>,
+  rangeStart: number,
+  rangeEnd: number
+): ExtractedStringLiteral[] {
+  let lo = 0;
+  let hi = stringLiterals.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (stringLiterals[mid].startOffset < rangeStart) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  const matches: ExtractedStringLiteral[] = [];
+  for (let i = lo; i < stringLiterals.length; i++) {
+    const lit = stringLiterals[i];
+    if (lit.startOffset >= rangeEnd) break;
+    if (lit.endOffset <= rangeEnd) {
+      matches.push(lit);
+    }
+  }
+  return matches;
+}
+
+function hasShadowedRequireInCode(maskedCode: string): boolean {
+  let pos = 0;
+  while (pos < maskedCode.length) {
+    const idx = maskedCode.indexOf('require', pos);
+    if (idx === -1) break;
+    pos = idx + 7;
+
+    const beforeOk = idx === 0 || !isIdentCharCode(maskedCode.charCodeAt(idx - 1));
+    const afterOk = idx + 7 >= maskedCode.length || !isIdentCharCode(maskedCode.charCodeAt(idx + 7));
+    if (!beforeOk || !afterOk) continue;
+
+    const prev = readPrevTokenInfo(maskedCode, idx - 1);
+    if (prev.prevNonWsChar === '.') continue; // obj.require or foo?.require property name
+    if (prev.prevWord === 'typeof') continue; // typeof require check
+
+    const afterIdx = skipWsForward(maskedCode, idx + 7);
+    const nextCh = maskedCode[afterIdx];
+    if (nextCh === '.' || (nextCh === '?' && maskedCode[afterIdx + 1] === '.')) {
+      continue; // require.resolve, require.cache, require.main, etc.
+    }
+    if (nextCh === '(') {
+      const span = findCallParenSpan(maskedCode, afterIdx);
+      if (
+        span &&
+        !isMethodOrFunctionDef(
+          maskedCode,
+          idx,
+          span.closeParenIdx,
+          prev.prevWord,
+          prev.prevNonWsChar,
+          prev.prevNonWsIdx
+        )
+      ) {
+        continue; // valid call require(...)
+      }
+    }
+    return true;
+  }
+  return false;
+}
+
+function scanDynamicKind(
+  kind: 'import' | 'require',
+  maskedCode: string,
+  stringLiterals: ReadonlyArray<ExtractedStringLiteral>,
+  lineStarts: number[],
+  displayFile: string,
+  inlineFindings: InlineFinding[]
+): void {
+  const token = kind;
+  const tokenLen = token.length;
+  let pos = 0;
+
+  while (pos < maskedCode.length) {
+    const idx = maskedCode.indexOf(token, pos);
+    if (idx === -1) break;
+    pos = idx + tokenLen;
+
+    const beforeOk = idx === 0 || !isIdentCharCode(maskedCode.charCodeAt(idx - 1));
+    const afterOk = idx + tokenLen >= maskedCode.length || !isIdentCharCode(maskedCode.charCodeAt(idx + tokenLen));
+    if (!beforeOk || !afterOk) continue;
+
+    const prev = readPrevTokenInfo(maskedCode, idx - 1);
+    if (prev.prevNonWsChar === '.') continue; // obj.import(x), module.require(x), foo?.require(x)
+
+    const afterIdx = skipWsForward(maskedCode, idx + tokenLen);
+    if (maskedCode[afterIdx] !== '(') continue;
+
+    const span = findCallParenSpan(maskedCode, afterIdx);
+    if (!span) continue;
+
+    if (isMethodOrFunctionDef(maskedCode, idx, span.closeParenIdx, prev.prevWord, prev.prevNonWsChar, prev.prevNonWsIdx)) {
+      continue;
+    }
+
+    const argStart = afterIdx + 1;
+    const firstArgEnd = span.firstCommaIdx !== -1 ? span.firstCommaIdx : span.closeParenIdx;
+    const argMasked = maskedCode.slice(argStart, firstArgEnd).trim();
+    const literalsInArg = findLiteralsInSpan(stringLiterals, argStart, firstArgEnd);
+
+    // Skip zero-argument calls: import() / require()
+    if (span.firstCommaIdx === -1 && argMasked.length === 0 && literalsInArg.length === 0) {
+      continue;
+    }
+
+    // Literal specifier iff first arg has zero residual code tokens and exactly one literal without ${...}
+    const validCommaDelim = kind === 'import' || span.firstCommaIdx === -1;
+    const isSingleLiteral =
+      validCommaDelim &&
+      argMasked.length === 0 &&
+      literalsInArg.length === 1 &&
+      !literalsInArg[0].hasInterpolation;
+
+    if (isSingleLiteral) {
+      continue;
+    }
+
+    const line = offsetToLine(idx, lineStarts);
+    const ruleId: DevGuardRuleId = kind === 'import' ? 'DG004-DYN-01' : 'DG004-DYN-02';
+    const callLabel = kind === 'import' ? 'import()' : 'require()';
+    inlineFindings.push({
+      ruleId,
+      line,
+      severity: 'warning',
+      scoring: false,
+      message: `[${ruleId}] Unanalyzable dynamic ${callLabel} specifier at ${displayFile}:${line} (supply-chain static verification skipped; allowlist in base-branch .devguard.json if intentional).`,
+    });
+  }
+}
+
+/**
+ * Lexically detects non-literal `import()` (`DG004-DYN-01`) and `require()` (`DG004-DYN-02`)
+ * specifiers as non-scoring warnings (`scoring: false`), applying syntactic and file-level
+ * conservative shadow guards to prevent false positives.
+ */
+export function detectDynamicModuleSpecifiers(
+  maskedCode: string,
+  stringLiterals: ReadonlyArray<ExtractedStringLiteral>,
+  options: AuditAnalyzeOptions | undefined,
+  inlineFindings: InlineFinding[]
+): { dynScopeUncertain: number } {
+  const lineStarts = buildLineStarts(maskedCode);
+  const rawFile = (options?.filePath || 'input').replace(/\\/g, '/');
+  const displayFile = redactSecretsPreservingLayout(rawFile);
+
+  scanDynamicKind('import', maskedCode, stringLiterals, lineStarts, displayFile, inlineFindings);
+
+  let dynScopeUncertain = 0;
+  if (hasShadowedRequireInCode(maskedCode)) {
+    dynScopeUncertain = 1;
+  } else {
+    scanDynamicKind('require', maskedCode, stringLiterals, lineStarts, displayFile, inlineFindings);
+  }
+
+  return { dynScopeUncertain };
 }
 
 function stripBalancedConsoleCalls(body: string): string {

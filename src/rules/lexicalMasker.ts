@@ -1,12 +1,16 @@
 export type DevGuardRuleId =
   | 'DG001' | 'DG002' | 'DG003' | 'DG004'
+  | 'DG004-DYN-01' | 'DG004-DYN-02'
   | 'DG005' | 'DG006' | 'DG007' | 'DG008';
+
+export type AllowlistRuleId = 'DG004' | 'DG004-DYN-01' | 'DG004-DYN-02' | 'DG006';
 
 export interface InlineFinding {
   ruleId: DevGuardRuleId;
   line: number;
   endLine?: number;
   severity: 'error' | 'warning';
+  scoring?: boolean;
   message: string;
   suggestion?: string;
 }
@@ -27,7 +31,7 @@ export interface AuditAnalyzeOptions {
   declaredDependencies?: ReadonlySet<string> | readonly string[];
   builtinModules?: readonly string[];
   subpathImports?: Record<string, unknown>;
-  externalAllowlist?: ReadonlyArray<{ rule: 'DG004' | 'DG006'; reason: string }>;
+  externalAllowlist?: ReadonlyArray<{ rule: AllowlistRuleId; reason: string }>;
 }
 
 export interface LineFinding {
@@ -56,8 +60,8 @@ const REGEX_PRECEDING_CHARS = new Set([
 const REGEX_PRECEDING_KEYWORDS = new Set([
   'return', 'typeof', 'void', 'delete', 'await', 'throw', 'case', 'in', 'of', 'instanceof', 'new', 'else', 'do', 'yield', 'export', 'default',
 ]);
-const SUPPRESSION_COMMENT_RE = /\bdevguard-ignore\s+(DG\d{3})\s*:\s*([^\r\n]+)/i;
-const VALID_DG_RULE_RE = /^DG00[1-8]$/;
+const SUPPRESSION_COMMENT_RE = /\bdevguard-ignore\s+(DG\d{3}(?:-DYN-0[12])?)\s*:\s*([^\r\n]+)/i;
+const VALID_DG_RULE_RE = /^(?:DG00[1-8]|DG004-DYN-0[12])$/;
 export const MEANINGFUL_SUPPRESSION_REASON_RE = /[A-Za-z]{2,}\s+[A-Za-z]{2,}/;
 
 /** Validates that a suppression justification has >= 8 chars and at least two alphabetic words. */
@@ -291,4 +295,85 @@ export function damerauLevenshtein(a: string, b: string): number {
 export function isCommentOrEmptyLine(line: string): boolean {
   const t = line.trim();
   return !t || t.startsWith('//') || t.startsWith('#') || t.startsWith('/*') || t.startsWith('*') || t.startsWith('"""') || t.startsWith("'''");
+}
+
+export const MAX_GLOB_PATTERN_LENGTH = 512;
+
+function normalizePosixGlobInput(raw: string): string {
+  let norm = raw.trim().replace(/\\/g, '/');
+  while (norm.startsWith('./')) {
+    norm = norm.slice(2);
+  }
+  return norm;
+}
+
+function matchSegmentGlob(patSeg: string, targetSeg: string): boolean {
+  let p = 0;
+  let t = 0;
+  let starP = -1;
+  let starT = 0;
+
+  while (t < targetSeg.length) {
+    const pch = patSeg[p];
+    if (p < patSeg.length && (pch === '?' || pch === targetSeg[t])) {
+      p++;
+      t++;
+    } else if (p < patSeg.length && pch === '*') {
+      while (p < patSeg.length && patSeg[p] === '*') {
+        p++;
+      }
+      starP = p - 1;
+      starT = t;
+    } else if (starP !== -1) {
+      p = starP + 1;
+      starT++;
+      t = starT;
+    } else {
+      return false;
+    }
+  }
+
+  while (p < patSeg.length && patSeg[p] === '*') {
+    p++;
+  }
+  return p === patSeg.length;
+}
+
+/**
+ * Matches a POSIX repo-relative file path against a glob pattern (`?`, `*`, `**`)
+ * in guaranteed linear O(|pattern| * |targetPath|) time without `new RegExp`.
+ */
+export function matchLinearGlob(pattern: string, targetPath: string): boolean {
+  if (typeof pattern !== 'string' || typeof targetPath !== 'string') return false;
+  const normPattern = normalizePosixGlobInput(pattern);
+  const normTarget = normalizePosixGlobInput(targetPath);
+  if (!normPattern || !normTarget || normPattern.length > MAX_GLOB_PATTERN_LENGTH) {
+    return false;
+  }
+
+  const pSegs = normPattern.split('/');
+  const tSegs = normTarget.split('/');
+
+  let prev = new Array<boolean>(tSegs.length + 1).fill(false);
+  prev[0] = true;
+
+  for (let i = 0; i < pSegs.length; i++) {
+    const patSeg = pSegs[i];
+    const next = new Array<boolean>(tSegs.length + 1).fill(false);
+    if (patSeg === '**') {
+      next[0] = prev[0];
+      for (let j = 1; j <= tSegs.length; j++) {
+        next[j] = prev[j] || next[j - 1];
+      }
+    } else {
+      for (let j = 1; j <= tSegs.length; j++) {
+        if (prev[j - 1] && matchSegmentGlob(patSeg, tSegs[j - 1])) {
+          next[j] = true;
+        }
+      }
+    }
+    prev = next;
+  }
+
+  return prev[tSegs.length];
 }

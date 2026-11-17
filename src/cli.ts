@@ -5,21 +5,27 @@ import { execFileSync } from 'node:child_process';
 import { builtinModules } from 'node:module';
 import {
   ANALYZABLE_EXTENSIONS,
+  MAX_GLOB_PATTERN_LENGTH,
   PARTIAL_ANALYSIS_EXTENSIONS,
   analyzeCodeDeterministically,
   hasAnalyzableExtension,
   hasPartialAnalysisExtension,
   isValidSuppressionReason,
+  matchLinearGlob,
   prepareRedactedCodeForLlm,
   redactSecretsPreservingLayout,
+  type AllowlistRuleId,
   type ParsedDevGuardReport,
 } from './devguardAnalyzer.js';
 
 export {
   ANALYZABLE_EXTENSIONS,
+  MAX_GLOB_PATTERN_LENGTH,
   PARTIAL_ANALYSIS_EXTENSIONS,
   hasAnalyzableExtension,
   hasPartialAnalysisExtension,
+  matchLinearGlob,
+  type AllowlistRuleId,
 };
 import {
   INVARIANT_MISMATCH_SENTINEL,
@@ -95,7 +101,7 @@ export interface CliAuditResult {
 let loggedRedactedTransmissionNotice = false;
 
 export interface AllowlistRuleEntry {
-  rule: 'DG004' | 'DG006';
+  rule: AllowlistRuleId;
   reason: string;
 }
 
@@ -128,19 +134,22 @@ function readBeforeShaFromEventFile(eventPath: string | undefined): string | und
 }
 
 function isValidAllowlistPathKey(rawKey: string): string | null {
-  const norm = rawKey.trim().replace(/\\/g, '/').replace(/^\.\//, '');
+  let norm = rawKey.trim().replace(/\\/g, '/');
+  while (norm.startsWith('./')) {
+    norm = norm.slice(2);
+  }
   if (
     !norm ||
+    norm.length > MAX_GLOB_PATTERN_LENGTH ||
+    norm.startsWith('/') ||
+    norm.endsWith('/') ||
     norm === '*' ||
     norm === '**' ||
-    norm.startsWith('**/') ||
-    norm.startsWith('/') ||
-    norm.split('/').includes('..')
+    norm.endsWith('/*') ||
+    norm.split('/').includes('..') ||
+    !norm.replace(/[\/*?]/g, '')
   ) {
     return null;
-  }
-  if (norm.includes('*')) {
-    return /^[^*]+\/\*\*$/.test(norm) ? norm : null;
   }
   return norm;
 }
@@ -272,7 +281,12 @@ export function loadVerifiedAllowlist(options?: LoadAllowlistOptions): VerifiedA
     const accepted: AllowlistRuleEntry[] = [];
     for (const item of rawEntries) {
       const candidate = item as { rule?: unknown; reason?: unknown };
-      if (candidate.rule !== 'DG004' && candidate.rule !== 'DG006') {
+      if (
+        candidate.rule !== 'DG004' &&
+        candidate.rule !== 'DG004-DYN-01' &&
+        candidate.rule !== 'DG004-DYN-02' &&
+        candidate.rule !== 'DG006'
+      ) {
         invalidAllowlistEntries.push(`Rejected disallowed allowlist rule "${String(candidate.rule)}" for "${validKey}"`);
         continue;
       }
@@ -280,7 +294,7 @@ export function loadVerifiedAllowlist(options?: LoadAllowlistOptions): VerifiedA
         invalidAllowlistEntries.push(`Rejected short/missing reason for ${candidate.rule} under "${validKey}"`);
         continue;
       }
-      accepted.push({ rule: candidate.rule, reason: candidate.reason.trim() });
+      accepted.push({ rule: candidate.rule as AllowlistRuleId, reason: candidate.reason.trim() });
     }
     if (accepted.length > 0) {
       rulesByPath.set(validKey, accepted);
@@ -300,12 +314,7 @@ export function matchAllowlistForFile(
   const matched: AllowlistRuleEntry[] = [];
 
   for (const [pattern, entries] of allowlist.rulesByPath.entries()) {
-    if (pattern.endsWith('/**')) {
-      const dirPrefix = pattern.slice(0, -2); // keep trailing '/'
-      if (posixRel.startsWith(dirPrefix)) {
-        matched.push(...entries);
-      }
-    } else if (posixRel === pattern) {
+    if (matchLinearGlob(pattern, posixRel)) {
       matched.push(...entries);
     }
   }
@@ -1032,7 +1041,7 @@ export async function auditClassifiedFiles(
       );
       const report = result.parsedReport;
       const score = report.skor;
-      const hasInlineErrors = report.inlineFindings?.some((f) => f.severity === 'error') ?? false;
+      const hasInlineErrors = report.inlineFindings?.some((f) => f.severity === 'error' && f.scoring !== false) ?? false;
       const passed = !(score.totalScore < minScore || (!report.isHardened && score.security < 70) || hasInlineErrors);
 
       const summaryItem: FileAuditSummary = {

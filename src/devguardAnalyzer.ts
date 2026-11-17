@@ -1,10 +1,13 @@
 import {
+  MAX_GLOB_PATTERN_LENGTH,
   MEANINGFUL_SUPPRESSION_REASON_RE,
   analyzeLexicalStructure,
   calculateShannonEntropy,
   damerauLevenshtein,
   isCommentOrEmptyLine,
   isValidSuppressionReason,
+  matchLinearGlob,
+  type AllowlistRuleId,
   type AuditAnalyzeOptions,
   type DevGuardRuleId,
   type InlineFinding,
@@ -13,6 +16,7 @@ import {
 } from './rules/lexicalMasker.js';
 import {
   POPULAR_NPM_PACKAGES,
+  detectDynamicModuleSpecifiers,
   detectHallucinatedPackages,
   detectNonAtomicBalanceMutations,
   detectSwallowedExceptions,
@@ -27,14 +31,16 @@ import {
   type PrepareLlmOptions,
 } from './rules/secretAndResilienceRules.js';
 
-export type { AuditAnalyzeOptions, DevGuardRuleId, InlineFinding, ParsedSuppression, PrepareLlmOptions };
+export type { AllowlistRuleId, AuditAnalyzeOptions, DevGuardRuleId, InlineFinding, ParsedSuppression, PrepareLlmOptions };
 export {
   DG007_PROVIDER_PATTERNS,
+  MAX_GLOB_PATTERN_LENGTH,
   MEANINGFUL_SUPPRESSION_REASON_RE,
   POPULAR_NPM_PACKAGES,
   analyzeLexicalStructure,
   calculateShannonEntropy,
   damerauLevenshtein,
+  detectDynamicModuleSpecifiers,
   detectHallucinatedPackages,
   detectHardcodedSecrets,
   detectMissingTimeoutsAndLoops,
@@ -42,6 +48,7 @@ export {
   detectSwallowedExceptions,
   findResidualSecretLikeTokens,
   isValidSuppressionReason,
+  matchLinearGlob,
   prepareRedactedCodeForLlm,
   redactSecretsPreservingLayout,
 };
@@ -114,6 +121,7 @@ export interface ParsedDevGuardReport {
   isHardened?: boolean;
   inlineFindings?: InlineFinding[];
   suppressions?: ParsedSuppression[];
+  dynScopeUncertain?: number;
 }
 
 export type AuditReport = ParsedDevGuardReport;
@@ -338,6 +346,10 @@ function isInlineSuppressionPermitted(ruleId: DevGuardRuleId, severity?: 'error'
   return ruleId === 'DG005' && severity === 'warning';
 }
 
+function isDynamicSpecifierRule(ruleId: DevGuardRuleId): boolean {
+  return ruleId === 'DG004-DYN-01' || ruleId === 'DG004-DYN-02';
+}
+
 function applySuppressionPolicy(
   parsedSuppressions: ParsedSuppression[],
   options: AuditAnalyzeOptions | undefined,
@@ -347,18 +359,31 @@ function applySuppressionPolicy(
   const activeSuppressions: ParsedSuppression[] = [];
   const suppressedInlineKeys = new Set<string>();
   const filePath = options?.filePath;
-  const externalRules = new Map<'DG004' | 'DG006', string>();
+  const externalRules = new Map<AllowlistRuleId, string>();
 
   for (const ext of options?.externalAllowlist || []) {
-    if ((ext.rule === 'DG004' || ext.rule === 'DG006') && !externalRules.has(ext.rule)) {
+    if (
+      (ext.rule === 'DG004' ||
+        ext.rule === 'DG004-DYN-01' ||
+        ext.rule === 'DG004-DYN-02' ||
+        ext.rule === 'DG006') &&
+      !externalRules.has(ext.rule)
+    ) {
       externalRules.set(ext.rule, ext.reason);
     }
   }
 
   for (let i = inlineFindings.length - 1; i >= 0; i--) {
     const f = inlineFindings[i];
-    const matchingInSource = parsedSuppressions.find((s) => s.ruleId === f.ruleId && s.targetLine === f.line);
-    const matchingExtReason = f.ruleId === 'DG004' || f.ruleId === 'DG006' ? externalRules.get(f.ruleId) : undefined;
+    const matchingInSource = parsedSuppressions.find(
+      (s) =>
+        s.targetLine === f.line &&
+        (s.ruleId === f.ruleId || (s.ruleId === 'DG004' && isDynamicSpecifierRule(f.ruleId)))
+    );
+    const matchingExtReason =
+      f.ruleId === 'DG004' || f.ruleId === 'DG004-DYN-01' || f.ruleId === 'DG004-DYN-02' || f.ruleId === 'DG006'
+        ? (externalRules.get(f.ruleId) ?? (isDynamicSpecifierRule(f.ruleId) ? externalRules.get('DG004') : undefined))
+        : undefined;
 
     if (matchingExtReason) {
       activeSuppressions.push({
@@ -1284,9 +1309,16 @@ export function analyzeCodeDeterministically(
     });
   }
 
-  // 3. v1.2.0 Deterministic AI-Slop & Vibe-Coding Detectors (DG004, DG005, DG006, DG008)
+  // 3. v1.2.0 Deterministic AI-Slop & Vibe-Coding Detectors (DG004, DG004-DYN-01/02, DG005, DG006, DG008)
+  let dynScopeUncertain = 0;
   if (!isPython) {
     detectHallucinatedPackages(execLines, maskedLines, options, findings, inlineFindings);
+    ({ dynScopeUncertain } = detectDynamicModuleSpecifiers(
+      lexical.maskedCode,
+      lexical.stringLiterals,
+      options,
+      inlineFindings
+    ));
     detectSwallowedExceptions(code, findings, inlineFindings);
     detectNonAtomicBalanceMutations(rawLines, findings, inlineFindings);
     detectMissingTimeoutsAndLoops(code, lexical.maskedCode, rawLines, findings, inlineFindings);
@@ -1593,5 +1625,6 @@ ${tesMarkdown}`;
     isHardened,
     inlineFindings: inlineFindings.length > 0 ? inlineFindings : undefined,
     suppressions: activeSuppressions.length > 0 ? activeSuppressions : undefined,
+    dynScopeUncertain: dynScopeUncertain > 0 ? dynScopeUncertain : undefined,
   };
 }

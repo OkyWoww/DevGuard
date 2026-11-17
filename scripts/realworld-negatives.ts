@@ -82,6 +82,8 @@ function main(): void {
     DG002: 0,
     DG003: 0,
     DG004: 0,
+    'DG004-DYN-01': 0,
+    'DG004-DYN-02': 0,
     DG005: 0,
     DG006: 0,
     DG007: 0,
