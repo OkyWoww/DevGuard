@@ -389,12 +389,13 @@ test('4. end-to-end cli.ts exits with code 1 after writing valid devguard-result
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-cli-e2e-'));
 
   try {
-    const fixturePath = path.join(tempDir, 'vulnerable_fixture.py');
+    const fixturePath = path.join(tempDir, 'vulnerable_fixture.ts');
     fs.writeFileSync(
       fixturePath,
       [
-        'def execute_user_expr(user_input):',
-        '    return eval(user_input)',
+        'export function executeUserExpr(userInput: string) {',
+        '  return eval(userInput);',
+        '}',
         '',
       ].join('\n'),
       'utf-8'
@@ -444,7 +445,7 @@ test('4. end-to-end cli.ts exits with code 1 after writing valid devguard-result
 
     const errorFinding = results.find((r) => r.ruleId === 'DG001' && r.level === 'error');
     assert.ok(errorFinding, 'Expected DG001 error finding in SARIF output');
-    assert.equal(errorFinding.locations[0].physicalLocation.artifactLocation.uri, 'vulnerable_fixture.py');
+    assert.equal(errorFinding.locations[0].physicalLocation.artifactLocation.uri, 'vulnerable_fixture.ts');
     assert.ok(errorFinding.locations[0].physicalLocation.region.startLine >= 1);
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
@@ -2628,6 +2629,7 @@ test('35. Pre-filter classifier preserves count invariant across mixed languages
   try {
     const repoDir = path.join(tempDir, 'repo');
     fs.mkdirSync(path.join(repoDir, 'src'), { recursive: true });
+    fs.mkdirSync(path.join(repoDir, 'tools'), { recursive: true });
     fs.mkdirSync(path.join(repoDir, 'scripts'), { recursive: true });
     fs.mkdirSync(path.join(repoDir, 'cmd'), { recursive: true });
     fs.mkdirSync(path.join(repoDir, 'notebooks'), { recursive: true });
@@ -2635,7 +2637,8 @@ test('35. Pre-filter classifier preserves count invariant across mixed languages
 
     fs.writeFileSync(path.join(repoDir, 'src', 'app.ts'), 'export const ok = 1;\n', 'utf-8');
     fs.writeFileSync(path.join(repoDir, 'src', 'util.mjs'), 'export const u = 2;\n', 'utf-8');
-    fs.writeFileSync(path.join(repoDir, 'scripts', 'deploy.py'), 'print("deploy")\n', 'utf-8');
+    fs.writeFileSync(path.join(repoDir, 'tools', 'deploy.py'), 'print("deploy")\n', 'utf-8');
+    fs.writeFileSync(path.join(repoDir, 'scripts', 'internal.py'), 'print("excluded")\n', 'utf-8');
     fs.writeFileSync(path.join(repoDir, 'cmd', 'main.go'), 'package main\nfunc main() {}\n', 'utf-8');
     fs.writeFileSync(path.join(repoDir, 'src', 'App.vue'), '<script setup>\nconst a = 1;\n</script>\n', 'utf-8');
     fs.writeFileSync(path.join(repoDir, 'src', 'Widget.svelte'), '<script>\nlet x = 1;\n</script>\n', 'utf-8');
@@ -2657,21 +2660,23 @@ test('35. Pre-filter classifier preserves count invariant across mixed languages
 
     // Update files and delete one tracked file to verify diff in-scope BEFORE extension filter
     fs.writeFileSync(path.join(repoDir, 'src', 'app.ts'), 'export const ok = 2;\n', 'utf-8');
-    fs.writeFileSync(path.join(repoDir, 'scripts', 'deploy.py'), 'print("deploy v2")\n', 'utf-8');
+    fs.writeFileSync(path.join(repoDir, 'tools', 'deploy.py'), 'print("deploy v2")\n', 'utf-8');
+    fs.writeFileSync(path.join(repoDir, 'scripts', 'internal.py'), 'print("excluded v2")\n', 'utf-8');
     fs.writeFileSync(path.join(repoDir, 'notebooks', 'exp.ipynb'), '{"cells":[1]}\n', 'utf-8');
     fs.unlinkSync(path.join(repoDir, 'cmd', 'main.go'));
     git(['add', '-A']);
     git(['commit', '-m', 'mixed diff with deleted go file']);
 
     const diffInScope = discoverInScopeFiles('modified', repoDir);
-    assert.ok(diffInScope.includes('scripts/deploy.py'), 'Classifier must receive .py before extension filter');
+    assert.ok(diffInScope.includes('tools/deploy.py'), 'Classifier must receive .py before extension filter');
     assert.ok(diffInScope.includes('notebooks/exp.ipynb'), 'Classifier must receive .ipynb before extension filter');
     assert.ok(diffInScope.includes('cmd/main.go'), 'Classifier must receive deleted file from diff');
+    assert.ok(!diffInScope.includes('scripts/internal.py'), 'Auto-discovery must exclude scripts/** uniformly');
 
     const fullMixedList = [
       'src/app.ts',
       'src/util.mjs',
-      'scripts/deploy.py',
+      'tools/deploy.py',
       'src/App.vue',
       'src/Widget.svelte',
       'src/Page.astro',
@@ -2704,10 +2709,10 @@ test('35. Pre-filter classifier preserves count invariant across mixed languages
       [
         ['bin/runner', 'unsupported_language'],
         ['notebooks/exp.ipynb', 'unsupported_language'],
-        ['scripts/deploy.py', 'unsupported_language'],
         ['src/App.vue', 'unsupported_language'],
         ['src/Page.astro', 'unsupported_language'],
         ['src/Widget.svelte', 'unsupported_language'],
+        ['tools/deploy.py', 'unsupported_language'],
       ]
     );
     assert.deepEqual(
@@ -2776,7 +2781,7 @@ test('37. PR containing only .py files produces N/A score, skips min_score check
 
   try {
     const repoDir = path.join(tempDir, 'repo');
-    fs.mkdirSync(path.join(repoDir, 'scripts'), { recursive: true });
+    fs.mkdirSync(path.join(repoDir, 'tools'), { recursive: true });
     fs.writeFileSync(path.join(repoDir, 'README.md'), '# init\n', 'utf-8');
     const git = (args: string[]) => spawnSync('git', args, { cwd: repoDir, encoding: 'utf-8' });
     git(['init']);
@@ -2785,8 +2790,8 @@ test('37. PR containing only .py files produces N/A score, skips min_score check
     git(['add', '.']);
     git(['commit', '-m', 'init']);
 
-    fs.writeFileSync(path.join(repoDir, 'scripts', 'deploy.py'), 'def deploy():\n    return True\n', 'utf-8');
-    fs.writeFileSync(path.join(repoDir, 'scripts', 'migrate.py'), 'def migrate():\n    return True\n', 'utf-8');
+    fs.writeFileSync(path.join(repoDir, 'tools', 'deploy.py'), 'def deploy():\n    return True\n', 'utf-8');
+    fs.writeFileSync(path.join(repoDir, 'tools', 'migrate.py'), 'def migrate():\n    return True\n', 'utf-8');
     git(['add', '.']);
     git(['commit', '-m', 'add python scripts only']);
 
@@ -2837,11 +2842,13 @@ test('37. PR containing only .py files produces N/A score, skips min_score check
 
     assert.equal(postedBodies.length, 1);
     const prBody = postedBodies[0];
+    assert.ok(prBody.includes('⚠️ NOT ANALYZED — no supported code files'));
+    assert.ok(!prBody.includes('✅ PASSED (READY TO MERGE)'), 'Must never show PASSED badge when 0 files were analyzed');
     assert.ok(prBody.includes('DevGuard v1.3.0 — Score: N/A  (analyzed 0 of 2 code files · 2 skipped)'));
     assert.ok(prBody.includes('- Analyzed: 0'));
     assert.ok(prBody.includes('- Skipped: 2'));
-    assert.ok(prBody.includes('scripts/deploy.py — Skipped: Unsupported language'));
-    assert.ok(prBody.includes('scripts/migrate.py — Skipped: Unsupported language'));
+    assert.ok(prBody.includes('tools/deploy.py — Skipped: Unsupported language'));
+    assert.ok(prBody.includes('tools/migrate.py — Skipped: Unsupported language'));
     assert.ok(!prBody.includes('100/100'), 'Must never display 100/100 when 0 files were analyzed');
 
     const sarif = JSON.parse(fs.readFileSync(sarifOut, 'utf-8'));
@@ -2910,7 +2917,6 @@ test('39. Mixed PR (.ts + .py + >1MiB .js + .md) computes score solely from anal
   try {
     const repoDir = path.join(tempDir, 'repo');
     fs.mkdirSync(path.join(repoDir, 'src'), { recursive: true });
-    fs.mkdirSync(path.join(repoDir, 'scripts'), { recursive: true });
     fs.mkdirSync(path.join(repoDir, 'tools'), { recursive: true });
     fs.writeFileSync(path.join(repoDir, 'README.md'), '# init\n', 'utf-8');
 
@@ -2936,7 +2942,7 @@ test('39. Mixed PR (.ts + .py + >1MiB .js + .md) computes score solely from anal
     const expectedTsScore = analyzeCodeDeterministically(safeTsSource, { filePath: 'src/math.ts' }).skor.totalScore;
 
     fs.writeFileSync(path.join(repoDir, 'src', 'math.ts'), safeTsSource, 'utf-8');
-    fs.writeFileSync(path.join(repoDir, 'scripts', 'deploy.py'), 'print("ok")\n', 'utf-8');
+    fs.writeFileSync(path.join(repoDir, 'tools', 'deploy.py'), 'print("ok")\n', 'utf-8');
     const pad = '// bundle padding 0123456789abcdef\n';
     fs.writeFileSync(
       path.join(repoDir, 'tools', 'big.js'),
@@ -2993,13 +2999,14 @@ test('39. Mixed PR (.ts + .py + >1MiB .js + .md) computes score solely from anal
 
     assert.equal(postedBodies.length, 1);
     const prBody = postedBodies[0];
+    assert.ok(prBody.includes('✅ PASSED (READY TO MERGE)'));
     assert.ok(
       prBody.includes(`DevGuard v1.3.0 — Score: ${expectedTsScore}/100  (analyzed 1 of 3 code files · 2 skipped)`),
       `Unexpected headline in PR body:\n${prBody}`
     );
     assert.ok(prBody.includes('- Analyzed: 1'));
     assert.ok(prBody.includes('- Skipped: 2'));
-    assert.ok(prBody.includes('scripts/deploy.py — Skipped: Unsupported language'));
+    assert.ok(prBody.includes('tools/deploy.py — Skipped: Unsupported language'));
     assert.ok(prBody.includes('tools/big.js — Skipped: File too large (> 1 MiB)'));
     assert.ok(prBody.includes('- Ignored (non-code): 1'));
   } finally {
@@ -3057,7 +3064,7 @@ test('40. Analyzed JS/TS rule outputs remain identical to baseline v1.2.1 and sh
   }
 });
 
-test('41. SARIF emits runs[0].invocations[0].toolExecutionNotifications with level note without altering results count', () => {
+test('41. SARIF emits runs[0].invocations[0].toolExecutionNotifications with note/error levels and executionSuccessful semantics without altering results count', () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-sarif-notif-'));
   try {
     const summary: FileAuditSummary = {
@@ -3074,30 +3081,48 @@ test('41. SARIF emits runs[0].invocations[0].toolExecutionNotifications with lev
       ],
     };
 
-    const skippedItems: SkippedFileReportItem[] = [
-      { filePath: 'scripts\\deploy.py', reason: 'unsupported_language' },
+    const nonErrorSkipped: SkippedFileReportItem[] = [
+      { filePath: 'tools\\deploy.py', reason: 'unsupported_language' },
       { filePath: '.\\tools\\big.js', reason: 'file_too_large' },
+    ];
+    const withErrorsSkipped: SkippedFileReportItem[] = [
+      ...nonErrorSkipped,
       { filePath: 'src\\broken.ts', reason: 'parse_error' },
       { filePath: 'src\\crash.ts', reason: 'internal_error' },
     ];
 
     const baselineSarifPath = path.join(tempDir, 'baseline.sarif');
-    const withSkippedSarifPath = path.join(tempDir, 'with-skipped.sarif');
+    const nonErrorSarifPath = path.join(tempDir, 'non-error.sarif');
+    const withErrorsSarifPath = path.join(tempDir, 'with-errors.sarif');
     generateSarifReport([summary], baselineSarifPath);
-    generateSarifReport([summary], withSkippedSarifPath, skippedItems);
+    generateSarifReport([summary], nonErrorSarifPath, nonErrorSkipped);
+    generateSarifReport([summary], withErrorsSarifPath, withErrorsSkipped);
 
     const baselineSarif = JSON.parse(fs.readFileSync(baselineSarifPath, 'utf-8'));
-    const withSkippedSarif = JSON.parse(fs.readFileSync(withSkippedSarifPath, 'utf-8'));
+    const nonErrorSarif = JSON.parse(fs.readFileSync(nonErrorSarifPath, 'utf-8'));
+    const withErrorsSarif = JSON.parse(fs.readFileSync(withErrorsSarifPath, 'utf-8'));
 
     assert.equal(
-      withSkippedSarif.runs[0].results.length,
+      nonErrorSarif.runs[0].results.length,
       baselineSarif.runs[0].results.length,
       'Skipped files must never add items to SARIF results[]'
     );
-    assert.equal(withSkippedSarif.runs[0].invocations.length, 1);
-    assert.equal(withSkippedSarif.runs[0].invocations[0].executionSuccessful, true);
+    assert.equal(nonErrorSarif.runs[0].invocations.length, 1);
+    assert.equal(nonErrorSarif.runs[0].invocations[0].executionSuccessful, true);
+    assert.deepEqual(
+      nonErrorSarif.runs[0].invocations[0].toolExecutionNotifications.map((n: { level: string }) => n.level),
+      ['note', 'note']
+    );
 
-    const notifications = withSkippedSarif.runs[0].invocations[0].toolExecutionNotifications as Array<{
+    assert.equal(
+      withErrorsSarif.runs[0].results.length,
+      baselineSarif.runs[0].results.length,
+      'Skipped files with parse/internal errors must still not add items to SARIF results[]'
+    );
+    assert.equal(withErrorsSarif.runs[0].invocations.length, 1);
+    assert.equal(withErrorsSarif.runs[0].invocations[0].executionSuccessful, false);
+
+    const notifications = withErrorsSarif.runs[0].invocations[0].toolExecutionNotifications as Array<{
       level: string;
       message: { text: string };
       locations: Array<{ physicalLocation: { artifactLocation: { uri: string; uriBaseId: string } } }>;
@@ -3114,7 +3139,7 @@ test('41. SARIF emits runs[0].invocations[0].toolExecutionNotifications with lev
         {
           level: 'note',
           text: 'Skipped: Unsupported language',
-          uri: 'scripts/deploy.py',
+          uri: 'tools/deploy.py',
           uriBaseId: '%SRCROOT%',
         },
         {
@@ -3124,19 +3149,25 @@ test('41. SARIF emits runs[0].invocations[0].toolExecutionNotifications with lev
           uriBaseId: '%SRCROOT%',
         },
         {
-          level: 'note',
+          level: 'error',
           text: 'Skipped: Parse error',
           uri: 'src/broken.ts',
           uriBaseId: '%SRCROOT%',
         },
         {
-          level: 'note',
+          level: 'error',
           text: 'Skipped: Internal error',
           uri: 'src/crash.ts',
           uriBaseId: '%SRCROOT%',
         },
       ]
     );
+
+    // Ensure null/non-finite overall score never produces spurious DG003 result
+    const emptySarifPath = path.join(tempDir, 'empty-null.sarif');
+    generateSarifReport([], emptySarifPath, nonErrorSkipped);
+    const emptySarif = JSON.parse(fs.readFileSync(emptySarifPath, 'utf-8'));
+    assert.equal(emptySarif.runs[0].results.length, 0);
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
@@ -3202,82 +3233,117 @@ test('43. Contract consistency: fail_on_unanalyzable aligns across action.yml, R
   assert.equal(parseFailOnUnanalyzable({}), false);
   assert.equal(parseFailOnUnanalyzable({ DEVGUARD_FAIL_ON_UNANALYZABLE: 'false' }), false);
   assert.equal(parseFailOnUnanalyzable({ DEVGUARD_FAIL_ON_UNANALYZABLE: 'true' }), true);
-  assert.equal(parseFailOnUnanalyzable({ INPUT_FAIL_ON_UNANALYZABLE: 'true' }), true);
+  assert.equal(parseFailOnUnanalyzable({ INPUT_FAIL_ON_UNANALYZABLE: 'true' }), false);
 });
 
-test('44. Per-file exception fails open to skipped/internal_error or skipped/parse_error while healthy files continue analyzing', async () => {
-  const inScope = ['src/healthy.ts', 'src/boom.ts', 'src/syntax.ts', 'README.md'];
-  const classification = classifyInScopeFiles(inScope, {
-    statFn: () => ({ exists: true, size: 128 }),
-  });
+test('44. Per-file exception fails open for coverage while enforcing fail-closed gate verdict and SARIF execution failure', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-failclosed-err-'));
+  try {
+    const inScope = ['src/healthy.ts', 'src/boom.ts', 'src/syntax.ts', 'README.md'];
+    const classification = classifyInScopeFiles(inScope, {
+      statFn: () => ({ exists: true, size: 128 }),
+    });
 
-  const cleanCode = [
-    'export function addSafe(a: number, b: number): number {',
-    '  if (typeof a !== "number" || typeof b !== "number") throw new TypeError("Invalid");',
-    '  try { return a + b; } catch (err) { throw err; }',
-    '}',
-  ].join('\n');
+    const cleanCode = [
+      'export function addSafe(a: number, b: number): number {',
+      '  if (typeof a !== "number" || typeof b !== "number") throw new TypeError("Invalid");',
+      '  try { return a + b; } catch (err) { throw err; }',
+      '}',
+    ].join('\n');
 
-  const execRes = await auditClassifiedFiles(classification, {
-    apiKey: '',
-    minScore: 85,
-    isFork: false,
-    verifiedAllowlist: {
-      rulesByPath: new Map(),
-      invalidAllowlistEntries: [],
-      allowlistModifiedInPr: false,
-      sourceMode: 'empty',
-    },
-    readFileFn: (filePath) => {
-      if (filePath === 'src/boom.ts') throw new Error('Simulated EIO disk crash');
-      if (filePath === 'src/syntax.ts') throw new SyntaxError('Simulated parser crash');
-      return cleanCode;
-    },
-  });
+    const execRes = await auditClassifiedFiles(classification, {
+      apiKey: '',
+      minScore: 85,
+      isFork: false,
+      verifiedAllowlist: {
+        rulesByPath: new Map(),
+        invalidAllowlistEntries: [],
+        allowlistModifiedInPr: false,
+        sourceMode: 'empty',
+      },
+      readFileFn: (filePath) => {
+        if (filePath === 'src/boom.ts') throw new Error('Simulated EIO disk crash');
+        if (filePath === 'src/syntax.ts') throw new SyntaxError('Simulated parser crash');
+        return cleanCode;
+      },
+    });
 
-  assert.equal(execRes.auditedCount, 1);
-  assert.equal(execRes.summaries.length, 1);
-  assert.equal(execRes.summaries[0].filePath, 'src/healthy.ts');
-  assert.equal(execRes.hasFatalFailure, false);
+    // Healthy file still gets analyzed (fail-open per-file coverage)
+    assert.equal(execRes.auditedCount, 1);
+    assert.equal(execRes.summaries.length, 1);
+    assert.equal(execRes.summaries[0].filePath, 'src/healthy.ts');
+    // Exception triggers fail-closed gate even with fail_on_unanalyzable=false
+    assert.equal(execRes.hasFatalFailure, true);
 
-  assert.equal(classification.analyzed.length, 1);
-  assert.equal(classification.skipped.length, 2);
-  assert.equal(classification.ignored.length, 1);
-  assert.equal(
-    classification.analyzed.length + classification.skipped.length + classification.ignored.length,
-    inScope.length,
-    'Invariant must hold after per-file fail-open transitions'
-  );
+    assert.equal(classification.analyzed.length, 1);
+    assert.equal(classification.skipped.length, 2);
+    assert.equal(classification.ignored.length, 1);
+    assert.equal(
+      classification.analyzed.length + classification.skipped.length + classification.ignored.length,
+      inScope.length,
+      'Invariant must hold after per-file fail-open transitions'
+    );
 
-  assert.deepEqual(
-    classification.skipped.map((s) => [s.filePath, s.reason]),
-    [
-      ['src/boom.ts', 'internal_error'],
-      ['src/syntax.ts', 'parse_error'],
-    ]
-  );
-  assert.equal(formatSkippedReasonText('internal_error'), 'Skipped: Internal error');
-  assert.equal(formatSkippedReasonText('parse_error'), 'Skipped: Parse error');
+    assert.deepEqual(
+      classification.skipped.map((s) => [s.filePath, s.reason]),
+      [
+        ['src/boom.ts', 'internal_error'],
+        ['src/syntax.ts', 'parse_error'],
+      ]
+    );
+    assert.equal(formatSkippedReasonText('internal_error'), 'Skipped: Internal error');
+    assert.equal(formatSkippedReasonText('parse_error'), 'Skipped: Parse error');
 
-  const passDefault = computeOverallGateVerdict(
-    execRes.auditedCount,
-    execRes.totalScoreSum,
-    classification.skipped.length,
-    execRes.hasFatalFailure,
-    false
-  );
-  assert.equal(passDefault.auditStatus, 'PASS');
-  assert.equal(passDefault.gateFailed, false);
+    const defaultVerdict = computeOverallGateVerdict(
+      execRes.auditedCount,
+      execRes.totalScoreSum,
+      classification.skipped.length,
+      execRes.hasFatalFailure,
+      false
+    );
+    assert.equal(defaultVerdict.auditStatus, 'FAIL');
+    assert.equal(defaultVerdict.gateFailed, true);
 
-  const failStrict = computeOverallGateVerdict(
-    execRes.auditedCount,
-    execRes.totalScoreSum,
-    classification.skipped.length,
-    execRes.hasFatalFailure,
-    true
-  );
-  assert.equal(failStrict.auditStatus, 'FAIL');
-  assert.equal(failStrict.gateFailed, true);
+    const prComment = buildPullRequestCommentMarkdown(execRes.summaries, 85, 'OFFLINE_AST', {
+      analyzedCount: classification.analyzed.length,
+      skippedFiles: classification.skipped.map((s) => ({ filePath: s.filePath, reason: s.reason })),
+      ignoredNonCodeCount: classification.ignored.length,
+      overallScore: defaultVerdict.overallScore,
+      failOnUnanalyzable: false,
+    });
+    assert.ok(prComment.includes('🚫 REJECTED (SECURITY GATE FAILED)'));
+
+    const sarifOut = path.join(tempDir, 'fail-closed-err.sarif');
+    generateSarifReport(
+      execRes.summaries,
+      sarifOut,
+      classification.skipped.map((s) => ({ filePath: s.filePath, reason: s.reason }))
+    );
+    const sarif = JSON.parse(fs.readFileSync(sarifOut, 'utf-8'));
+    assert.equal(sarif.runs[0].invocations[0].executionSuccessful, false);
+    assert.deepEqual(
+      sarif.runs[0].invocations[0].toolExecutionNotifications.map((n: { level: string }) => n.level),
+      ['error', 'error']
+    );
+
+    // Explicit missing CLI target path must fail closed (exit 1) instead of silently passing as deleted
+    const compiledCliPath = path.join(BUILD_ROOT, 'src', 'cli.js');
+    const missingPathRun = spawnSync(process.execPath, [compiledCliPath, path.join(tempDir, 'does-not-exist.ts')], {
+      cwd: tempDir,
+      encoding: 'utf-8',
+      env: {
+        ...process.env,
+        GEMINI_API_KEY: '',
+        GITHUB_TOKEN: '',
+        GITHUB_EVENT_PATH: '',
+        DEVGUARD_SARIF_OUTPUT: path.join(tempDir, 'missing.sarif'),
+      },
+    });
+    assert.equal(missingPathRun.status, 1);
+    assert.match(`${missingPathRun.stderr}\n${missingPathRun.stdout}`, /Target file not found/);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
 });
 
 

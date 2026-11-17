@@ -15,6 +15,7 @@ import {
 
 export { ANALYZABLE_EXTENSIONS, hasAnalyzableExtension };
 import {
+  REPORT_SPEC_VERSION,
   detectPrEnvironment,
   formatSkippedReasonText,
   postInlineReviewComments,
@@ -27,7 +28,7 @@ import {
 } from './githubCommenter.js';
 import { generateSarifReport } from './sarifGenerator.js';
 
-export { formatSkippedReasonText, type SkippedFileReportItem, type SkippedReason };
+export { REPORT_SPEC_VERSION, formatSkippedReasonText, type SkippedFileReportItem, type SkippedReason };
 
 function loadDotEnvIfPresent(): void {
   try {
@@ -570,11 +571,11 @@ function resolveCliFileArgs(args: string[]): string[] {
   const resolved: string[] = [];
   for (const rawArg of args) {
     if (rawArg.startsWith('--')) continue;
-    if (fs.existsSync(rawArg)) {
-      resolved.push(rawArg);
-      continue;
-    }
     if (rawArg.includes('*')) {
+      if (fs.existsSync(rawArg)) {
+        resolved.push(rawArg);
+        continue;
+      }
       const dir = path.dirname(rawArg);
       const pattern = path.basename(rawArg).replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
       const matcher = new RegExp(`^${pattern}$`);
@@ -585,7 +586,9 @@ function resolveCliFileArgs(args: string[]): string[] {
           }
         }
       }
+      continue;
     }
+    resolved.push(rawArg);
   }
   return Array.from(new Set(resolved));
 }
@@ -785,12 +788,18 @@ export function classifyInScopeFiles(
 const AUTO_DISCOVERY_EXCLUDED_DIRS = new Set([
   'node_modules',
   'dist',
+  '.test-dist',
   'build',
   'coverage',
   'remotion',
   'out',
   'tests',
   'scripts',
+]);
+
+const SELF_REFERENCE_EXCLUDED_FILES = new Set([
+  'devguardAnalyzer.ts',
+  'devguard_verify.py',
 ]);
 
 /** Returns true when a path belongs to tests, internal scripts, build artifacts, or excluded self-reference files. */
@@ -802,21 +811,13 @@ export function isExcludedPathFromScope(filePath: string, cwd: string = process.
   const segments = posix.split('/');
   const fileName = segments[segments.length - 1] || '';
   if (segments.some((seg) => seg.startsWith('.') && seg !== '.')) return true;
-
-  for (const seg of segments) {
-    if (seg === 'scripts') {
-      if (hasAnalyzableExtension(fileName) || fileName === 'devguard_verify.py') return true;
-      continue;
-    }
-    if (AUTO_DISCOVERY_EXCLUDED_DIRS.has(seg)) return true;
-  }
+  if (segments.some((seg) => AUTO_DISCOVERY_EXCLUDED_DIRS.has(seg))) return true;
 
   return (
     fileName.endsWith('.d.ts') ||
     fileName.includes('.test.') ||
     fileName.includes('.spec.') ||
-    fileName === 'devguardAnalyzer.ts' ||
-    fileName === 'devguard_verify.py'
+    SELF_REFERENCE_EXCLUDED_FILES.has(fileName)
   );
 }
 
@@ -832,7 +833,7 @@ export function discoverInScopeFiles(mode: 'modified' | 'all', cwd: string = pro
       const results: string[] = [];
       const list = fs.readdirSync(dir, { withFileTypes: true });
       for (const item of list) {
-        if (item.name.startsWith('.') || (AUTO_DISCOVERY_EXCLUDED_DIRS.has(item.name) && item.name !== 'scripts')) {
+        if (item.name.startsWith('.') || AUTO_DISCOVERY_EXCLUDED_DIRS.has(item.name)) {
           continue;
         }
         const full = path.join(dir, item.name);
@@ -1002,17 +1003,16 @@ export async function auditClassifiedFiles(
       entry.status = 'skipped';
       entry.reason = reason;
       classification.skipped.push(entry as ClassifiedFileEntry & { status: 'skipped'; reason: SkippedReason });
+      hasFatalFailure = true;
     }
   }
 
   return { summaries, hasFatalFailure, totalScoreSum, auditedCount };
 }
 
-/** Parses `fail_on_unanalyzable` input from `DEVGUARD_FAIL_ON_UNANALYZABLE` or `INPUT_FAIL_ON_UNANALYZABLE`. */
+/** Parses `fail_on_unanalyzable` input from `DEVGUARD_FAIL_ON_UNANALYZABLE`. */
 export function parseFailOnUnanalyzable(env: NodeJS.ProcessEnv = process.env): boolean {
-  const raw = (env.DEVGUARD_FAIL_ON_UNANALYZABLE ?? env.INPUT_FAIL_ON_UNANALYZABLE ?? 'false')
-    .trim()
-    .toLowerCase();
+  const raw = (env.DEVGUARD_FAIL_ON_UNANALYZABLE ?? 'false').trim().toLowerCase();
   return raw === 'true' || raw === '1';
 }
 
@@ -1085,18 +1085,19 @@ export async function runAction() {
 
   const classification = classifyInScopeFiles(inScopeFiles, { cwd: process.cwd() });
 
-  // Compatibility bridge for legacy Test 4 single-file fixture
-  if (
-    explicitFileArgs.length === 1 &&
-    /^vulnerable_fixture\.py$/i.test(path.basename(explicitFileArgs[0])) &&
-    !process.env.DEVGUARD_FAIL_ON_UNANALYZABLE &&
-    !process.env.GITHUB_EVENT_PATH &&
-    classification.skipped.length === 1
-  ) {
-    const compatEntry: ClassifiedFileEntry = classification.skipped.pop()!;
-    compatEntry.status = 'analyzed';
-    delete compatEntry.reason;
-    classification.analyzed.push(compatEntry);
+  // Explicit CLI target paths that do not exist on disk must fail closed rather than pass as deleted diff entries
+  if (explicitFileArgs.length > 0) {
+    for (let i = classification.ignored.length - 1; i >= 0; i--) {
+      const ign = classification.ignored[i];
+      if (ign.reason === 'deleted') {
+        console.error(`❌ Target file not found: ${ign.filePath}`);
+        classification.ignored.splice(i, 1);
+        const errEntry: ClassifiedFileEntry = ign;
+        errEntry.status = 'skipped';
+        errEntry.reason = 'internal_error';
+        classification.skipped.push(errEntry as ClassifiedFileEntry & { status: 'skipped'; reason: SkippedReason });
+      }
+    }
   }
 
   for (const skippedEntry of classification.skipped) {
@@ -1147,11 +1148,17 @@ export async function runAction() {
   const ignoredNonCodeCount = classification.ignored.filter((i) => i.reason === 'non_code').length;
   const ignoredDeletedCount = classification.ignored.filter((i) => i.reason === 'deleted').length;
 
+  const hasExecutionErrors =
+    Boolean(classification.invariantError) ||
+    !postCheck.valid ||
+    skippedFiles.some((s) => s.reason === 'parse_error' || s.reason === 'internal_error');
+  const effectiveHasFatalFailure = hasFatalFailure || hasExecutionErrors;
+
   const verdict = computeOverallGateVerdict(
     auditedCount,
     totalScoreSum,
     skippedFiles.length,
-    hasFatalFailure,
+    effectiveHasFatalFailure,
     failOnUnanalyzable
   );
 
@@ -1160,7 +1167,7 @@ export async function runAction() {
   console.log('\n======================================================================');
   console.log(`RATA-RATA SKOR KESELURUHAN: ${scoreDisplay}`);
   console.log(
-    `DevGuard v1.3.0 — Score: ${scoreDisplay}  (analyzed ${classification.analyzed.length} of ${codeFilesCount} code files · ${skippedFiles.length} skipped)`
+    `DevGuard ${REPORT_SPEC_VERSION} — Score: ${scoreDisplay}  (analyzed ${classification.analyzed.length} of ${codeFilesCount} code files · ${skippedFiles.length} skipped)`
   );
 
   // GitHub Actions Workflow Output Parameters
@@ -1196,9 +1203,13 @@ export async function runAction() {
   writeGitHubOutput(outputFile, 'sarif_file', sarifFile);
 
   if (verdict.gateFailed) {
-    if (verdict.unanalyzableFailed && !hasFatalFailure) {
+    if (verdict.unanalyzableFailed && !effectiveHasFatalFailure) {
       console.error(
         `🚫 DevGuard Quality Gate Rejected: ${skippedFiles.length} berkas tidak dapat dianalisis (fail_on_unanalyzable=true).`
+      );
+    } else if (hasExecutionErrors && !hasFatalFailure) {
+      console.error(
+        '🚫 DevGuard Quality Gate Rejected: Terjadi kesalahan analisis/internal (fail-closed gate).'
       );
     } else {
       console.error('🚫 DevGuard Quality Gate Rejected: Ditemukan celah keamanan atau regresi logika.');

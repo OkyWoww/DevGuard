@@ -84,6 +84,9 @@ export interface PrCoverageSummary {
 
 export const MAX_PR_SKIPPED_FILES_DISPLAY = 20;
 
+/** Report headline version required by DevGuard v1.3.0 specification (§4.2). */
+export const REPORT_SPEC_VERSION = 'v1.3.0';
+
 /** Formats canonical human-readable skipped reason text per DevGuard v1.3.0 spec. */
 export function formatSkippedReasonText(reason: SkippedReason): string {
   switch (reason) {
@@ -202,10 +205,17 @@ export function buildPullRequestCommentMarkdown(
           : null;
 
   const analyzedPassed = summaries.every((summary) => summary.passed);
+  const hasAnalysisErrors = skippedFiles.some(
+    (s) => s.reason === 'parse_error' || s.reason === 'internal_error'
+  );
   const unanalyzableFailed = Boolean(coverage?.failOnUnanalyzable && skippedCount > 0);
-  const allPassed = analyzedPassed && !unanalyzableFailed;
+  const allPassed = analyzedPassed && !hasAnalysisErrors && !unanalyzableFailed;
 
-  const badgeStatus = allPassed ? '✅ PASSED (READY TO MERGE)' : '🚫 REJECTED (SECURITY GATE FAILED)';
+  const badgeStatus = !allPassed
+    ? '🚫 REJECTED (SECURITY GATE FAILED)'
+    : analyzedCount === 0
+      ? '⚠️ NOT ANALYZED — no supported code files'
+      : '✅ PASSED (READY TO MERGE)';
   const engineLabel = mode === 'HYBRID'
     ? 'Hybrid Dual-Layer (Single-Pass Lexical & Heuristic Engine + Gemini 3.8 Flash)'
     : '100% Offline Single-Pass Lexical & Heuristic Engine';
@@ -217,7 +227,7 @@ export function buildPullRequestCommentMarkdown(
     headerStatuses.length > 0 ? headerStatuses.join(' / ') : formatLayer2StatusLabel(undefined, mode);
 
   const scoreDisplay = overallScore === null ? 'N/A' : `${overallScore}/100`;
-  const scoreHeadline = `DevGuard v1.3.0 — Score: ${scoreDisplay}  (analyzed ${analyzedCount} of ${codeFilesCount} code files · ${skippedCount} skipped)`;
+  const scoreHeadline = `DevGuard ${REPORT_SPEC_VERSION} — Score: ${scoreDisplay}  (analyzed ${analyzedCount} of ${codeFilesCount} code files · ${skippedCount} skipped)`;
 
   const maxDisplay = Math.max(1, coverage?.maxSkippedDisplay ?? MAX_PR_SKIPPED_FILES_DISPLAY);
   const skippedLines = skippedFiles

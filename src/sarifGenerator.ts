@@ -261,7 +261,12 @@ export function generateSarifReport(
     }
 
     // 3. Jika skor gagal tapi fatalFlaws & inlineFindings error kosong, catat pelanggaran threshold (DG003)
-    if (!summary.passed && summary.fatalFlaws.length === 0 && inlineErrorMessages.length === 0) {
+    if (
+      !summary.passed &&
+      Number.isFinite(summary.overall) &&
+      summary.fatalFlaws.length === 0 &&
+      inlineErrorMessages.length === 0
+    ) {
       results.push(
         createSarifResult(
           'DG003',
@@ -298,22 +303,29 @@ export function generateSarifReport(
     }
   }
 
-  const toolExecutionNotifications = skippedFiles.map((item) => ({
-    level: 'note' as const,
-    message: {
-      text: redactSecretsPreservingLayout(formatSkippedReasonText(item.reason)),
-    },
-    locations: [
-      {
-        physicalLocation: {
-          artifactLocation: {
-            uri: normalizeSarifUri(item.filePath),
-            uriBaseId: '%SRCROOT%',
+  const hasExecutionError = skippedFiles.some(
+    (item) => item.reason === 'parse_error' || item.reason === 'internal_error'
+  );
+
+  const toolExecutionNotifications = skippedFiles.map((item) => {
+    const isError = item.reason === 'parse_error' || item.reason === 'internal_error';
+    return {
+      level: (isError ? 'error' : 'note') as 'error' | 'note',
+      message: {
+        text: redactSecretsPreservingLayout(formatSkippedReasonText(item.reason)),
+      },
+      locations: [
+        {
+          physicalLocation: {
+            artifactLocation: {
+              uri: normalizeSarifUri(item.filePath),
+              uriBaseId: '%SRCROOT%',
+            },
           },
         },
-      },
-    ],
-  }));
+      ],
+    };
+  });
 
   const sarifLog = {
     $schema: 'https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json',
@@ -330,7 +342,7 @@ export function generateSarifReport(
         },
         invocations: [
           {
-            executionSuccessful: true,
+            executionSuccessful: !hasExecutionError,
             toolExecutionNotifications,
           },
         ],
