@@ -1,8 +1,8 @@
-# DevGuard v1.3.0 — SPEC (Stage 5) — Rev 2.2
+# DevGuard v1.3.0 — SPEC (Stage 5) — Rev 2.3
 
 **Tema:** Explicit Unanalyzable Reporting & Lexical Constant Folding (SpanMap)
 **Baseline:** `v1.2.1` — hijau di GitHub Actions, `35/35` tes lulus
-**Status:** Stage 5.1 sudah di-merge ke `main` (merge `d4801e7`, implementasi `c5f7129`, `45/45` tes lokal) dan **masih mengandung cacat yang diketahui** (§0, §4.8): `main` belum boleh dirilis atau di-tag. **Referensi baseline v1.2.1 adalah commit `e67c869` (tag `v1.2.1`), bukan `main`.** Berkas ini berada di `specs/SPEC.md`. §4 rev 2.1 mengamandemen Stage 5.1 dan diwujudkan oleh Stage **5.1-fix** (§4.8). §5–§9 tidak berubah dari rev 2.
+**Status:** Stage 5.1 sudah di-merge ke `main` (merge `d4801e7`, implementasi `c5f7129`, `45/45` tes lokal) dan **masih mengandung cacat yang diketahui** (§0, §4.8): `main` belum boleh dirilis atau di-tag. **Referensi baseline v1.2.1 adalah commit `e67c869` (tag `v1.2.1`), bukan `main`.** Berkas ini berada di `specs/SPEC.md` (salinan duplikat `docs/specs/` dihapus di Rev 2.3). §4 rev 2.1–2.3 mengamandemen Stage 5.1 dan diwujudkan oleh Stage **5.1-fix / 5.1-hardening** (§4.8). §5–§9 tidak berubah dari rev 2.
 **Catatan:** dokumen ini tidak mengubah kode apa pun.
 
 Konvensi penanda:
@@ -14,6 +14,13 @@ Konvensi penanda:
 ## 0. Perubahan dari Rev 2
 
 > **Rev 2.1 → 2.2:** hanya koreksi referensi (status merge ke `main`, baseline v1.2.1 = `e67c869`, lokasi berkas `specs/`). Tidak ada perubahan perilaku.
+> **Rev 2.2 → 2.3 (`Stage 5.1-hardening`):**
+> - **C4:** Duplikat `docs/specs/` dihapus (`git rm -r docs/specs/`); `specs/SPEC.md` menjadi sumber kebenaran tunggal.
+> - **C2:** Cakupan parsial `.py` didokumentasikan akurat: menjalankan `DG001`, `DG002`, `DG007` (serta heuristik domain SQL/ping), sedangkan detektor spesifik JS/TS/NPM `DG004`, `DG005`, `DG006`, dan `DG008` dilewati.
+> - **G1 (Self-Ref Anchoring):** Pengecualian self-reference (`src/devguardAnalyzer.ts`, `scripts/devguard_verify.py`, `devguard_verify.py`) dijangkar ke path repo-relatif eksak dan hanya aktif bila `package.json` pada `cwd` memiliki `"name": "devguard"`.
+> - **G2 / D12 (`ignored/excluded_path` pada mode `modified`):** `discoverInScopeFiles('modified', cwd)` mengembalikan seluruh path dari `git diff` tanpa pre-filter sebelum klasifier; path yang cocok `isExcludedPathFromScope` dipetakan ke `status: 'ignored', reason: 'excluded_path'` sehingga invarian `analyzed + skipped + ignored === total_diff_files` berlaku atas **seluruh** berkas diff dan dirender sebagai `- Ignored (excluded path): N` bila `N > 0`.
+> - **R1 (`GITHUB_OUTPUT` Early Exit):** Jalur `exit 1` awal (`DEVGUARD_FAIL_ON_UNANALYZABLE` tidak valid atau argumen CLI eksplisit hilang) menulis `overall_score=N/A` dan `audit_status=FAIL` ke `GITHUB_OUTPUT` sebelum `process.exit(1)`.
+> - **R2 (SARIF & PR Clean Invariant Mismatch):** Sentinel `<invariant-mismatch>` tidak dimasukkan ke URI `locations` SARIF (menghilangkan `locations` pada notifikasi invarian) dan dirender sebagai `- Coverage invariant mismatch — Skipped: Internal error` tanpa karakter `< >` pada komentar PR.
 
 | Area | Rev 2 | Rev 2.1 | Alasan |
 |---|---|---|---|
@@ -52,9 +59,9 @@ Konvensi penanda:
 
 | Istilah | Definisi |
 |---|---|
-| **In-scope files** | File yang dienumerasi action (diff / workspace / argumen eksplisit) **setelah pengecualian path** yang sudah ada di v1.2.1 (§4.6) dan **sebelum** filter ekstensi. Klasifier menerima daftar ini. |
+| **In-scope files** | File yang dienumerasi action: pada mode `modified`, seluruh berkas `git diff` masuk langsung ke klasifier (termasuk path yang akhirnya diklasifikasikan sebagai `ignored/excluded_path`); pada mode `all` tetap setelah pengecualian direktori `AUTO_DISCOVERY_EXCLUDED_DIRS` (§4.6) agar tidak menyusuri `node_modules`. Klasifier menerima daftar ini sebelum filter ekstensi. |
 | **Analyzed (full)** | Ekstensi `.ts .tsx .js .jsx .mjs .cjs .mts .cts` `[TERVERIFIKASI]`, ukuran ≤ `MAX_FILE_BYTES`. |
-| **Analyzed (partial)** | Ekstensi `PARTIAL_ANALYSIS_EXTENSIONS = ['.py']`, ukuran ≤ `MAX_FILE_BYTES`. Analyzer dipanggil persis seperti v1.2.1 (rule bahasa-agnostik saja). |
+| **Analyzed (partial)** | Ekstensi `PARTIAL_ANALYSIS_EXTENSIONS = ['.py']`, ukuran ≤ `MAX_FILE_BYTES`. Analyzer dipanggil persis seperti v1.2.1 (menjalankan `DG001`, `DG002`, `DG007`, serta heuristik domain SQL/ping; melewati `DG004`, `DG005`, `DG006`, `DG008`). |
 | **Skipped** | File kode yang seharusnya diperiksa tetapi tidak bisa. Selalu ada `reason`. |
 | **Analysis failure** | `skipped` dengan `reason` `parse_error` atau `internal_error`, atau pelanggaran invarian coverage. Selalu fatal. |
 | **Ignored** | File non-kode atau tidak relevan. Dihitung terpisah. |
@@ -79,9 +86,11 @@ Setiap in-scope file diklasifikasikan **tepat satu kali**:
 | `skipped` | `internal_error` | exception tak terduga pada file itu. **Fatal.** |
 | `ignored` | `non_code` | lockfile, gambar, `.md`, `.json`, `.yml`, `.txt`, `.html`/`.htm`, direktori/submodule, dll. |
 | `ignored` | `deleted` | **hanya** untuk file yang muncul dari `git diff` (mode `modified`) dan tidak ada di disk |
+| `ignored` | `excluded_path` | path pada mode `modified` (`git diff`) yang cocok dengan `isExcludedPathFromScope` (`scripts/`, `tests/`, `dist/`, `.github/`, `*.test.*`, `*.spec.*`, `*.d.ts`, dan pengecualian self-reference terjangkar `src/devguardAnalyzer.ts` / `scripts/devguard_verify.py` saat `package.json` `name === "devguard"`) |
 
 Aturan:
-- **Invarian (diuji):** `analyzed + skipped + ignored == |in-scope files|`. Karena setiap file masuk tepat satu kategori secara struktural, invarian ini hanyalah pagar bug; bukti bahwa discovery tidak menjatuhkan file adalah tes yang menunjukkan `.py`, `.ipynb`, dan file terhapus **terlihat** oleh klasifier. Pelanggaran invarian saat runtime = analysis failure (fatal).
+- **Invarian (diuji):** `analyzed + skipped + ignored == |in-scope files|`. Pada mode `modified` (`git diff`), invarian ini berlaku atas **seluruh** file di `git diff` tanpa pengecualian tersembunyi karena `discoverInScopeFiles('modified', cwd)` menyerahkan semua path diff ke klasifier dan memetakan path ter-exclude ke `ignored/excluded_path`. Mode `all` tetap melewati `AUTO_DISCOVERY_EXCLUDED_DIRS` saat traversal direktori agar tidak menyusuri `node_modules`. Pelanggaran invarian saat runtime = analysis failure (fatal).
+- **Self-reference anchoring:** pengecualian `src/devguardAnalyzer.ts`, `scripts/devguard_verify.py`, dan `devguard_verify.py` dijangkar ke path repo-relatif eksak dan **hanya** aktif ketika `package.json` pada `cwd` bernilai `"name": "devguard"`. Berkas seperti `src/devguard_verify.py` atau `pkg/devguardAnalyzer.ts` pada repo pengguna tetap diaudit.
 - Daftar ekstensi analyzable (JS/TS) adalah satu konstanta bersama (`ANALYZABLE_EXTENSIONS`) yang dipakai klasifier, analyzer, dan discovery. `PARTIAL_ANALYSIS_EXTENSIONS` berdampingan dengannya.
 - Discovery mempertahankan perilaku v1.2.1 untuk `.py`: `discoverWorkspaceFiles` tetap mengembalikan `.py` seperti sebelumnya.
 - **Argumen file eksplisit** (CLI) yang tidak ditemukan di disk → gagal jelas sebelum klasifikasi (`exit 1`, pesan memuat path). Tidak boleh menjadi `ignored/deleted`.
@@ -122,16 +131,17 @@ Coverage
     - tools/deploy.go — Skipped: Unsupported language
     - tools/big.js    — Skipped: File too large (> 1 MiB)
 - Ignored (non-code): 4
+- Ignored (excluded path): 1
 ```
 
-Daftar partial dan skipped dipotong dengan `+N more` di komentar (cap tampilan 20 per daftar); daftar penuh ada di SARIF.
+Baris `- Ignored (excluded path): N` hanya muncul bila `N > 0`. Entri mismatch invarian internal dirender sebagai `    - Coverage invariant mismatch — Skipped: Internal error` (tanpa karakter `< >`). Daftar partial dan skipped dipotong dengan `+N more` di komentar (cap tampilan 20 per daftar); daftar penuh ada di SARIF.
 
 ### 4.3 Input action & exit code
 
 - Input: **`fail_on_unanalyzable`**, `snake_case`, default `'false'`, dibaca dari `DEVGUARD_FAIL_ON_UNANALYZABLE` via `process.env`. **Tidak ada** fallback `INPUT_FAIL_ON_UNANALYZABLE` (konvensi input lain hanya `DEVGUARD_*` `[TERVERIFIKASI]`).
-- **Parsing ketat:** nilai yang di-trim dan di-lowercase harus `true` atau `false`; kosong/tidak diset → `false`. Nilai lain (`yes`, `1`, `ture`) → pesan error jelas dan `exit 1`. Alasan: salah ketik pada tombol gerbang tidak boleh berubah menjadi "mati" secara diam-diam.
+- **Parsing ketat:** nilai yang di-trim dan di-lowercase harus `true` atau `false`; kosong/tidak diset → `false`. Nilai lain (`yes`, `1`, `ture`) → menulis `overall_score=N/A` dan `audit_status=FAIL` ke `GITHUB_OUTPUT`, pesan error jelas, dan `exit 1`. Alasan: salah ketik pada tombol gerbang tidak boleh berubah menjadi "mati" secara diam-diam.
 - Tidak ada input `fail_on_warning` `[TERVERIFIKASI: belum ada]`; tidak ditambahkan.
-- **Exit `1`** bila salah satu: (a) gerbang per-file gagal (skor/finding, v1.2.1), (b) ada analysis failure, (c) `fail_on_unanalyzable: 'true'` dan `skipped > 0`, (d) konfigurasi input tidak valid, (e) argumen file eksplisit tidak ditemukan.
+- **Exit `1`** bila salah satu: (a) gerbang per-file gagal (skor/finding, v1.2.1), (b) ada analysis failure, (c) `fail_on_unanalyzable: 'true'` dan `skipped > 0`, (d) konfigurasi input tidak valid (menulis `overall_score=N/A` & `audit_status=FAIL` ke `GITHUB_OUTPUT`), (e) argumen file eksplisit tidak ditemukan (menulis `overall_score=N/A` & `audit_status=FAIL` ke `GITHUB_OUTPUT`).
 - Skipped biasa (`unsupported_language`, `file_too_large`) dan `ignored/*` **tidak** menggagalkan secara default.
 - **Kontrak:** `action.yml`, `README.md`, workflow `.github/workflows/devguard.yml`, dan tes kontrak (Test 6 dan Test 29) disinkronkan dalam satu commit.
 
@@ -141,7 +151,7 @@ Daftar partial dan skipped dipotong dengan `+N more` di komentar (cap tampilan 2
 - `toolExecutionNotifications[]`:
   - skipped → `level: "note"`, teks baku alasan, `uri` = path;
   - partial → `level: "note"`, teks `Partial: language-agnostic rules only`;
-  - analysis failure → `level: "error"`, teks `Skipped: Parse error` / `Skipped: Internal error`.
+  - analysis failure → `level: "error"`, teks `Skipped: Parse error` / `Skipped: Internal error`. Notifikasi pelanggaran invarian (`INVARIANT_MISMATCH_SENTINEL`) menghilangkan array `locations` (tidak menulis `<invariant-mismatch>` sebagai URI artefak fisik).
 - Tidak ada `result` baru untuk semua di atas. Teks lewat redaksi secret.
 
 ### 4.5 Teks baku alasan
@@ -154,13 +164,11 @@ Daftar partial dan skipped dipotong dengan `+N more` di komentar (cap tampilan 2
 | `internal_error` | `Skipped: Internal error` |
 | (coverage partial) | `Partial: language-agnostic rules only` |
 
-### 4.6 Known limitations (pra-ada di v1.2.1, tidak diubah di v1.3.0, harus diungkapkan di README)
+### 4.6 Known limitations (pra-ada di v1.2.1, diperbarui Rev 2.3, harus diungkapkan di README)
 
-1. **Pengecualian path terjadi sebelum klasifikasi** dan tidak muncul di coverage: direktori titik (`.github/scripts/`, `.husky/`, dll.), `node_modules`, `dist`, direktori di `AUTO_DISCOVERY_EXCLUDED_DIRS` termasuk `scripts/` (semua file di dalamnya), serta `*.d.ts`, `*.test.*`, `*.spec.*`. Invarian §4.1 berlaku terhadap in-scope **setelah** pengecualian ini.
-2. **Mode eksplisit CLI** di v1.2.1 tidak memfilter ekstensi; di v1.3.0 argumen eksplisit mengikuti klasifier (D10).
+1. **Pengecualian path menurut mode:** Pada mode `modified` (`git diff`), direktori titik (`.github/`, `.husky/`), `node_modules`, `dist`, `scripts/`, `tests/`, `*.d.ts`, `*.test.*`, `*.spec.*`, dan self-reference terjangkar `devguard` kini tetap terlihat di klasifier dan dilaporkan sebagai `ignored/excluded_path` (`- Ignored (excluded path): N` bila `N > 0`) tanpa pengecualian tersembunyi. Pada mode `all`, direktori dalam `AUTO_DISCOVERY_EXCLUDED_DIRS` tetap dilewati saat traversal agar tidak menyusuri `node_modules`.
+2. **Mode eksplisit CLI** di v1.2.1 tidak memfilter ekstensi; di v1.3.0 argumen eksplisit mengikuti klasifier (D10) dan tidak masuk `excluded_path`.
 3. **`target_files` selain `all`/`modified`:** perilaku aktual diperiksa di pre-flight; tidak diubah di sini `[ASUMSI]`.
-
-Usulan rilis berikutnya (bukan v1.3.0): `ignored/excluded_path` untuk mode `modified` (mode `all` tidak dapat menghitungnya tanpa menyusuri `node_modules`). Keputusan terbuka D12.
 
 ### 4.7 Perubahan perilaku yang wajib didokumentasikan (README/CHANGELOG)
 
