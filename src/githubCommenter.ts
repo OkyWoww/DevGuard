@@ -179,6 +179,7 @@ export interface FileAuditSummary {
   allowlistModifiedInPr?: boolean;
   layer2Status?: string;
   dynScopeUncertain?: number;
+  foldLimitExceeded?: boolean;
 }
 
 export const COMMENT_SIGNATURE = '<!-- devguard-adversarial-audit-sticky-comment -->';

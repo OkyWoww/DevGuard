@@ -381,13 +381,21 @@ export function generateSarifReport(
     Boolean(options?.hasAnalysisFailure) ||
     skippedFiles.some((item) => item.reason === 'parse_error' || item.reason === 'internal_error');
 
-  const createToolNotification = (level: 'error' | 'note', text: string, filePath?: string) => {
+  const createToolNotification = (
+    level: 'error' | 'note',
+    text: string,
+    filePath?: string,
+    descriptorId?: string
+  ) => {
     const notification: Record<string, unknown> = {
       level,
       message: {
         text: redactSecretsPreservingLayout(text),
       },
     };
+    if (descriptorId) {
+      notification.descriptor = { id: descriptorId };
+    }
     if (filePath && filePath !== INVARIANT_MISMATCH_SENTINEL) {
       notification.locations = [
         {
@@ -414,7 +422,31 @@ export function generateSarifReport(
       item.filePath
     );
   });
-  const toolExecutionNotifications = [...partialNotifications, ...skippedNotifications];
+
+  const foldLimitSeenUris = new Set<string>();
+  const foldLimitNotifications: Array<Record<string, unknown>> = [];
+  for (const summary of summaries) {
+    if (summary.foldLimitExceeded) {
+      const normUri = normalizeSarifUri(summary.filePath);
+      if (!foldLimitSeenUris.has(normUri)) {
+        foldLimitSeenUris.add(normUri);
+        foldLimitNotifications.push(
+          createToolNotification(
+            'note',
+            'Fold limit exceeded (fold_limit_exceeded): partial virtual folding applied',
+            summary.filePath,
+            'fold_limit_exceeded'
+          )
+        );
+      }
+    }
+  }
+
+  const toolExecutionNotifications = [
+    ...partialNotifications,
+    ...skippedNotifications,
+    ...foldLimitNotifications,
+  ];
 
   const sarifLog = {
     $schema: 'https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json',

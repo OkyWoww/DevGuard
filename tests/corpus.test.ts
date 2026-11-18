@@ -68,6 +68,21 @@ test('Corpus Benchmark: evaluates DG001, DG004-DG008 with honest baseline accoun
     if (c.status === 'expected') {
       if (c.label === 'TN') {
         assert.equal(flagged, false, `Unexpected false positive on ${c.id} (${c.note})`);
+        const crossRuleReport = analyzeCodeDeterministically(c.code, {
+          filePath: c.filePath,
+          declaredDependencies: c.declaredDependencies,
+        });
+        const anyInline = crossRuleReport.inlineFindings ?? [];
+        assert.equal(
+          anyInline.length,
+          0,
+          `Cross-rule TN check failed on ${c.id}: unexpected findings ${JSON.stringify(anyInline)}`
+        );
+        assert.equal(
+          crossRuleReport.temuanUtama.line,
+          '-',
+          `Cross-rule TN check failed on ${c.id}: unexpected temuanUtama ${crossRuleReport.temuanUtama.description}`
+        );
       } else {
         assert.equal(flagged, true, `Expected ${c.rule} to flag ${c.id} (${c.note})`);
       }

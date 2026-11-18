@@ -1065,6 +1065,7 @@ export async function auditClassifiedFiles(
           verifiedAllowlist.invalidAllowlistEntries.length > 0 ? verifiedAllowlist.invalidAllowlistEntries : undefined,
         allowlistModifiedInPr: verifiedAllowlist.allowlistModifiedInPr || undefined,
         dynScopeUncertain: report.dynScopeUncertain,
+        foldLimitExceeded: report.virtualView?.limitExceeded === true ? true : undefined,
       };
 
       console.log(`   - Security        : ${score.security}/100`);

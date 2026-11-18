@@ -1,4 +1,9 @@
 import {
+  MAX_BACKSCAN,
+  MAX_FOLDED_LENGTH,
+  MAX_FOLD_DEPTH,
+  MAX_FOLD_EDITS,
+  MAX_FOLD_OPERANDS,
   MAX_GLOB_PATTERN_LENGTH,
   MEANINGFUL_SUPPRESSION_REASON_RE,
   analyzeLexicalStructure,
@@ -61,6 +66,11 @@ export type {
 };
 export {
   DG007_PROVIDER_PATTERNS,
+  MAX_BACKSCAN,
+  MAX_FOLDED_LENGTH,
+  MAX_FOLD_DEPTH,
+  MAX_FOLD_EDITS,
+  MAX_FOLD_OPERANDS,
   MAX_GLOB_PATTERN_LENGTH,
   MEANINGFUL_SUPPRESSION_REASON_RE,
   POPULAR_NPM_PACKAGES,
@@ -487,7 +497,7 @@ function applySuppressionPolicy(
 
 export function analyzeCodeDeterministically(
   code: string,
-  options?: AuditAnalyzeOptions
+  options?: AuditAnalyzeOptions & { disableFolding?: boolean }
 ): ParsedDevGuardReport {
   if (typeof code !== 'string') {
     throw new TypeError('code input must be a string');
@@ -536,8 +546,15 @@ export function analyzeCodeDeterministically(
   const isTypeScript = isSelfAnalyzerModule || isAuthDomain || /:\s*(?:string|number|boolean|any|Request|Response|JwtPayload)\b|\binterface\s+\w+/i.test(codeWithoutComments);
   const language = isPython ? 'python' : isTypeScript ? 'typescript' : 'javascript';
 
-  const virtualView = buildVirtualView(code, { isPython });
   const lexical = analyzeLexicalStructure(code, isPython);
+  const virtualView = options?.disableFolding
+    ? {
+        virtualCode: code,
+        spanMap: createIdentitySpanMap(code.length),
+        editsApplied: 0,
+        limitExceeded: false,
+      }
+    : buildVirtualView(code, { isPython, initialLex: lexical });
   const maskedLines = lexical.maskedCode.split('\n');
 
   const findings: LineFinding[] = [];
@@ -1217,7 +1234,7 @@ export function analyzeCodeDeterministically(
   // 6. CUSTOM SCRATCHPAD / GENERAL CODE RULES
   // ---------------------------------------------------------------------------
   else {
-    const evalSinkRe = /(?:^|[^.\w])(?:eval|exec)\s*\(|os\.system\s*\(|child_process\.exec|\bnew\s+Function\s*\(/i;
+    const evalSinkRe = /(?:^|[^.\w])(?:eval|exec)\s*\(|\b[A-Za-z_$][\w$]*\.eval\s*\(|\b(?:globalThis|window|global|self|child_process)\.exec\s*\(|os\.system\s*\(|\bnew\s+Function\s*\(/i;
     const maskedGlobalBracketRe = /\b(?:globalThis|window|global|self)\b[^\n;]*\[/;
     const bracketEvalRe = /\b(?:globalThis|window|global|self)\b[^\n;]*\[\s*['"](?:eval|exec)['"]\s*\]/;
     const evalLines = execLines
@@ -1235,6 +1252,12 @@ export function analyzeCodeDeterministically(
         shortReason: `-40 Eksekusi kode/perintah dinamis berbahaya (baris ${evalLines.join(', ')})`,
         detailedReason: `Ditemukan pemanggilan eksekusi kode/perintah dinamis pada baris ${evalLines.join(', ')} yang membuka celah Remote Code Execution (RCE) / Command Injection.`,
         isCritical: true,
+      });
+      inlineFindings.push({
+        ruleId: 'DG001',
+        line: evalLines[0],
+        severity: 'error',
+        message: `[DG001] Dangerous dynamic code/command execution sink on line ${evalLines.join(', ')}`,
       });
     }
 
@@ -1350,15 +1373,166 @@ export function analyzeCodeDeterministically(
   let dynScopeUncertain = 0;
   if (!isPython) {
     detectHallucinatedPackages(execLines, maskedLines, options, findings, inlineFindings);
-    ({ dynScopeUncertain } = detectDynamicModuleSpecifiers(
-      lexical.maskedCode,
-      lexical.stringLiterals,
-      options,
-      inlineFindings
-    ));
+    if (virtualView.editsApplied === 0) {
+      ({ dynScopeUncertain } = detectDynamicModuleSpecifiers(
+        lexical.maskedCode,
+        lexical.stringLiterals,
+        options,
+        inlineFindings
+      ));
+    }
     detectSwallowedExceptions(code, findings, inlineFindings);
     detectNonAtomicBalanceMutations(rawLines, findings, inlineFindings);
     detectMissingTimeoutsAndLoops(code, lexical.maskedCode, rawLines, findings, inlineFindings);
+  }
+
+  // 3b. Additive Pass-V (runs if and only if virtualView.editsApplied > 0)
+  if (virtualView.editsApplied > 0) {
+    const vLex = analyzeLexicalStructure(virtualView.virtualCode, isPython);
+    const vRawLines = virtualView.virtualCode.split('\n');
+    const vLineStarts = [0];
+    for (let i = 0; i < virtualView.virtualCode.length; i++) {
+      if (virtualView.virtualCode[i] === '\n') vLineStarts.push(i + 1);
+    }
+
+    // DG004-DYN-01/02 in virtual-only mode: evaluated on virtualView.virtualCode
+    if (!isPython) {
+      const vDynFindings: InlineFinding[] = [];
+      const dynRes = detectDynamicModuleSpecifiers(
+        vLex.maskedCode,
+        vLex.stringLiterals,
+        options,
+        vDynFindings
+      );
+      dynScopeUncertain = dynRes.dynScopeUncertain;
+      for (const df of vDynFindings) {
+        const vOffset = vLineStarts[Math.max(0, Math.min(df.line - 1, vLineStarts.length - 1))];
+        const mapped = toOrigLineAndCol(code, virtualView.spanMap, vOffset);
+        df.line = mapped.line;
+        df.message = df.message.replace(/:\d+/, `:${mapped.line}`);
+        inlineFindings.push(df);
+      }
+    }
+
+    // Additive execution of v1.2.1 rule detectors on V
+    const vFindings: LineFinding[] = [];
+    const vInlineFindings: InlineFinding[] = [];
+
+    // DG007 on V
+    detectHardcodedSecrets(virtualView.virtualCode, vRawLines, vLex.stringLiterals, vFindings, vInlineFindings);
+
+    if (!isPython) {
+      const vExecLines: Array<{ num: number; text: string }> = [];
+      for (let i = 0; i < vRawLines.length; i++) {
+        if (!isCommentOrEmptyLine(vRawLines[i])) {
+          vExecLines.push({ num: i + 1, text: vRawLines[i] });
+        }
+      }
+      const vMaskedLines = vLex.maskedCode.split('\n');
+
+      if (/\b(?:import|require|from)\b/.test(vLex.maskedCode)) {
+        detectHallucinatedPackages(vExecLines, vMaskedLines, options, vFindings, vInlineFindings);
+      }
+      if (/\b(?:try|catch)\b/.test(vLex.maskedCode)) {
+        detectSwallowedExceptions(virtualView.virtualCode, vFindings, vInlineFindings);
+      }
+      if (/\bawait\b/.test(vLex.maskedCode)) {
+        detectNonAtomicBalanceMutations(vRawLines, vFindings, vInlineFindings);
+      }
+      if (/\b(?:while|for|fetch)\b/.test(vLex.maskedCode)) {
+        detectMissingTimeoutsAndLoops(virtualView.virtualCode, vLex.maskedCode, vRawLines, vFindings, vInlineFindings);
+      }
+
+      // DG001 on V (eval/exec dynamic sinks in general code domain)
+      if (!isSqlDomain && !isPingDomain && !isAuthDomain && !isFileDomain && !isCartDomain) {
+        const evalSinkRe = /(?:^|[^.\w])(?:eval|exec)\s*\(|\b[A-Za-z_$][\w$]*\.eval\s*\(|\b(?:globalThis|window|global|self|child_process)\.exec\s*\(|os\.system\s*\(|\bnew\s+Function\s*\(/i;
+        const maskedGlobalBracketRe = /\b(?:globalThis|window|global|self)\b[^\n;]*\[/;
+        const bracketEvalRe = /\b(?:globalThis|window|global|self)\b[^\n;]*\[\s*['"](?:eval|exec)['"]\s*\]/;
+        const vEvalLines = vExecLines
+          .filter(({ num, text }) => {
+            const mLine = vMaskedLines[num - 1] ?? '';
+            if (evalSinkRe.test(mLine)) return true;
+            return maskedGlobalBracketRe.test(mLine) && bracketEvalRe.test(text);
+          })
+          .map((l) => l.num);
+        if (vEvalLines.length > 0) {
+          vFindings.push({
+            line: vEvalLines[0],
+            extraLines: vEvalLines.slice(1),
+            category: 'security',
+            penalty: 40,
+            shortReason: `-40 Eksekusi kode/perintah dinamis berbahaya (baris ${vEvalLines.join(', ')})`,
+            detailedReason: `Ditemukan pemanggilan eksekusi kode/perintah dinamis pada baris ${vEvalLines.join(', ')} yang membuka celah Remote Code Execution (RCE) / Command Injection.`,
+            isCritical: true,
+          });
+          vInlineFindings.push({
+            ruleId: 'DG001',
+            line: vEvalLines[0],
+            severity: 'error',
+            message: `[DG001] Dangerous dynamic code/command execution sink on line ${vEvalLines.join(', ')}`,
+          });
+        }
+      }
+    }
+
+    // Remap finding locations from V to O and deduplicate against Pass-O findings
+    for (const vInline of vInlineFindings) {
+      const vOffset = vLineStarts[Math.max(0, Math.min(vInline.line - 1, vLineStarts.length - 1))];
+      const mapped = toOrigLineAndCol(code, virtualView.spanMap, vOffset);
+      const oLine = mapped.line;
+
+      // Deduplicate: discard if Pass-O already flagged the same ruleId at an overlapping line
+      const isDuplicate = inlineFindings.some(
+        (orig) =>
+          orig.ruleId === vInline.ruleId &&
+          (orig.line === oLine ||
+            (orig.endLine !== undefined && oLine >= orig.line && oLine <= orig.endLine))
+      );
+
+      if (!isDuplicate) {
+        const taggedMsg = vInline.message.includes('[via-fold]')
+          ? vInline.message
+          : `${vInline.message} [via-fold]`;
+        inlineFindings.push({
+          ...vInline,
+          line: oLine,
+          endLine: mapped.endLine > oLine ? mapped.endLine : undefined,
+          message: taggedMsg,
+        });
+      }
+    }
+
+    for (const vFinding of vFindings) {
+      const vOffset = vLineStarts[Math.max(0, Math.min(vFinding.line - 1, vLineStarts.length - 1))];
+      const mapped = toOrigLineAndCol(code, virtualView.spanMap, vOffset);
+      const oLine = mapped.line;
+
+      const isDuplicate = findings.some(
+        (orig) =>
+          orig.category === vFinding.category &&
+          (orig.line === oLine || (orig.extraLines?.includes(oLine) ?? false))
+      );
+
+      if (!isDuplicate) {
+        const tag = ' [via-fold]';
+        findings.push({
+          ...vFinding,
+          line: oLine,
+          extraLines: vFinding.extraLines
+            ? vFinding.extraLines.map((el) => {
+                const elOffset = vLineStarts[Math.max(0, Math.min(el - 1, vLineStarts.length - 1))];
+                return toOrigLineAndCol(code, virtualView.spanMap, elOffset).line;
+              })
+            : undefined,
+          shortReason: vFinding.shortReason.includes('[via-fold]')
+            ? vFinding.shortReason
+            : `${vFinding.shortReason}${tag}`,
+          detailedReason: vFinding.detailedReason.includes('[via-fold]')
+            ? vFinding.detailedReason
+            : `${vFinding.detailedReason}${tag}`,
+        });
+      }
+    }
   }
 
   // 4. Stage 3a: Non-Bypassable Suppression & Verified Allowlist Policy

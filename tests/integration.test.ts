@@ -75,6 +75,7 @@ import {
   type SpanMapSeg,
 } from '../src/devguardAnalyzer.js';
 import { CORPUS_CASES } from './corpus/cases.js';
+import { MAX_FOLD_EDITS } from '../src/devguardAnalyzer.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -5094,8 +5095,6 @@ test('65. Baseline Pass-O byte-for-byte identity proof across full benchmark cor
     );
 
     const vView = buildVirtualView(c.code);
-    assert.equal(vView.editsApplied, 0, `Case ${c.id}: Stage 5.3a must have 0 edits applied`);
-    assert.equal(vView.virtualCode, c.code, `Case ${c.id}: virtualCode must equal original code`);
     const inv = verifySpanMapInvariants(c.code, vView.virtualCode, vView.spanMap);
     assert.equal(inv.valid, true, `Case ${c.id}: SpanMap invariants must hold: ${inv.error}`);
 
@@ -5104,9 +5103,375 @@ test('65. Baseline Pass-O byte-for-byte identity proof across full benchmark cor
       declaredDependencies: ['lodash', 'express', '@google/genai', '@prisma/client'],
     });
     assert.ok(report.skor.totalScore >= 0 && report.skor.totalScore <= 100);
-    assert.equal(report.virtualView?.editsApplied, 0);
+    assert.ok(report.virtualView !== undefined);
+
+    if (vView.editsApplied === 0) {
+      assert.equal(vView.virtualCode, c.code, `Case ${c.id}: virtualCode must equal original code`);
+      assert.equal(report.virtualView?.editsApplied, 0);
+      const reportPassO = analyzeCodeDeterministically(c.code, {
+        filePath: 'src/case.ts',
+        declaredDependencies: ['lodash', 'express', '@google/genai', '@prisma/client'],
+        disableFolding: true,
+      });
+      assert.deepEqual(
+        report,
+        reportPassO,
+        `Case ${c.id}: Pass-O+V must be identical to Pass-O when editsApplied === 0`
+      );
+    }
   }
 });
+
+test('66. FOLD-03, FOLD-01, FOLD-02, FOLD-04 & Multi-Pass Composition Detection', () => {
+  // 1. window["ev" + "al"](userInput) -> DG001 via fold
+  const c1 = [
+    'function runAdminCode(userInput: string) {',
+    '  window["ev" + "al"](userInput);',
+    '}',
+  ].join('\n');
+  const r1 = analyzeCodeDeterministically(c1, { filePath: 'src/admin/eval.ts' });
+  assert.ok(r1.virtualView && r1.virtualView.editsApplied >= 2);
+  const dg001_1 = r1.inlineFindings?.find((f) => f.ruleId === 'DG001');
+  assert.ok(dg001_1, 'Expected DG001 to be flagged for window["ev" + "al"]');
+  assert.equal(dg001_1.line, 2, 'Line in O must be 2');
+  assert.ok(dg001_1.message.includes('[via-fold]'), 'Finding must include [via-fold]');
+
+  // 2. x[["ev", "al"].join("")](userInput) -> DG001 via fold
+  const c2 = [
+    'function runJoinCode(x: any, userInput: string) {',
+    '  x[["ev", "al"].join("")](userInput);',
+    '}',
+  ].join('\n');
+  const r2 = analyzeCodeDeterministically(c2, { filePath: 'src/admin/join.ts' });
+  assert.ok(r2.virtualView && r2.virtualView.editsApplied >= 2);
+  const dg001_2 = r2.inlineFindings?.find((f) => f.ruleId === 'DG001');
+  assert.ok(dg001_2, 'Expected DG001 to be flagged for x[["ev", "al"].join("")]');
+  assert.equal(dg001_2.line, 2, 'Line in O must be 2');
+  assert.ok(dg001_2.message.includes('[via-fold]'), 'Finding must include [via-fold]');
+
+  // 3. account?.["bal" + "ance"] across await -> DG006 via fold
+  const c3 = [
+    'async function debit(account: any, amount: number) {',
+    '  if (account?.["bal" + "ance"] >= amount) {',
+    '    await delay(50);',
+    '    account.balance -= amount;',
+    '  }',
+    '}',
+  ].join('\n');
+  const r3 = analyzeCodeDeterministically(c3, { filePath: 'src/billing/debit.ts' });
+  assert.ok(r3.virtualView && r3.virtualView.editsApplied >= 2);
+  const dg006 = r3.inlineFindings?.find((f) => f.ruleId === 'DG006');
+  assert.ok(dg006, 'Expected DG006 to be flagged for account?.["bal" + "ance"]');
+  assert.equal(dg006.line, 4, 'Mutation line in O must be 4');
+  assert.ok(dg006.message.includes('[via-fold]'), 'Finding must include [via-fold]');
+
+  // 4. require("lod" + "ahs") -> DG004 typosquatting detected via fold, NOT DG004-DYN-02!
+  const c4 = [
+    'export function getLodash() {',
+    '  return require("lod" + "ahs");',
+    '}',
+  ].join('\n');
+  const r4 = analyzeCodeDeterministically(c4, { filePath: 'src/vendor/lodash.ts' });
+  assert.ok(r4.virtualView && r4.virtualView.editsApplied >= 1);
+  const dg004 = r4.inlineFindings?.find((f) => f.ruleId === 'DG004');
+  assert.ok(dg004, 'Expected DG004 typosquatting to be flagged for folded require("lodahs")');
+  assert.equal(dg004.line, 2, 'Line in O must be 2');
+  assert.ok(dg004.message.includes('[via-fold]'), 'Finding must include [via-fold]');
+  assert.equal(
+    r4.inlineFindings?.some((f) => f.ruleId === 'DG004-DYN-02'),
+    false,
+    'DG004-DYN-02 must NOT trigger because argument folded to static literal in V'
+  );
+
+  // 5. require("./local" + "Chunk.js") -> folded so 0 warning DG004-DYN-02
+  const c5 = [
+    'export function getChunk() {',
+    '  return require("./local" + "Chunk.js");',
+    '}',
+  ].join('\n');
+  const r5 = analyzeCodeDeterministically(c5, { filePath: 'src/chunks/loader.ts' });
+  assert.ok(r5.virtualView && r5.virtualView.editsApplied >= 1);
+  const hasDyn2 = r5.inlineFindings ? r5.inlineFindings.some((f) => f.ruleId === 'DG004-DYN-02') : false;
+  assert.equal(hasDyn2, false, '0 DG004-DYN-02 warnings because require folded to relative literal');
+  const hasDg004 = r5.inlineFindings ? r5.inlineFindings.some((f) => f.ruleId === 'DG004') : false;
+  assert.equal(hasDg004, false, '0 DG004 warnings because relative import is not a package');
+
+  // 6. RegExp.prototype.exec must NOT trigger DG001 (neither in Pass-O nor via fold in Pass-V)
+  const c6 = [
+    'export function matchToken(pattern: RegExp, input: string) {',
+    '  const m1 = pattern.exec(input);',
+    '  const m2 = pattern["ex" + "ec"](input);',
+    '  return m1 || m2;',
+    '}',
+  ].join('\n');
+  const r6 = analyzeCodeDeterministically(c6, { filePath: 'src/utils/regexMatch.ts' });
+  const hasRegexDg001 = r6.inlineFindings ? r6.inlineFindings.some((f) => f.ruleId === 'DG001') : false;
+  assert.equal(hasRegexDg001, false, 'RegExp.prototype.exec must not trigger DG001');
+  assert.equal(r6.temuanUtama.line, '-', 'RegExp.prototype.exec must not produce a fatal finding');
+});
+
+test('67. Operator Precedence & Bracket Position Guards — Zero False Folding', () => {
+  const traps = [
+    'x - "a" + "b"',
+    '2 * "a" + "b"',
+    '"a" + "b".length',
+    '"a" + "b"?.length',
+    '"a" + "b" * 2',
+    '+"a" + "b"',
+    'typeof "a" + "b"',
+    'if (cond) ["a"].forEach(fn)',
+    'return ["a"]',
+    '{ ["k"]: 1 }',
+    'obj["a-b"]',
+    'obj["0"]',
+    'tag`hello`',
+    '"a\\nb" + "c"',
+  ];
+
+  for (const expr of traps) {
+    const vView = buildVirtualView(expr);
+    assert.equal(
+      vView.editsApplied,
+      0,
+      `Trap expression must not fold (editsApplied === 0): ${expr}`
+    );
+    assert.equal(vView.virtualCode, expr);
+  }
+});
+
+test('68. Differential Fold Test across Entire Corpus', () => {
+  const tnCases = CORPUS_CASES.filter((c) => c.label === 'TN');
+  assert.ok(tnCases.length >= 30, 'At least 30 TN cases must exist in corpus');
+
+  let foldsObservedOnTn = 0;
+  for (const c of tnCases) {
+    const reportPassO = analyzeCodeDeterministically(c.code, {
+      filePath: c.filePath,
+      declaredDependencies: c.declaredDependencies,
+      disableFolding: true,
+    });
+    const reportPassOV = analyzeCodeDeterministically(c.code, {
+      filePath: c.filePath,
+      declaredDependencies: c.declaredDependencies,
+    });
+
+    if (reportPassOV.virtualView?.editsApplied && reportPassOV.virtualView.editsApplied > 0) {
+      foldsObservedOnTn++;
+    }
+
+    // Verify Pass-V did not add any [via-fold] finding compared to Pass-O
+    const viaFoldFindings = (reportPassOV.inlineFindings || []).filter((f) =>
+      f.message.includes('[via-fold]')
+    );
+    assert.equal(
+      viaFoldFindings.length,
+      0,
+      `Case ${c.id}: Pass-V added false positive findings on TN: ${JSON.stringify(viaFoldFindings)}`
+    );
+
+    // Strict cross-rule TN invariant: zero findings from ANY rule (DG001-DG008 & DG004-DYN-*)
+    assert.equal(
+      (reportPassOV.inlineFindings ?? []).length,
+      0,
+      `Case ${c.id}: unexpected inline findings across any rule: ${JSON.stringify(reportPassOV.inlineFindings)}`
+    );
+    assert.equal(
+      reportPassOV.temuanUtama.line,
+      '-',
+      `Case ${c.id}: unexpected temuanUtama on TN: ${reportPassOV.temuanUtama.description}`
+    );
+    assert.ok(
+      (reportPassOV.inlineFindings ?? []).length <= (reportPassO.inlineFindings ?? []).length,
+      `Case ${c.id}: Pass-O+V must not add findings over Pass-O on TN (got Pass-O+V=${(reportPassOV.inlineFindings ?? []).length}, Pass-O=${(reportPassO.inlineFindings ?? []).length})`
+    );
+  }
+  assert.ok(foldsObservedOnTn > 0, 'At least one TN case must have exercised folding (e.g. static require concat)');
+});
+
+test('69. Adversarial DoS Limits & SARIF fold_limit_exceeded Notification', () => {
+  // 1. Chain with 200 operands (> MAX_FOLD_OPERANDS = 64)
+  const chain200 = Array(200).fill('"a"').join(' + ');
+  const t0 = performance.now();
+  const v1 = buildVirtualView(chain200);
+  const elapsed1 = performance.now() - t0;
+  assert.ok(elapsed1 < 100, `200 operands must complete under 100ms (took ${elapsed1.toFixed(2)}ms)`);
+  assert.equal(v1.limitExceeded, true, 'limitExceeded must be true for 200 operands');
+  assert.equal(v1.editsApplied, 0, 'untrusted operand chain must be skipped');
+
+  // 2. Result > MAX_FOLDED_LENGTH = 4096
+  const hugeStr = '"' + 'x'.repeat(2500) + '"';
+  const joinExceeds = `[${hugeStr}, ${hugeStr}].join("")`;
+  const v2 = buildVirtualView(joinExceeds);
+  assert.equal(v2.limitExceeded, true, 'limitExceeded must be true for folded length > 4096');
+  assert.equal(v2.editsApplied, 0);
+
+  // 3. File with > MAX_FOLD_EDITS = 2000
+  const manyFolds = Array(2200).fill('const x = "a" + "b";').join('\n');
+  const t2 = performance.now();
+  const v3 = buildVirtualView(manyFolds);
+  const elapsed3 = performance.now() - t2;
+  assert.ok(elapsed3 < 1000, `2200 edits must complete under 1000ms (took ${elapsed3.toFixed(2)}ms)`);
+  assert.equal(v3.limitExceeded, true, 'limitExceeded must be true when edits reach MAX_FOLD_EDITS');
+  assert.equal(v3.editsApplied, MAX_FOLD_EDITS, 'editsApplied must be capped at MAX_FOLD_EDITS');
+
+  // 4. Back-scan > MAX_BACKSCAN = 256
+  const backscanExceeds = '(' + 'x'.repeat(300) + ')["balance"]';
+  const v4 = buildVirtualView(backscanExceeds);
+  assert.equal(v4.limitExceeded, true, 'limitExceeded must be true when paren backscan exceeds MAX_BACKSCAN');
+  assert.equal(v4.editsApplied, 0);
+
+  // 5. SARIF emission: level 'note' deduplicated 1 per file
+  const dosReport = analyzeCodeDeterministically(chain200, { filePath: 'src/dos/chain.ts' });
+  assert.equal(dosReport.virtualView?.limitExceeded, true);
+  const summary: FileAuditSummary = {
+    ...toFileAuditSummary('src/dos/chain.ts', chain200),
+    foldLimitExceeded: dosReport.virtualView?.limitExceeded === true ? true : undefined,
+  };
+  const sarifPath = generateSarifReport([summary], 'test-dos.sarif');
+  const sarif = JSON.parse(fs.readFileSync(sarifPath, 'utf8'));
+  const notifs = sarif.runs[0].invocations?.[0]?.toolExecutionNotifications ?? [];
+  const foldNotifs = notifs.filter((n: any) => n.descriptor?.id === 'fold_limit_exceeded');
+  assert.equal(foldNotifs.length, 1, 'Exactly 1 fold_limit_exceeded notification per file');
+  assert.equal(foldNotifs[0].level, 'note');
+  assert.ok(foldNotifs[0].message.text.includes('fold_limit_exceeded'));
+  assert.equal(sarif.runs[0].invocations?.[0]?.executionSuccessful, true);
+  assert.equal(
+    sarif.runs[0].results.some((r: any) => r.ruleId === 'fold_limit_exceeded'),
+    false,
+    'fold_limit_exceeded notification must not pollute results[]'
+  );
+  try { fs.unlinkSync(sarifPath); } catch {}
+});
+
+test('70. Suppression & Redaction on Folded Spans + Benchmark Gate', () => {
+  // 1. Inline suppression // devguard-ignore DG008 on folded span
+  const suppressedCode = [
+    'function callStripe() {',
+    '  // devguard-ignore DG008: intentional un-timeouted fetch',
+    '  window["fe" + "tch"]("https://api.stripe.com/v1/charges");',
+    '}',
+  ].join('\n');
+  const repSup = analyzeCodeDeterministically(suppressedCode, { filePath: 'src/stripe.ts' });
+  const activeDg008 = (repSup.inlineFindings || []).filter((f) => f.ruleId === 'DG008');
+  assert.equal(activeDg008.length, 0, 'DG008 must be suppressed by inline devguard-ignore on O');
+  assert.ok(repSup.suppressions && repSup.suppressions.length > 0);
+  assert.equal(repSup.suppressions[0].ruleId, 'DG008');
+
+  // 2. Secret concatenation detected by DG007 in Pass-V and redacted without leaks
+  const secretCode = 'const stripeKey = "sk_live_" + "51H9xY2zA3bC4dE5fG6hI7jK8lM9nO0p";';
+  const repSecret = analyzeCodeDeterministically(secretCode, { filePath: 'src/keys.ts' });
+  const dg007Finding = repSecret.inlineFindings?.find((f) => f.ruleId === 'DG007');
+  assert.ok(dg007Finding, 'DG007 must detect folded secret');
+  assert.ok(dg007Finding.message.includes('[via-fold]'));
+  assert.equal(
+    dg007Finding.message.includes('51H9xY2zA3bC4dE5fG6hI7jK8lM9nO0p'),
+    false,
+    'DG007 message must NOT leak plaintext secret token'
+  );
+  if (repSecret.temuanUtama.description) {
+    assert.equal(repSecret.temuanUtama.description.includes('51H9xY2zA3bC4dE5fG6hI7jK8lM9nO0p'), false);
+  }
+  const vCode = repSecret.virtualView?.virtualCode ?? '';
+  const redacted = redactSecretsPreservingLayout(vCode);
+  assert.equal(redacted.includes('51H9xY2zA3bC4dE5fG6hI7jK8lM9nO0p'), false, 'Redacted code must not leak secret');
+  const llmResult = prepareRedactedCodeForLlm('src/keys.ts', vCode);
+  assert.equal(llmResult.safeCode.includes('51H9xY2zA3bC4dE5fG6hI7jK8lM9nO0p'), false, 'LLM safeCode must not leak secret');
+
+  // 3. Corpus Benchmark Gate: Pass-O vs Pass-O+V
+  // Warmup (5 full iterations of both modes so V8 JIT tiers are steady)
+  for (let w = 0; w < 5; w++) {
+    for (const c of CORPUS_CASES) {
+      analyzeCodeDeterministically(c.code, {
+        filePath: c.filePath,
+        declaredDependencies: c.declaredDependencies,
+        disableFolding: true,
+      });
+      analyzeCodeDeterministically(c.code, {
+        filePath: c.filePath,
+        declaredDependencies: c.declaredDependencies,
+      });
+    }
+  }
+
+  const ITERS = 25;
+  const isNonFold = CORPUS_CASES.map(
+    (c) => buildVirtualView(c.code, { isPython: c.filePath.endsWith('.py') }).editsApplied === 0
+  );
+  const nonFoldCount = isNonFold.filter(Boolean).length;
+
+  const median = (arr: number[]) => {
+    const sorted = arr.slice().sort((a, b) => a - b);
+    return sorted[Math.floor(sorted.length / 2)];
+  };
+  const passOTimes: number[] = [];
+  const passOVTimes: number[] = [];
+  const nfOTimes: number[] = [];
+  const nfOVTimes: number[] = [];
+  for (let iter = 0; iter < ITERS; iter++) {
+    let iterO = 0;
+    let iterOV = 0;
+    let iterNfO = 0;
+    let iterNfOV = 0;
+    for (let idx = 0; idx < CORPUS_CASES.length; idx++) {
+      const c = CORPUS_CASES[idx];
+      const runO = () => {
+        const s = performance.now();
+        analyzeCodeDeterministically(c.code, {
+          filePath: c.filePath,
+          declaredDependencies: c.declaredDependencies,
+          disableFolding: true,
+        });
+        const d = performance.now() - s;
+        iterO += d;
+        if (isNonFold[idx]) iterNfO += d;
+      };
+      const runOV = () => {
+        const s = performance.now();
+        analyzeCodeDeterministically(c.code, {
+          filePath: c.filePath,
+          declaredDependencies: c.declaredDependencies,
+        });
+        const d = performance.now() - s;
+        iterOV += d;
+        if (isNonFold[idx]) iterNfOV += d;
+      };
+      if (iter % 2 === 0) {
+        runO();
+        runOV();
+      } else {
+        runOV();
+        runO();
+      }
+    }
+    passOTimes.push(iterO);
+    passOVTimes.push(iterOV);
+    nfOTimes.push(iterNfO);
+    nfOVTimes.push(iterNfOV);
+  }
+
+  const timePassO = median(passOTimes);
+  const timePassOV = median(passOVTimes);
+  const overheadPct = ((timePassOV - timePassO) / Math.max(timePassO, 0.001)) * 100;
+  const timeNfO = median(nfOTimes);
+  const timeNfOV = median(nfOVTimes);
+  const overheadNfPct = ((timeNfOV - timeNfO) / Math.max(timeNfO, 0.001)) * 100;
+
+  console.log('\n=== DevGuard Benchmark Gate (Pass-O vs Pass-O+V) ===');
+  console.log(`Full Corpus (${CORPUS_CASES.length} cases, median of ${ITERS} iterations after warmup):`);
+  console.log(`  Pass-O Only:   ${timePassO.toFixed(2)} ms (${(timePassO / CORPUS_CASES.length).toFixed(3)} ms/case)`);
+  console.log(`  Pass-O+V:      ${timePassOV.toFixed(2)} ms (${(timePassOV / CORPUS_CASES.length).toFixed(3)} ms/case)`);
+  console.log(`  Overhead:      ${overheadPct >= 0 ? '+' : ''}${overheadPct.toFixed(2)}% (SPEC §9 gate <= +25%)`);
+  console.log(`Non-Fold Subset (${nonFoldCount} cases with editsApplied === 0):`);
+  console.log(`  Pass-O Only:   ${timeNfO.toFixed(2)} ms`);
+  console.log(`  Pass-O+V:      ${timeNfOV.toFixed(2)} ms`);
+  console.log(`  Overhead:      ${overheadNfPct >= 0 ? '+' : ''}${overheadNfPct.toFixed(2)}% (SPEC §9 gate <= +25%)`);
+  console.log(`  Throughput:    ${(CORPUS_CASES.length / (timePassOV / 1000)).toFixed(0)} cases/sec`);
+
+  assert.ok(timePassOV < 5000, `Full benchmark must complete in < 5000ms (took ${timePassOV.toFixed(2)}ms)`);
+  assert.ok(overheadPct <= 25, `SPEC §9 benchmark gate on full corpus exceeded: ${overheadPct.toFixed(2)}% > 25%`);
+  assert.ok(overheadNfPct <= 25, `SPEC §9 benchmark gate on non-fold baseline exceeded: ${overheadNfPct.toFixed(2)}% > 25%`);
+});
+
 
 
 
