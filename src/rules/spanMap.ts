@@ -1,5 +1,50 @@
-import type { LexicalRegion } from './lexicalMasker.js';
-import { isRangeStrictlyInCodeRegion } from './lexicalMasker.js';
+import type { ExtractedStringLiteral, LexicalRegion } from './lexicalMasker.js';
+import { analyzeLexicalStructure, isRangeStrictlyInCodeRegion } from './lexicalMasker.js';
+
+export const MAX_FOLD_DEPTH = 4;
+export const MAX_FOLD_OPERANDS = 64;
+export const MAX_FOLDED_LENGTH = 4096;
+export const MAX_FOLD_EDITS = 2000;
+export const MAX_BACKSCAN = 256;
+
+const ASCII_IDENT_RE = /^[A-Za-z_$][\w$]*$/;
+
+const FOLD04_REJECTED_KEYWORDS = new Set([
+  'return', 'typeof', 'in', 'of', 'instanceof', 'new', 'delete', 'void',
+  'throw', 'case', 'do', 'else', 'yield', 'await', 'extends',
+  'if', 'while', 'for', 'with', 'switch', 'catch',
+  'class', 'function', 'var', 'let', 'const', 'import', 'export', 'default',
+  'try', 'finally', 'debugger',
+]);
+
+const CONTROL_KEYWORDS = new Set([
+  'if', 'while', 'for', 'with', 'switch', 'catch',
+]);
+
+function isSafeLiteral(rawText: string, value: string): boolean {
+  if (rawText.includes('\\') || rawText.includes('\n') || rawText.includes('\r')) {
+    return false;
+  }
+  if (value.includes('\\') || value.includes('\n') || value.includes('\r')) {
+    return false;
+  }
+  return true;
+}
+
+function overlapsCommentOrRegex(
+  start: number,
+  end: number,
+  regions: ReadonlyArray<LexicalRegion>
+): boolean {
+  for (const r of regions) {
+    if (r.kind === 'comment' || r.kind === 'regex') {
+      if (Math.max(start, r.start) < Math.min(end, r.end)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
 
 export interface SpanMapSeg {
   vStart: number;
@@ -439,19 +484,556 @@ export function verifySpanMapInvariants(
   return { valid: true };
 }
 
+function collectFold03Edits(
+  source: string,
+  _maskedCode: string,
+  stringLiterals: ReadonlyArray<ExtractedStringLiteral>,
+  regions: ReadonlyArray<LexicalRegion>
+): { edits: FoldTextEdit[]; limitFlag: boolean } {
+  if (stringLiterals.length === 0 || !source.includes('`')) return { edits: [], limitFlag: false };
+  const edits: FoldTextEdit[] = [];
+  let limitFlag = false;
+
+  for (const lit of stringLiterals) {
+    if (lit.quote !== '`') continue;
+    if (lit.hasInterpolation) continue;
+
+    const raw = source.slice(lit.startOffset, lit.endOffset);
+    if (!isSafeLiteral(raw, lit.value)) continue;
+    if (overlapsCommentOrRegex(lit.startOffset, lit.endOffset, regions)) continue;
+
+    // Check region kind: must be template region
+    let inTemplate = false;
+    for (const r of regions) {
+      if (lit.startOffset >= r.start && lit.endOffset <= r.end) {
+        if (r.kind === 'template') inTemplate = true;
+        break;
+      }
+    }
+    if (!inTemplate) continue;
+
+    // Guard: not a tagged template (token before ` cannot be identifier, ), ], or literal quote)
+    let prevIdx = lit.startOffset - 1;
+    while (prevIdx >= 0 && /\s/.test(source[prevIdx])) prevIdx--;
+    if (prevIdx >= 0) {
+      const prevCh = source[prevIdx];
+      if (
+        /[A-Za-z0-9_$]/.test(prevCh) ||
+        prevCh === ')' ||
+        prevCh === ']' ||
+        prevCh === "'" ||
+        prevCh === '"' ||
+        prevCh === '`'
+      ) {
+        continue;
+      }
+    }
+
+    const val = lit.value;
+    if (val.length > MAX_FOLDED_LENGTH) {
+      limitFlag = true;
+      continue;
+    }
+
+    let chosenQuote = '"';
+    if (val.includes('"')) {
+      if (val.includes("'")) {
+        continue; // Contains both " and ', cannot fold without escape
+      }
+      chosenQuote = "'";
+    }
+
+    edits.push({
+      start: lit.startOffset,
+      end: lit.endOffset,
+      replacement: chosenQuote + val + chosenQuote,
+    });
+  }
+
+  return { edits, limitFlag };
+}
+
+function collectFold01Edits(
+  source: string,
+  maskedCode: string,
+  stringLiterals: ReadonlyArray<ExtractedStringLiteral>,
+  regions: ReadonlyArray<LexicalRegion>
+): { edits: FoldTextEdit[]; limitFlag: boolean } {
+  if (stringLiterals.length < 2 || !maskedCode.includes('+')) return { edits: [], limitFlag: false };
+  const edits: FoldTextEdit[] = [];
+  let limitFlag = false;
+
+  const safeLiterals = stringLiterals.filter((lit) => {
+    if (lit.quote !== "'" && lit.quote !== '"') return false;
+    const raw = source.slice(lit.startOffset, lit.endOffset);
+    if (!isSafeLiteral(raw, lit.value)) return false;
+    if (overlapsCommentOrRegex(lit.startOffset, lit.endOffset, regions)) return false;
+    return true;
+  });
+
+  const chains: ExtractedStringLiteral[][] = [];
+  let i = 0;
+  while (i < safeLiterals.length) {
+    const currentChain: ExtractedStringLiteral[] = [safeLiterals[i]];
+    let j = i + 1;
+    while (j < safeLiterals.length) {
+      const prev = currentChain[currentChain.length - 1];
+      const next = safeLiterals[j];
+      const gap = source.slice(prev.endOffset, next.startOffset);
+      if (/^\s*\+\s*$/.test(gap)) {
+        const plusIdx = prev.endOffset + gap.indexOf('+');
+        if (!overlapsCommentOrRegex(plusIdx, plusIdx + 1, regions)) {
+          currentChain.push(next);
+          j++;
+          continue;
+        }
+      }
+      break;
+    }
+    if (currentChain.length >= 2) {
+      chains.push(currentChain);
+      i = j;
+    } else {
+      i++;
+    }
+  }
+
+  for (const chain of chains) {
+    if (chain.length > MAX_FOLD_OPERANDS) {
+      limitFlag = true;
+      continue;
+    }
+
+    const combined = chain.map((l) => l.value).join('');
+    if (combined.length > MAX_FOLDED_LENGTH) {
+      limitFlag = true;
+      continue;
+    }
+
+    const L1 = chain[0];
+    const Ln = chain[chain.length - 1];
+
+    // Guard Token Before L1
+    let idx = L1.startOffset - 1;
+    while (idx >= 0 && /\s/.test(maskedCode[idx])) idx--;
+    if (idx >= 0) {
+      if (/[A-Za-z0-9_$]/.test(maskedCode[idx])) {
+        let wStart = idx;
+        while (wStart > 0 && /[A-Za-z0-9_$]/.test(maskedCode[wStart - 1])) wStart--;
+        const word = maskedCode.slice(wStart, idx + 1);
+        if (word !== 'return') {
+          continue;
+        }
+      } else if (maskedCode[idx] === '+') {
+        if (idx > 0 && maskedCode[idx - 1] === '+') continue;
+        let pIdx = idx - 1;
+        while (pIdx >= 0 && /\s/.test(maskedCode[pIdx])) pIdx--;
+        if (pIdx < 0) continue; // Unary +
+        const prevCh = maskedCode[pIdx];
+        if (prevCh === ']') {
+          // Binary +
+        } else if (prevCh === ')') {
+          let depth = 1;
+          let matchP = -1;
+          const maxB = Math.max(0, pIdx - MAX_BACKSCAN);
+          for (let b = pIdx - 1; b >= maxB; b--) {
+            if (maskedCode[b] === ')') depth++;
+            else if (maskedCode[b] === '(') {
+              depth--;
+              if (depth === 0) { matchP = b; break; }
+            }
+          }
+          if (matchP === -1) {
+            limitFlag = true;
+            continue;
+          }
+          let bp = matchP - 1;
+          while (bp >= 0 && /\s/.test(maskedCode[bp])) bp--;
+          if (bp >= 0 && /[A-Za-z0-9_$]/.test(maskedCode[bp])) {
+            let cpStart = bp;
+            while (cpStart > 0 && /[A-Za-z0-9_$]/.test(maskedCode[cpStart - 1])) cpStart--;
+            const cpWord = maskedCode.slice(cpStart, bp + 1);
+            if (CONTROL_KEYWORDS.has(cpWord)) {
+              continue; // Unary + after control header
+            }
+          }
+        } else if (prevCh === "'" || prevCh === '"' || prevCh === '`') {
+          // Binary + after literal
+        } else if (/[A-Za-z0-9_$]/.test(prevCh)) {
+          let pwStart = pIdx;
+          while (pwStart > 0 && /[A-Za-z0-9_$]/.test(maskedCode[pwStart - 1])) pwStart--;
+          const pwWord = maskedCode.slice(pwStart, pIdx + 1);
+          if (FOLD04_REJECTED_KEYWORDS.has(pwWord)) {
+            continue; // Unary + after keyword
+          }
+        } else {
+          continue; // Unary + after operator/delimiter
+        }
+      } else {
+        const ch = maskedCode[idx];
+        if (ch === '-' || ch === '*' || ch === '/' || ch === '%' || ch === '!' || ch === '~') {
+          continue;
+        }
+        if (ch === '.') {
+          if (idx >= 2 && maskedCode[idx - 1] === '.' && maskedCode[idx - 2] === '.') {
+            // Spread ...
+          } else {
+            continue;
+          }
+        } else if (ch === '?') {
+          if (idx > 0 && maskedCode[idx - 1] === '.') continue;
+        } else if (ch === '(' || ch === '[' || ch === '{' || ch === ',' || ch === ';' || ch === ':') {
+          // Allowed delimiter
+        } else if (ch === '=' || ch === '<' || ch === '>' || ch === '&' || ch === '|' || ch === '^') {
+          // Allowed lower precedence operator
+        } else {
+          continue;
+        }
+      }
+    }
+
+    // Guard Token After Ln
+    let afterIdx = Ln.endOffset;
+    while (afterIdx < maskedCode.length && /\s/.test(maskedCode[afterIdx])) afterIdx++;
+    if (afterIdx < maskedCode.length) {
+      const nextChar = maskedCode[afterIdx];
+      if (
+        nextChar === '.' ||
+        (nextChar === '?' && maskedCode[afterIdx + 1] === '.') ||
+        nextChar === '[' ||
+        nextChar === '(' ||
+        nextChar === '`' ||
+        nextChar === '*' ||
+        nextChar === '/' ||
+        nextChar === '%'
+      ) {
+        continue;
+      }
+    }
+
+    const quote = L1.quote;
+    if (combined.includes(quote)) continue;
+
+    edits.push({
+      start: L1.startOffset,
+      end: Ln.endOffset,
+      replacement: quote + combined + quote,
+    });
+  }
+
+  return { edits, limitFlag };
+}
+
+function collectFold02Edits(
+  source: string,
+  maskedCode: string,
+  stringLiterals: ReadonlyArray<ExtractedStringLiteral>,
+  regions: ReadonlyArray<LexicalRegion>
+): { edits: FoldTextEdit[]; limitFlag: boolean } {
+  if (stringLiterals.length === 0 || !maskedCode.includes('[') || !maskedCode.includes('join')) {
+    return { edits: [], limitFlag: false };
+  }
+  const edits: FoldTextEdit[] = [];
+  let limitFlag = false;
+
+  let pos = 0;
+  while (pos < source.length) {
+    const openBracketIdx = source.indexOf('[', pos);
+    if (openBracketIdx === -1) break;
+    pos = openBracketIdx + 1;
+
+    if (overlapsCommentOrRegex(openBracketIdx, openBracketIdx + 1, regions)) continue;
+
+    // Guard Posisi [: token before [ cannot be identifier non-keyword, ), ], or ?.
+    let idx = openBracketIdx - 1;
+    while (idx >= 0 && /\s/.test(maskedCode[idx])) idx--;
+    if (idx >= 0) {
+      const prevCh = maskedCode[idx];
+      if (prevCh === ')' || prevCh === ']') continue;
+      if (prevCh === '.' && idx > 0 && maskedCode[idx - 1] === '?') continue;
+      if (/[A-Za-z0-9_$]/.test(prevCh)) {
+        let wStart = idx;
+        while (wStart > 0 && /[A-Za-z0-9_$]/.test(maskedCode[wStart - 1])) wStart--;
+        const word = maskedCode.slice(wStart, idx + 1);
+        if (!FOLD04_REJECTED_KEYWORDS.has(word)) {
+          continue;
+        }
+      }
+    }
+
+    const closeBracketIdx = source.indexOf(']', openBracketIdx + 1);
+    if (closeBracketIdx === -1 || overlapsCommentOrRegex(closeBracketIdx, closeBracketIdx + 1, regions)) continue;
+
+    const innerText = source.slice(openBracketIdx + 1, closeBracketIdx);
+    if (innerText.includes('[') || innerText.includes('{') || innerText.includes('(')) continue;
+
+    const lits = stringLiterals.filter(
+      (l) => l.startOffset >= openBracketIdx + 1 && l.endOffset <= closeBracketIdx
+    );
+    if (lits.length === 0) continue;
+    if (lits.length > MAX_FOLD_OPERANDS) {
+      limitFlag = true;
+      continue;
+    }
+
+    const allSafe = lits.every(
+      (l) =>
+        (l.quote === "'" || l.quote === '"') &&
+        isSafeLiteral(source.slice(l.startOffset, l.endOffset), l.value)
+    );
+    if (!allSafe) continue;
+
+    if (source.slice(openBracketIdx + 1, lits[0].startOffset).trim() !== '') continue;
+    let validCommas = true;
+    for (let k = 0; k < lits.length - 1; k++) {
+      const gap = source.slice(lits[k].endOffset, lits[k + 1].startOffset);
+      if (!/^\s*,\s*$/.test(gap)) {
+        validCommas = false;
+        break;
+      }
+    }
+    if (!validCommas) continue;
+    if (source.slice(lits[lits.length - 1].endOffset, closeBracketIdx).trim() !== '') continue;
+
+    // After ]: must be followed by .join(
+    let afterIdx = closeBracketIdx + 1;
+    while (afterIdx < maskedCode.length && /\s/.test(maskedCode[afterIdx])) afterIdx++;
+    if (maskedCode[afterIdx] !== '.') continue;
+    afterIdx++;
+    while (afterIdx < maskedCode.length && /\s/.test(maskedCode[afterIdx])) afterIdx++;
+    if (maskedCode.slice(afterIdx, afterIdx + 4) !== 'join') continue;
+    afterIdx += 4;
+    while (afterIdx < maskedCode.length && /\s/.test(maskedCode[afterIdx])) afterIdx++;
+    if (maskedCode[afterIdx] !== '(') continue;
+    const openParenIdx = afterIdx;
+
+    const closeParenIdx = maskedCode.indexOf(')', openParenIdx + 1);
+    if (closeParenIdx === -1) continue;
+
+    const arg = source.slice(openParenIdx + 1, closeParenIdx).trim();
+    let separator = ',';
+    if (arg !== '') {
+      const argLits = stringLiterals.filter(
+        (l) => l.startOffset >= openParenIdx + 1 && l.endOffset <= closeParenIdx
+      );
+      if (argLits.length !== 1) continue;
+      const argLit = argLits[0];
+      if (source.slice(argLit.startOffset, argLit.endOffset) !== arg) continue;
+      if (!isSafeLiteral(arg, argLit.value)) continue;
+      separator = argLit.value;
+    }
+
+    const joined = lits.map((l) => l.value).join(separator);
+    if (joined.length > MAX_FOLDED_LENGTH) {
+      limitFlag = true;
+      continue;
+    }
+    const quote = lits[0].quote;
+    if (joined.includes(quote)) continue;
+
+    edits.push({
+      start: openBracketIdx,
+      end: closeParenIdx + 1,
+      replacement: quote + joined + quote,
+    });
+  }
+
+  return { edits, limitFlag };
+}
+
+function collectFold04Edits(
+  source: string,
+  maskedCode: string,
+  stringLiterals: ReadonlyArray<ExtractedStringLiteral>,
+  regions: ReadonlyArray<LexicalRegion>
+): { edits: FoldTextEdit[]; limitFlag: boolean } {
+  if (stringLiterals.length === 0 || !maskedCode.includes('[')) return { edits: [], limitFlag: false };
+  const edits: FoldTextEdit[] = [];
+  let limitFlag = false;
+
+  let pos = 0;
+  while (pos < source.length) {
+    const openBracketIdx = source.indexOf('[', pos);
+    if (openBracketIdx === -1) break;
+    pos = openBracketIdx + 1;
+
+    if (overlapsCommentOrRegex(openBracketIdx, openBracketIdx + 1, regions)) continue;
+
+    let idx = openBracketIdx - 1;
+    while (idx >= 0 && /\s/.test(maskedCode[idx])) idx--;
+    if (idx < 0) continue;
+
+    let hasOptChain = false;
+    let optChainStart = -1;
+    let tokenEnd = idx;
+
+    if (idx > 0 && maskedCode[idx] === '.' && maskedCode[idx - 1] === '?') {
+      hasOptChain = true;
+      optChainStart = idx - 1;
+      tokenEnd = idx - 2;
+      while (tokenEnd >= 0 && /\s/.test(maskedCode[tokenEnd])) tokenEnd--;
+      if (tokenEnd < 0) continue;
+    }
+
+    const ch = maskedCode[tokenEnd];
+    if (ch === '}' || /[0-9]/.test(ch) || ch === "'" || ch === '"' || ch === '`') {
+      continue;
+    }
+
+    if (ch === ']') {
+      // Allowed member access
+    } else if (ch === ')') {
+      let depth = 1;
+      let matchParen = -1;
+      const maxB = Math.max(0, tokenEnd - MAX_BACKSCAN);
+      for (let b = tokenEnd - 1; b >= maxB; b--) {
+        if (maskedCode[b] === ')') depth++;
+        else if (maskedCode[b] === '(') {
+          depth--;
+          if (depth === 0) {
+            matchParen = b;
+            break;
+          }
+        }
+      }
+      if (matchParen === -1) {
+        limitFlag = true;
+        continue;
+      }
+      let bp = matchParen - 1;
+      while (bp >= 0 && /\s/.test(maskedCode[bp])) bp--;
+      if (bp >= 0 && /[A-Za-z0-9_$]/.test(maskedCode[bp])) {
+        let cpStart = bp;
+        while (cpStart > 0 && /[A-Za-z0-9_$]/.test(maskedCode[cpStart - 1])) cpStart--;
+        const cpWord = maskedCode.slice(cpStart, bp + 1);
+        if (CONTROL_KEYWORDS.has(cpWord)) {
+          continue;
+        }
+      }
+    } else if (/[A-Za-z_$]/.test(ch)) {
+      let idStart = tokenEnd;
+      while (idStart > 0 && /[A-Za-z0-9_$]/.test(maskedCode[idStart - 1])) idStart--;
+      const idWord = maskedCode.slice(idStart, tokenEnd + 1);
+      if (!ASCII_IDENT_RE.test(idWord) || FOLD04_REJECTED_KEYWORDS.has(idWord)) {
+        continue;
+      }
+    } else {
+      continue;
+    }
+
+    const closeBracketIdx = source.indexOf(']', openBracketIdx + 1);
+    if (closeBracketIdx === -1) continue;
+
+    const inner = source.slice(openBracketIdx + 1, closeBracketIdx).trim();
+    const innerLits = stringLiterals.filter(
+      (l) => l.startOffset >= openBracketIdx + 1 && l.endOffset <= closeBracketIdx
+    );
+    if (innerLits.length !== 1) continue;
+    const propLit = innerLits[0];
+    if (source.slice(propLit.startOffset, propLit.endOffset) !== inner) continue;
+    if (propLit.quote !== "'" && propLit.quote !== '"') continue;
+    if (!isSafeLiteral(inner, propLit.value)) continue;
+    if (!ASCII_IDENT_RE.test(propLit.value)) continue;
+
+    const editStart = hasOptChain ? optChainStart : openBracketIdx;
+    const rep = (hasOptChain ? '?.' : '.') + propLit.value;
+    edits.push({
+      start: editStart,
+      end: closeBracketIdx + 1,
+      replacement: rep,
+    });
+  }
+
+  return { edits, limitFlag };
+}
+
 /**
- * Builds the virtual view pipeline. In Stage 5.3a, 0 folds are active (virtualCode === originalSource, editsApplied === 0).
+ * Builds the virtual view pipeline. In Stage 5.3b, constant folding FOLD-03/01/02/04
+ * is executed iteratively up to MAX_FOLD_DEPTH passes within deterministic bounds.
  */
 export function buildVirtualView(
   originalSource: string,
-  _options?: { isPython?: boolean }
+  options?: { isPython?: boolean; initialLex?: ReturnType<typeof analyzeLexicalStructure> }
 ): VirtualViewResult {
-  try {
+  if (typeof originalSource !== 'string') throw new TypeError('originalSource must be a string');
+  if (originalSource.length === 0 || options?.isPython) {
     return {
       virtualCode: originalSource,
       spanMap: createIdentitySpanMap(originalSource.length),
       editsApplied: 0,
       limitExceeded: false,
+    };
+  }
+
+  try {
+    let currentCode = originalSource;
+    let currentSpanMap = createIdentitySpanMap(originalSource.length);
+    let totalEdits = 0;
+    let limitExceeded = false;
+    let currentLex = options?.initialLex ?? analyzeLexicalStructure(currentCode, false);
+    if (currentLex.stringLiterals.length === 0) {
+      return {
+        virtualCode: originalSource,
+        spanMap: currentSpanMap,
+        editsApplied: 0,
+        limitExceeded: false,
+      };
+    }
+
+    for (let depth = 0; depth < MAX_FOLD_DEPTH; depth++) {
+      let editsInPass = 0;
+
+      const foldOps = [
+        collectFold03Edits,
+        collectFold01Edits,
+        collectFold02Edits,
+        collectFold04Edits,
+      ];
+
+      for (const foldOp of foldOps) {
+        if (totalEdits >= MAX_FOLD_EDITS) {
+          limitExceeded = true;
+          break;
+        }
+
+        const { edits, limitFlag } = foldOp(
+          currentCode,
+          currentLex.maskedCode,
+          currentLex.stringLiterals,
+          currentLex.regions
+        );
+        if (limitFlag) {
+          limitExceeded = true;
+        }
+        if (edits.length === 0) continue;
+
+        let toApply = edits;
+        if (totalEdits + toApply.length > MAX_FOLD_EDITS) {
+          toApply = toApply.slice(0, MAX_FOLD_EDITS - totalEdits);
+          limitExceeded = true;
+        }
+        if (toApply.length === 0) break;
+
+        const applied = applyTextEditsWithSpanMap(currentCode, toApply);
+        if (applied.appliedCount > 0) {
+          currentCode = applied.virtualText;
+          currentSpanMap = composeSpanMaps(currentSpanMap, applied.spanMap);
+          totalEdits += applied.appliedCount;
+          editsInPass += applied.appliedCount;
+          currentLex = analyzeLexicalStructure(currentCode, false);
+        }
+      }
+
+      if (editsInPass === 0 || totalEdits >= MAX_FOLD_EDITS) {
+        break;
+      }
+    }
+
+    return {
+      virtualCode: currentCode,
+      spanMap: currentSpanMap,
+      editsApplied: totalEdits,
+      limitExceeded,
     };
   } catch {
     return {
