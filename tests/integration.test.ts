@@ -59,6 +59,22 @@ import {
 } from '../src/githubCommenter.js';
 import { MAX_GLOB_PATTERN_LENGTH, matchLinearGlob } from '../src/devguardAnalyzer.js';
 import { MAX_DYN_FINDINGS_PER_FILE } from '../src/githubCommenter.js';
+import {
+  applyTextEditsWithSpanMap,
+  buildVirtualView,
+  composeSpanMaps,
+  createIdentitySpanMap,
+  isRangeStrictlyInCodeRegion,
+  toOrigLineAndCol,
+  toOrigSpan,
+  verifySpanMapInvariants,
+  type FoldTextEdit,
+  type LexicalRegion,
+  type LexicalRegionKind,
+  type SpanMap,
+  type SpanMapSeg,
+} from '../src/devguardAnalyzer.js';
+import { CORPUS_CASES } from './corpus/cases.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -4852,5 +4868,245 @@ test('61. PR comment caps DYN findings at MAX_DYN_FINDINGS_PER_FILE=20 with +N m
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
 });
+
+test('62. LexicalRegion contiguity, non-overlapping coverage, and classification accuracy across comments, strings, templates, regexes, and non-BMP UTF-16 surrogates', () => {
+  // Empty string
+  const emptyRes = analyzeLexicalStructure('');
+  assert.deepEqual(emptyRes.regions, []);
+  assert.equal(isRangeStrictlyInCodeRegion(emptyRes.regions, 0, 1), false);
+
+  const sampleJs = [
+    '// line comment',
+    'const a = "hello \\"world\\"";',
+    '/* block comment */',
+    "const b = 'single';",
+    'const tpl1 = `plain template`;',
+    'const tpl2 = `interpolated ${a} here`;',
+    'const re1 = /a\\/b/gi;',
+    'const div = 10 / 2 / 1;',
+    'const emoji = "🚀 Antigravity"; // non-BMP UTF-16 surrogate pair',
+  ].join('\n');
+
+  const resJs = analyzeLexicalStructure(sampleJs);
+  const regions = resJs.regions;
+
+  // 1. Invariants check
+  assert.ok(regions.length > 0);
+  assert.equal(regions[0].start, 0);
+  assert.equal(regions[regions.length - 1].end, sampleJs.length);
+  for (let i = 0; i < regions.length; i++) {
+    const r = regions[i];
+    assert.ok(r.start < r.end, `Region ${i} start ${r.start} must be < end ${r.end}`);
+    if (i > 0) {
+      assert.equal(r.start, regions[i - 1].end, `Region ${i} start must equal previous end`);
+      assert.notEqual(r.kind, regions[i - 1].kind, `Adjacent regions ${i - 1} and ${i} must be coalesced`);
+    }
+  }
+
+  // 2. Specific constructs classification check
+  const lineCommentReg = regions.find((r) => r.kind === 'comment' && sampleJs.slice(r.start, r.end).includes('line comment'));
+  assert.ok(lineCommentReg);
+  const blockCommentReg = regions.find((r) => r.kind === 'comment' && sampleJs.slice(r.start, r.end).includes('block comment'));
+  assert.ok(blockCommentReg);
+  const strReg = regions.find((r) => r.kind === 'string' && sampleJs.slice(r.start, r.end).includes('hello'));
+  assert.ok(strReg);
+  const tplReg = regions.find((r) => r.kind === 'template' && sampleJs.slice(r.start, r.end).includes('plain template'));
+  assert.ok(tplReg);
+  const regexReg = regions.find((r) => r.kind === 'regex' && sampleJs.slice(r.start, r.end).includes('/a\\/b/gi'));
+  assert.ok(regexReg);
+
+  // Division operator should be in code region
+  const divOffset = sampleJs.indexOf('10 / 2 / 1');
+  assert.ok(divOffset >= 0);
+  assert.ok(isRangeStrictlyInCodeRegion(regions, divOffset, divOffset + 10), 'Division expression must be in code region');
+
+  // 3. isRangeStrictlyInCodeRegion helper tests
+  assert.ok(isRangeStrictlyInCodeRegion(regions, sampleJs.indexOf('const a'), sampleJs.indexOf('const a') + 7));
+  assert.equal(isRangeStrictlyInCodeRegion(regions, strReg.start, strReg.end), false, 'String must not be code region');
+  assert.equal(isRangeStrictlyInCodeRegion(regions, lineCommentReg.start, lineCommentReg.end), false, 'Comment must not be code region');
+  assert.equal(isRangeStrictlyInCodeRegion(regions, tplReg.start, tplReg.end), false, 'Template must not be code region');
+  assert.equal(isRangeStrictlyInCodeRegion(regions, regexReg.start, regexReg.end), false, 'Regex must not be code region');
+  assert.equal(isRangeStrictlyInCodeRegion(regions, strReg.start - 2, strReg.start + 2), false, 'Straddling boundary must not be code region');
+
+  // Python hash comments
+  const pyCode = [
+    '# python comment',
+    'val = "test"',
+  ].join('\n');
+  const pyRes = analyzeLexicalStructure(pyCode, true);
+  const pyCommentReg = pyRes.regions.find((r) => r.kind === 'comment');
+  assert.ok(pyCommentReg);
+  assert.ok(pyCode.slice(pyCommentReg.start, pyCommentReg.end).startsWith('# python comment'));
+});
+
+test('63. SpanMap single-pass editing, multi-pass composition, binary search toOrigSpan, and toOrigLineAndCol across multi-line expressions and non-BMP UTF-16 surrogates', () => {
+  const origSource = [
+    '// Header with emoji 🚀',
+    'function runDynamic(target: string) {',
+    '  const fn = x[["ev", "al"].join("")](target);',
+    '  return fn;',
+    '}',
+  ].join('\n');
+
+  const origLex = analyzeLexicalStructure(origSource);
+  const origRegions = origLex.regions;
+
+  // Pass 1: fold '["ev", "al"].join("")' into '"eval"'
+  const targetExpr = '["ev", "al"].join("")';
+  const exprStart = origSource.indexOf(targetExpr);
+  assert.ok(exprStart > 0);
+  const exprEnd = exprStart + targetExpr.length;
+
+  const pass1 = applyTextEditsWithSpanMap(
+    origSource,
+    [{ start: exprStart, end: exprEnd, replacement: '"eval"' }]
+  );
+  assert.equal(pass1.appliedCount, 1);
+  assert.ok(pass1.virtualText.includes('x["eval"](target)'));
+  const inv1 = verifySpanMapInvariants(origSource, pass1.virtualText, pass1.spanMap);
+  assert.equal(inv1.valid, true, inv1.error);
+
+  // Pass 2: fold 'x["eval"]' into 'x.eval' on pass1.virtualText
+  const v1Text = pass1.virtualText;
+  const v1Target = 'x["eval"]';
+  const v1Start = v1Text.indexOf(v1Target);
+  assert.ok(v1Start > 0);
+  const v1End = v1Start + v1Target.length;
+
+  const pass2 = applyTextEditsWithSpanMap(
+    v1Text,
+    [{ start: v1Start, end: v1End, replacement: 'x.eval' }]
+  );
+  assert.equal(pass2.appliedCount, 1);
+  assert.ok(pass2.virtualText.includes('x.eval(target)'));
+  const inv2 = verifySpanMapInvariants(v1Text, pass2.virtualText, pass2.spanMap);
+  assert.equal(inv2.valid, true, inv2.error);
+
+  // Compose Pass 1 and Pass 2
+  const composedMap = composeSpanMaps(pass1.spanMap, pass2.spanMap);
+  const invComposed = verifySpanMapInvariants(origSource, pass2.virtualText, composedMap);
+  assert.equal(invComposed.valid, true, invComposed.error);
+
+  // Finding on virtual text at 'x.eval'
+  const findingVStart = pass2.virtualText.indexOf('x.eval');
+  const findingVEnd = findingVStart + 'x.eval'.length;
+
+  const origSpan = toOrigSpan(composedMap, findingVStart, findingVEnd);
+  const origExpectedStart = origSource.indexOf('x[["ev", "al"].join("")]');
+  const origExpectedEnd = origExpectedStart + 'x[["ev", "al"].join("")]'.length;
+  assert.equal(origSpan.oStart, origExpectedStart);
+  assert.equal(origSpan.oEnd, origExpectedEnd);
+
+  // Line and col mapping
+  const lineCol = toOrigLineAndCol(origSource, composedMap, findingVStart, findingVEnd);
+  assert.equal(lineCol.line, 3);
+  assert.equal(lineCol.col, origSource.split('\n')[2].indexOf('x[["ev", "al"].join("")]') + 1);
+
+  // Fail-open checks: invalid, out-of-bounds, or edits in comments are skipped
+  const commentStart = origSource.indexOf('Header with emoji');
+  const failedEdits = applyTextEditsWithSpanMap(
+    origSource,
+    [
+      { start: commentStart, end: commentStart + 5, replacement: 'bad' },
+      { start: -5, end: 10, replacement: 'bad' },
+      { start: 20, end: 10, replacement: 'bad' },
+      { start: 5, end: 15, replacement: '' },
+      { start: origSource.length + 10, end: origSource.length + 20, replacement: 'bad' },
+    ],
+    origRegions
+  );
+  assert.equal(failedEdits.appliedCount, 0);
+  assert.equal(failedEdits.virtualText, origSource);
+  assert.equal(verifySpanMapInvariants(origSource, failedEdits.virtualText, failedEdits.spanMap).valid, true);
+});
+
+test('64. SpanMap property tests: deterministic PRNG validation of all 4 invariants across multi-pass randomized edits', () => {
+  let seed = 133742;
+  const nextRand = () => {
+    seed = (seed * 1664525 + 1013904223) >>> 0;
+    return seed / 4294967296;
+  };
+  const randInt = (min: number, max: number) => Math.floor(nextRand() * (max - min)) + min;
+
+  const alphabet = 'abcdefghijklmnopqrstuvwxyz0123456789 \n+*-=;(){},.';
+
+  for (let iteration = 0; iteration < 150; iteration++) {
+    const len = randInt(50, 300);
+    let src = '';
+    for (let c = 0; c < len; c++) {
+      src += alphabet[randInt(0, alphabet.length)];
+    }
+
+    const numEdits = randInt(1, 6);
+    const rawPoints: number[] = [];
+    for (let p = 0; p < numEdits * 2; p++) {
+      rawPoints.push(randInt(0, src.length));
+    }
+    rawPoints.sort((a, b) => a - b);
+
+    const editsPass1: FoldTextEdit[] = [];
+    for (let e = 0; e < rawPoints.length - 1; e += 2) {
+      const start = rawPoints[e];
+      const end = rawPoints[e + 1];
+      if (start < end) {
+        const repLen = randInt(1, 15);
+        let rep = '';
+        for (let r = 0; r < repLen; r++) rep += alphabet[randInt(0, alphabet.length)];
+        editsPass1.push({ start, end, replacement: rep });
+      }
+    }
+
+    const pass1 = applyTextEditsWithSpanMap(src, editsPass1);
+    const inv1 = verifySpanMapInvariants(src, pass1.virtualText, pass1.spanMap);
+    assert.equal(inv1.valid, true, `Pass 1 invariant failure on iter ${iteration}: ${inv1.error}`);
+
+    if (pass1.virtualText.length > 10) {
+      const v1Len = pass1.virtualText.length;
+      const editsPass2: FoldTextEdit[] = [];
+      const p2Start = randInt(0, Math.floor(v1Len / 2));
+      const p2End = randInt(p2Start + 1, v1Len);
+      editsPass2.push({ start: p2Start, end: p2End, replacement: 'folded2' });
+
+      const pass2 = applyTextEditsWithSpanMap(pass1.virtualText, editsPass2);
+      const inv2 = verifySpanMapInvariants(pass1.virtualText, pass2.virtualText, pass2.spanMap);
+      assert.equal(inv2.valid, true, `Pass 2 invariant failure on iter ${iteration}: ${inv2.error}`);
+
+      const composed = composeSpanMaps(pass1.spanMap, pass2.spanMap);
+      const invComposed = verifySpanMapInvariants(src, pass2.virtualText, composed);
+      assert.equal(invComposed.valid, true, `Composed invariant failure on iter ${iteration}: ${invComposed.error}`);
+    }
+  }
+});
+
+test('65. Baseline Pass-O byte-for-byte identity proof across full benchmark corpus with 0 active folds', () => {
+  assert.ok(CORPUS_CASES.length >= 50, 'Corpus cases must be loaded');
+
+  for (const c of CORPUS_CASES) {
+    const lex = analyzeLexicalStructure(c.code);
+    assert.equal(
+      lex.maskedCode.length,
+      c.code.length,
+      `Case ${c.id}: maskedCode length must equal source length`
+    );
+    assert.ok(
+      lex.regions.length > 0 || c.code.length === 0,
+      `Case ${c.id}: regions must not be empty for non-empty code`
+    );
+
+    const vView = buildVirtualView(c.code);
+    assert.equal(vView.editsApplied, 0, `Case ${c.id}: Stage 5.3a must have 0 edits applied`);
+    assert.equal(vView.virtualCode, c.code, `Case ${c.id}: virtualCode must equal original code`);
+    const inv = verifySpanMapInvariants(c.code, vView.virtualCode, vView.spanMap);
+    assert.equal(inv.valid, true, `Case ${c.id}: SpanMap invariants must hold: ${inv.error}`);
+
+    const report = analyzeCodeDeterministically(c.code, {
+      filePath: 'src/case.ts',
+      declaredDependencies: ['lodash', 'express', '@google/genai', '@prisma/client'],
+    });
+    assert.ok(report.skor.totalScore >= 0 && report.skor.totalScore <= 100);
+    assert.equal(report.virtualView?.editsApplied, 0);
+  }
+});
+
 
 

@@ -2,17 +2,31 @@ import {
   MAX_GLOB_PATTERN_LENGTH,
   MEANINGFUL_SUPPRESSION_REASON_RE,
   analyzeLexicalStructure,
+  applyTextEditsWithSpanMap,
+  buildVirtualView,
   calculateShannonEntropy,
+  composeSpanMaps,
+  createIdentitySpanMap,
   damerauLevenshtein,
   isCommentOrEmptyLine,
+  isRangeStrictlyInCodeRegion,
   isValidSuppressionReason,
   matchLinearGlob,
+  toOrigLineAndCol,
+  toOrigSpan,
+  verifySpanMapInvariants,
   type AllowlistRuleId,
   type AuditAnalyzeOptions,
   type DevGuardRuleId,
+  type FoldTextEdit,
   type InlineFinding,
+  type LexicalRegion,
+  type LexicalRegionKind,
   type LineFinding,
   type ParsedSuppression,
+  type SpanMap,
+  type SpanMapSeg,
+  type VirtualViewResult,
 } from './rules/lexicalMasker.js';
 import {
   POPULAR_NPM_PACKAGES,
@@ -31,14 +45,31 @@ import {
   type PrepareLlmOptions,
 } from './rules/secretAndResilienceRules.js';
 
-export type { AllowlistRuleId, AuditAnalyzeOptions, DevGuardRuleId, InlineFinding, ParsedSuppression, PrepareLlmOptions };
+export type {
+  AllowlistRuleId,
+  AuditAnalyzeOptions,
+  DevGuardRuleId,
+  FoldTextEdit,
+  InlineFinding,
+  LexicalRegion,
+  LexicalRegionKind,
+  ParsedSuppression,
+  PrepareLlmOptions,
+  SpanMap,
+  SpanMapSeg,
+  VirtualViewResult,
+};
 export {
   DG007_PROVIDER_PATTERNS,
   MAX_GLOB_PATTERN_LENGTH,
   MEANINGFUL_SUPPRESSION_REASON_RE,
   POPULAR_NPM_PACKAGES,
   analyzeLexicalStructure,
+  applyTextEditsWithSpanMap,
+  buildVirtualView,
   calculateShannonEntropy,
+  composeSpanMaps,
+  createIdentitySpanMap,
   damerauLevenshtein,
   detectDynamicModuleSpecifiers,
   detectHallucinatedPackages,
@@ -47,10 +78,14 @@ export {
   detectNonAtomicBalanceMutations,
   detectSwallowedExceptions,
   findResidualSecretLikeTokens,
+  isRangeStrictlyInCodeRegion,
   isValidSuppressionReason,
   matchLinearGlob,
   prepareRedactedCodeForLlm,
   redactSecretsPreservingLayout,
+  toOrigLineAndCol,
+  toOrigSpan,
+  verifySpanMapInvariants,
 };
 
 export const ANALYZABLE_EXTENSIONS = [
@@ -122,6 +157,7 @@ export interface ParsedDevGuardReport {
   inlineFindings?: InlineFinding[];
   suppressions?: ParsedSuppression[];
   dynScopeUncertain?: number;
+  virtualView?: VirtualViewResult;
 }
 
 export type AuditReport = ParsedDevGuardReport;
@@ -500,6 +536,7 @@ export function analyzeCodeDeterministically(
   const isTypeScript = isSelfAnalyzerModule || isAuthDomain || /:\s*(?:string|number|boolean|any|Request|Response|JwtPayload)\b|\binterface\s+\w+/i.test(codeWithoutComments);
   const language = isPython ? 'python' : isTypeScript ? 'typescript' : 'javascript';
 
+  const virtualView = buildVirtualView(code, { isPython });
   const lexical = analyzeLexicalStructure(code, isPython);
   const maskedLines = lexical.maskedCode.split('\n');
 
@@ -1626,5 +1663,6 @@ ${tesMarkdown}`;
     inlineFindings: inlineFindings.length > 0 ? inlineFindings : undefined,
     suppressions: activeSuppressions.length > 0 ? activeSuppressions : undefined,
     dynScopeUncertain: dynScopeUncertain > 0 ? dynScopeUncertain : undefined,
+    virtualView,
   };
 }

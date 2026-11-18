@@ -1,9 +1,18 @@
+export * from './spanMap.js';
 export type DevGuardRuleId =
   | 'DG001' | 'DG002' | 'DG003' | 'DG004'
   | 'DG004-DYN-01' | 'DG004-DYN-02'
   | 'DG005' | 'DG006' | 'DG007' | 'DG008';
 
 export type AllowlistRuleId = 'DG004' | 'DG004-DYN-01' | 'DG004-DYN-02' | 'DG006';
+
+export type LexicalRegionKind = 'code' | 'string' | 'template' | 'comment' | 'regex';
+
+export interface LexicalRegion {
+  start: number;
+  end: number;
+  kind: LexicalRegionKind;
+}
 
 export interface InlineFinding {
   ruleId: DevGuardRuleId;
@@ -177,16 +186,72 @@ function skipRegexLiteral(rawCode: string, out: string[], startIdx: number): num
   return i;
 }
 
-/** Masks comments, regexes, and literals while extracting in-comment suppressions. */
+/** Returns true if and only if [start, end) falls strictly inside a single 'code' region. */
+export function isRangeStrictlyInCodeRegion(
+  regions: ReadonlyArray<LexicalRegion>,
+  start: number,
+  end: number
+): boolean {
+  if (typeof start !== 'number' || typeof end !== 'number') return false;
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return false;
+  if (start < 0 || end <= start || regions.length === 0) return false;
+
+  let low = 0;
+  let high = regions.length - 1;
+  while (low <= high) {
+    const mid = (low + high) >> 1;
+    const reg = regions[mid];
+    if (start >= reg.start && start < reg.end) {
+      return reg.kind === 'code' && end <= reg.end;
+    }
+    if (start < reg.start) {
+      high = mid - 1;
+    } else {
+      low = mid + 1;
+    }
+  }
+  return false;
+}
+
+/** Masks comments, regexes, and literals while extracting in-comment suppressions and region classification. */
 export function analyzeLexicalStructure(
   rawCode: string,
-  allowHashComments: boolean
-): { maskedCode: string; stringLiterals: ExtractedStringLiteral[]; suppressions: ParsedSuppression[] } {
+  allowHashComments: boolean = false
+): {
+  maskedCode: string;
+  stringLiterals: ExtractedStringLiteral[];
+  suppressions: ParsedSuppression[];
+  regions: LexicalRegion[];
+} {
   if (typeof rawCode !== 'string') throw new TypeError('rawCode must be a string');
+  if (rawCode.length === 0) {
+    return { maskedCode: '', stringLiterals: [], suppressions: [], regions: [] };
+  }
+
   const out = rawCode.split('');
   const stringLiterals: ExtractedStringLiteral[] = [];
   const suppressions: ParsedSuppression[] = [];
   const pending: Array<{ ruleId: DevGuardRuleId; commentLine: number; reason: string }> = [];
+  const regions: LexicalRegion[] = [];
+  let lastRegionEnd = 0;
+
+  const pushRegion = (start: number, end: number, kind: LexicalRegionKind) => {
+    if (start >= end) return;
+    if (regions.length > 0 && regions[regions.length - 1].kind === kind && regions[regions.length - 1].end === start) {
+      regions[regions.length - 1].end = end;
+    } else {
+      regions.push({ start, end, kind });
+    }
+  };
+
+  const recordConstruct = (start: number, end: number, kind: LexicalRegionKind) => {
+    if (start > lastRegionEnd) {
+      pushRegion(lastRegionEnd, start, 'code');
+    }
+    pushRegion(start, end, kind);
+    lastRegionEnd = end;
+  };
+
   let line = 1;
   let lineHadCode = false;
   let prevNonWs = '';
@@ -204,13 +269,16 @@ export function analyzeLexicalStructure(
         currentWord = '';
         prevNonWs = '\n';
       } else if ((ch === '/' && next === '/') || ((allowHashComments || (i === 0 && next === '!')) && ch === '#')) {
+        const commentStart = i;
         const cStart = i + (ch === '#' ? 1 : 2);
         const cLine = line;
         while (i < rawCode.length && rawCode[i] !== '\n') out[i++] = ' ';
+        recordConstruct(commentStart, i, 'comment');
         parseSuppressionFromComment(rawCode.slice(cStart, i), cLine, lineHadCode, suppressions, pending);
         if (rawCode[i] === '\n') { line++; lineHadCode = false; prevNonWs = '\n'; }
         currentWord = '';
       } else if (!allowHashComments && ch === '/' && next === '*') {
+        const commentStart = i;
         const cStart = i + 2;
         const cLine = line;
         const wasTrailing = lineHadCode;
@@ -220,20 +288,28 @@ export function analyzeLexicalStructure(
           if (rawCode[i] === '*' && rawCode[i + 1] === '/') { out[i] = ' '; out[++i] = ' '; break; }
           if (rawCode[i] === '\n') line++; else out[i] = ' ';
         }
+        const commentEnd = Math.min(rawCode.length, i + 1);
+        recordConstruct(commentStart, commentEnd, 'comment');
         parseSuppressionFromComment(rawCode.slice(cStart, i - 1), cLine, wasTrailing, suppressions, pending);
         currentWord = '';
       } else if (!allowHashComments && ch === '/' && (REGEX_PRECEDING_KEYWORDS.has(currentWord || lastWord) || (!currentWord && REGEX_PRECEDING_CHARS.has(prevNonWs)))) {
         flushPendingSuppressions(line, suppressions, pending);
         lineHadCode = true;
+        const regexStart = i;
         i = skipRegexLiteral(rawCode, out, i);
+        const regexEnd = Math.min(rawCode.length, i + 1);
+        recordConstruct(regexStart, regexEnd, 'regex');
         prevNonWs = ')';
         currentWord = '';
         lastWord = '';
       } else if (ch === '\'' || ch === '"' || ch === '`') {
         flushPendingSuppressions(line, suppressions, pending);
         lineHadCode = true;
+        const quoteStart = i;
+        const kind: LexicalRegionKind = ch === '`' ? 'template' : 'string';
         const res = skipQuotedLiteral(rawCode, out, i, line);
         stringLiterals.push(res.literal);
+        recordConstruct(quoteStart, res.literal.endOffset, kind);
         i = res.nextIdx;
         line = res.endLine;
         prevNonWs = res.literal.quote;
@@ -254,10 +330,18 @@ export function analyzeLexicalStructure(
         }
       }
     }
+    if (lastRegionEnd < rawCode.length) {
+      pushRegion(lastRegionEnd, rawCode.length, 'code');
+    }
   } catch {
-    return { maskedCode: rawCode, stringLiterals: [], suppressions: [] };
+    return {
+      maskedCode: rawCode,
+      stringLiterals: [],
+      suppressions: [],
+      regions: rawCode.length > 0 ? [{ start: 0, end: rawCode.length, kind: 'code' }] : [],
+    };
   }
-  return { maskedCode: out.join(''), stringLiterals, suppressions };
+  return { maskedCode: out.join(''), stringLiterals, suppressions, regions };
 }
 
 export function calculateShannonEntropy(input: string): number {
