@@ -30,6 +30,7 @@ import {
   getDevGuardVersion,
   hasAnalyzableExtension,
   hasPartialAnalysisExtension,
+  isDevGuardSelfRepo,
   isExcludedFromAutoDiscovery,
   isExcludedPathFromScope,
   loadVerifiedAllowlist,
@@ -41,6 +42,7 @@ import { generateSarifReport } from '../src/sarifGenerator.js';
 import { analyzeLexicalStructure } from '../src/rules/lexicalMasker.js';
 import {
   COMMENT_SIGNATURE,
+  INVARIANT_MISMATCH_SENTINEL,
   MAX_PR_PARTIAL_FILES_DISPLAY,
   MAX_PR_SKIPPED_FILES_DISPLAY,
   PARTIAL_COVERAGE_REASON_TEXT,
@@ -2682,8 +2684,21 @@ test('35. Pre-filter classifier preserves count invariant across mixed languages
     assert.ok(diffInScope.includes('tools/worker.go'), 'Classifier must receive .go before extension filter');
     assert.ok(diffInScope.includes('notebooks/exp.ipynb'), 'Classifier must receive .ipynb before extension filter');
     assert.ok(diffInScope.includes('cmd/main.go'), 'Classifier must receive deleted file from diff');
-    assert.ok(!diffInScope.includes('scripts/internal.py'), 'Auto-discovery must exclude scripts/** uniformly');
-    assert.ok(!diffInScope.includes('scripts/helper.js'), 'Auto-discovery must exclude scripts/** uniformly');
+    assert.ok(diffInScope.includes('scripts/internal.py'), 'Modified diff passes excluded paths to classifier');
+    assert.ok(diffInScope.includes('scripts/helper.js'), 'Modified diff passes excluded paths to classifier');
+
+    const diffClassified = classifyInScopeFiles(diffInScope, { cwd: repoDir, sourceMode: 'modified' });
+    assert.deepEqual(
+      diffClassified.ignored.filter((e) => e.filePath.startsWith('scripts/')).map((e) => [e.filePath, e.reason]).sort(),
+      [
+        ['scripts/helper.js', 'excluded_path'],
+        ['scripts/internal.py', 'excluded_path'],
+      ]
+    );
+
+    const modWorkspace = discoverWorkspaceFiles('modified', repoDir);
+    assert.ok(!modWorkspace.includes('scripts/internal.py'), 'Auto-discovery must exclude scripts/** uniformly');
+    assert.ok(!modWorkspace.includes('scripts/helper.js'), 'Auto-discovery must exclude scripts/** uniformly');
 
     const allDiscovered = discoverWorkspaceFiles('all', repoDir).map((p) =>
       path.relative(repoDir, p).replace(/\\/g, '/')
@@ -4200,10 +4215,250 @@ test('53. Path exclusion policy keeps scripts/*.js and scripts/*.py excluded in 
       .map((p) => path.relative(repoDir, p).replace(/\\/g, '/'))
       .sort();
 
-    assert.deepEqual(modInScope, ['src/app.ts', 'tools/etl.py']);
+    assert.deepEqual(modInScope, ['scripts/etl.py', 'scripts/helper.js', 'src/app.ts', 'tools/etl.py']);
     assert.deepEqual(allInScope, ['src/app.ts', 'tools/etl.py']);
     assert.deepEqual(modWorkspace, ['src/app.ts', 'tools/etl.py']);
     assert.deepEqual(allWorkspace, ['src/app.ts', 'tools/etl.py']);
+
+    const classifiedMod = classifyInScopeFiles(modInScope, { cwd: repoDir, sourceMode: 'modified' });
+    assert.deepEqual(
+      classifiedMod.ignored.filter((i) => i.reason === 'excluded_path').map((i) => i.filePath).sort(),
+      ['scripts/etl.py', 'scripts/helper.js']
+    );
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('54. Self-reference exclusions anchor strictly to exact DevGuard repo paths and audit user repos normally (G1)', async () => {
+  assert.equal(isDevGuardSelfRepo(REPO_ROOT), true);
+  assert.equal(isExcludedPathFromScope('src/devguardAnalyzer.ts', REPO_ROOT), true);
+  assert.equal(isExcludedPathFromScope('scripts/devguard_verify.py', REPO_ROOT), true);
+  assert.equal(isExcludedPathFromScope('devguard_verify.py', REPO_ROOT), true);
+  assert.equal(isExcludedPathFromScope('pkg/devguardAnalyzer.ts', REPO_ROOT), false);
+  assert.equal(isExcludedPathFromScope('src/devguard_verify.py', REPO_ROOT), false);
+
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-g1-anchor-'));
+  try {
+    const repoDir = path.join(tempDir, 'acme-payments');
+    fs.mkdirSync(path.join(repoDir, 'src'), { recursive: true });
+    fs.mkdirSync(path.join(repoDir, 'pkg'), { recursive: true });
+    fs.writeFileSync(path.join(repoDir, 'package.json'), JSON.stringify({ name: 'acme-payments', version: '1.0.0' }), 'utf-8');
+    fs.writeFileSync(
+      path.join(repoDir, 'src', 'devguard_verify.py'),
+      'import os\ndef run(cmd):\n    return os.system(cmd)\n',
+      'utf-8'
+    );
+    fs.writeFileSync(
+      path.join(repoDir, 'pkg', 'devguardAnalyzer.ts'),
+      'export const dangerous = (x: string) => eval(x);\n',
+      'utf-8'
+    );
+    fs.writeFileSync(
+      path.join(repoDir, 'src', 'devguardAnalyzer.ts'),
+      'export const cleanHelper = (n: number) => n + 1;\n',
+      'utf-8'
+    );
+
+    assert.equal(isDevGuardSelfRepo(repoDir), false);
+    assert.equal(isExcludedPathFromScope('src/devguard_verify.py', repoDir), false);
+    assert.equal(isExcludedPathFromScope('pkg/devguardAnalyzer.ts', repoDir), false);
+    assert.equal(isExcludedPathFromScope('src/devguardAnalyzer.ts', repoDir), false);
+
+    const targets = ['src/devguard_verify.py', 'pkg/devguardAnalyzer.ts', 'src/devguardAnalyzer.ts'];
+    const classification = classifyInScopeFiles(targets, { cwd: repoDir, sourceMode: 'modified' });
+    assert.equal(classification.analyzed.length, 3);
+    assert.equal(classification.ignored.length, 0);
+
+    const execRes = await auditClassifiedFiles(classification, {
+      apiKey: '',
+      minScore: 85,
+      isFork: false,
+      verifiedAllowlist: {
+        rulesByPath: new Map(),
+        invalidAllowlistEntries: [],
+        allowlistModifiedInPr: false,
+        sourceMode: 'empty',
+      },
+      cwd: repoDir,
+    });
+    assert.equal(execRes.hasFindingFailure, true, 'Vulnerable user files named devguard_verify.py / devguardAnalyzer.ts must fail gate');
+    const summaryByFile = new Map(execRes.summaries.map((s) => [s.filePath, s]));
+    assert.equal(summaryByFile.get('src/devguard_verify.py')?.passed, false);
+    assert.equal(summaryByFile.get('pkg/devguardAnalyzer.ts')?.passed, false);
+    assert.equal(summaryByFile.get('src/devguardAnalyzer.ts')?.passed, true);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('55. Modified git diff classifies excluded paths as ignored/excluded_path, preserves total invariant, and renders PR Coverage line (G2/D12)', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-g2-excluded-'));
+  try {
+    const repoDir = path.join(tempDir, 'repo');
+    fs.mkdirSync(path.join(repoDir, 'src'), { recursive: true });
+    fs.mkdirSync(path.join(repoDir, 'scripts'), { recursive: true });
+    fs.mkdirSync(path.join(repoDir, '.github', 'workflows'), { recursive: true });
+    fs.writeFileSync(path.join(repoDir, 'package.json'), JSON.stringify({ name: 'user-service', version: '1.0.0' }), 'utf-8');
+    fs.writeFileSync(path.join(repoDir, 'src', 'app.ts'), 'export const a = 1;\n', 'utf-8');
+    fs.writeFileSync(path.join(repoDir, 'scripts', 'helper.js'), 'export const s = 1;\n', 'utf-8');
+    fs.writeFileSync(path.join(repoDir, 'src', 'foo.test.ts'), 'export const t = 1;\n', 'utf-8');
+    fs.writeFileSync(path.join(repoDir, '.github', 'workflows', 'ci.yml'), 'name: ci\n', 'utf-8');
+    fs.writeFileSync(path.join(repoDir, 'README.md'), '# init\n', 'utf-8');
+
+    const git = (args: string[]) => spawnSync('git', args, { cwd: repoDir, encoding: 'utf-8' });
+    git(['init']);
+    git(['config', 'user.email', 'ci@devguard.local']);
+    git(['config', 'user.name', 'DevGuard Test']);
+    git(['add', '.']);
+    git(['commit', '-m', 'init']);
+
+    fs.writeFileSync(path.join(repoDir, 'src', 'app.ts'), 'export const a = 2;\n', 'utf-8');
+    fs.writeFileSync(path.join(repoDir, 'scripts', 'helper.js'), 'export const s = 2;\n', 'utf-8');
+    fs.writeFileSync(path.join(repoDir, 'src', 'foo.test.ts'), 'export const t = 2;\n', 'utf-8');
+    fs.writeFileSync(path.join(repoDir, '.github', 'workflows', 'ci.yml'), 'name: ci-v2\n', 'utf-8');
+    fs.writeFileSync(path.join(repoDir, 'README.md'), '# updated\n', 'utf-8');
+    git(['add', '.']);
+    git(['commit', '-m', 'touch mixed diff including excluded paths']);
+
+    const inScope = discoverInScopeFiles('modified', repoDir).sort();
+    assert.deepEqual(inScope, [
+      '.github/workflows/ci.yml',
+      'README.md',
+      'scripts/helper.js',
+      'src/app.ts',
+      'src/foo.test.ts',
+    ]);
+
+    const res = classifyInScopeFiles(inScope, { cwd: repoDir, sourceMode: 'modified' });
+    assert.equal(res.analyzed.length + res.skipped.length + res.ignored.length, inScope.length);
+    assert.deepEqual(res.analyzed.map((e) => e.filePath), ['src/app.ts']);
+    assert.deepEqual(
+      res.ignored.map((e) => [e.filePath, e.reason]).sort((a, b) => a[0].localeCompare(b[0])),
+      [
+        ['.github/workflows/ci.yml', 'excluded_path'],
+        ['README.md', 'non_code'],
+        ['scripts/helper.js', 'excluded_path'],
+        ['src/foo.test.ts', 'excluded_path'],
+      ]
+    );
+
+    const ignoredNonCodeCount = res.ignored.filter((i) => i.reason === 'non_code').length;
+    const ignoredExcludedPathCount = res.ignored.filter((i) => i.reason === 'excluded_path').length;
+    const passSummary: FileAuditSummary = {
+      filePath: 'src/app.ts',
+      security: 100,
+      correctness: 100,
+      maintainability: 100,
+      overall: 100,
+      passed: true,
+      fatalFlaws: [],
+      defenseInDepth: [],
+    };
+    const mdWithExcluded = buildPullRequestCommentMarkdown([passSummary], 85, 'OFFLINE_AST', {
+      analyzedCount: 1,
+      skippedFiles: [],
+      ignoredNonCodeCount,
+      ignoredExcludedPathCount,
+      overallScore: 100,
+    });
+    assert.ok(mdWithExcluded.includes('- Ignored (non-code): 1'));
+    assert.ok(mdWithExcluded.includes('- Ignored (excluded path): 3'));
+
+    const mdWithoutExcluded = buildPullRequestCommentMarkdown([passSummary], 85, 'OFFLINE_AST', {
+      analyzedCount: 1,
+      skippedFiles: [],
+      ignoredNonCodeCount: 1,
+      ignoredExcludedPathCount: 0,
+      overallScore: 100,
+    });
+    assert.ok(!mdWithoutExcluded.includes('- Ignored (excluded path):'));
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('56. Early exit paths write overall_score=N/A & audit_status=FAIL to GITHUB_OUTPUT, and invariant mismatch omits <invariant-mismatch> from PR and SARIF URIs (R1/R2)', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-r1-r2-'));
+  try {
+    const compiledCliPath = path.join(REPO_ROOT, '.test-dist', 'src', 'cli.js');
+    assert.ok(fs.existsSync(compiledCliPath), `Expected compiled CLI at ${compiledCliPath}`);
+
+    const ghOutputInvalid = path.join(tempDir, 'gh_invalid.out');
+    fs.writeFileSync(ghOutputInvalid, '', 'utf-8');
+    const invalidRun = spawnSync(process.execPath, [compiledCliPath], {
+      cwd: REPO_ROOT,
+      encoding: 'utf-8',
+      env: {
+        ...process.env,
+        DEVGUARD_FAIL_ON_UNANALYZABLE: 'invalid_bool',
+        GITHUB_OUTPUT: ghOutputInvalid,
+      },
+    });
+    assert.equal(invalidRun.status, 1);
+    const out1 = fs.readFileSync(ghOutputInvalid, 'utf-8');
+    assert.match(out1, /^overall_score=N\/A$/m);
+    assert.match(out1, /^audit_status=FAIL$/m);
+
+    const ghOutputMissing = path.join(tempDir, 'gh_missing.out');
+    fs.writeFileSync(ghOutputMissing, '', 'utf-8');
+    const missingRun = spawnSync(process.execPath, [compiledCliPath, 'src/nonexistent-r1-file.ts'], {
+      cwd: REPO_ROOT,
+      encoding: 'utf-8',
+      env: {
+        ...process.env,
+        DEVGUARD_FAIL_ON_UNANALYZABLE: 'false',
+        GITHUB_OUTPUT: ghOutputMissing,
+      },
+    });
+    assert.equal(missingRun.status, 1);
+    const out2 = fs.readFileSync(ghOutputMissing, 'utf-8');
+    assert.match(out2, /^overall_score=N\/A$/m);
+    assert.match(out2, /^audit_status=FAIL$/m);
+
+    const skippedFiles: SkippedFileReportItem[] = [];
+    const analysisFailureCount = collectAnalysisFailures(skippedFiles, false);
+    assert.equal(analysisFailureCount, 1);
+    assert.equal(skippedFiles[0].filePath, INVARIANT_MISMATCH_SENTINEL);
+
+    const cleanSummary: FileAuditSummary = {
+      filePath: 'src/ok.ts',
+      security: 95,
+      correctness: 95,
+      maintainability: 95,
+      overall: 95,
+      passed: true,
+      fatalFlaws: [],
+      defenseInDepth: [],
+    };
+
+    const md = buildPullRequestCommentMarkdown([cleanSummary], 85, 'OFFLINE_AST', {
+      analyzedCount: 1,
+      skippedFiles,
+      analysisFailureCount,
+      ignoredNonCodeCount: 0,
+      overallScore: 95,
+      failOnUnanalyzable: false,
+    });
+    assert.ok(md.includes('- Coverage invariant mismatch — Skipped: Internal error'));
+    assert.ok(!md.includes(INVARIANT_MISMATCH_SENTINEL), 'PR comment must never contain raw <invariant-mismatch> angle brackets');
+
+    const sarifOut = path.join(tempDir, 'r2-invariant.sarif');
+    generateSarifReport([cleanSummary], sarifOut, skippedFiles, { hasAnalysisFailure: true });
+    const sarifRaw = fs.readFileSync(sarifOut, 'utf-8');
+    assert.ok(!sarifRaw.includes(INVARIANT_MISMATCH_SENTINEL), 'SARIF JSON must not contain <invariant-mismatch> URI');
+    const sarif = JSON.parse(sarifRaw) as {
+      runs: Array<{
+        invocations: Array<{
+          executionSuccessful: boolean;
+          toolExecutionNotifications: Array<{ level: string; message: { text: string }; locations?: unknown }>;
+        }>;
+      }>;
+    };
+    assert.equal(sarif.runs[0].invocations[0].executionSuccessful, false);
+    assert.equal(sarif.runs[0].invocations[0].toolExecutionNotifications[0].level, 'error');
+    assert.equal(sarif.runs[0].invocations[0].toolExecutionNotifications[0].message.text, 'Skipped: Internal error');
+    assert.equal(sarif.runs[0].invocations[0].toolExecutionNotifications[0].locations, undefined);
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }

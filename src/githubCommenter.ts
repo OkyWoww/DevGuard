@@ -81,6 +81,7 @@ export interface PrCoverageSummary {
   analysisFailureCount?: number;
   ignoredNonCodeCount: number;
   ignoredDeletedCount?: number;
+  ignoredExcludedPathCount?: number;
   overallScore?: number | null;
   failOnUnanalyzable?: boolean;
   maxSkippedDisplay?: number;
@@ -90,6 +91,7 @@ export interface PrCoverageSummary {
 export const MAX_PR_SKIPPED_FILES_DISPLAY = 20;
 export const MAX_PR_PARTIAL_FILES_DISPLAY = 20;
 export const PARTIAL_COVERAGE_REASON_TEXT = 'Partial: language-agnostic rules only';
+export const INVARIANT_MISMATCH_SENTINEL = '<invariant-mismatch>';
 
 let cachedDevGuardVersion: string | null = null;
 
@@ -271,6 +273,7 @@ export function buildPullRequestCommentMarkdown(
   const codeFilesCount = analyzedCount + skippedCount;
   const ignoredNonCodeCount = coverage?.ignoredNonCodeCount ?? 0;
   const ignoredDeletedCount = coverage?.ignoredDeletedCount ?? 0;
+  const ignoredExcludedPathCount = coverage?.ignoredExcludedPathCount ?? 0;
 
   const overallScore: number | null =
     analyzedCount === 0
@@ -336,7 +339,9 @@ export function buildPullRequestCommentMarkdown(
     skippedFiles,
     maxSkippedDisplay,
     (item) =>
-      `    - ${sanitizeMarkdownText(normalizePosixRepoPath(item.filePath).replace(/[\r\n]+/g, ' '))} — ${formatSkippedReasonText(item.reason)}`
+      item.filePath === INVARIANT_MISMATCH_SENTINEL
+        ? `    - Coverage invariant mismatch — ${formatSkippedReasonText(item.reason)}`
+        : `    - ${sanitizeMarkdownText(normalizePosixRepoPath(item.filePath).replace(/[\r\n]+/g, ' '))} — ${formatSkippedReasonText(item.reason)}`
   );
 
   const coverageLines: string[] = [
@@ -347,6 +352,9 @@ export function buildPullRequestCommentMarkdown(
     ...skippedLines,
     `- Ignored (non-code): ${ignoredNonCodeCount}`,
   ];
+  if (ignoredExcludedPathCount > 0) {
+    coverageLines.push(`- Ignored (excluded path): ${ignoredExcludedPathCount}`);
+  }
   if (ignoredDeletedCount > 0) {
     coverageLines.push(`- Ignored (deleted): ${ignoredDeletedCount}`);
   }

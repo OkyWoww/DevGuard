@@ -2,6 +2,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { redactSecretsPreservingLayout } from './devguardAnalyzer.js';
 import {
+  INVARIANT_MISMATCH_SENTINEL,
   PARTIAL_COVERAGE_REASON_TEXT,
   formatSkippedReasonText,
   getDevGuardVersion,
@@ -315,22 +316,27 @@ export function generateSarifReport(
     Boolean(options?.hasAnalysisFailure) ||
     skippedFiles.some((item) => item.reason === 'parse_error' || item.reason === 'internal_error');
 
-  const createToolNotification = (level: 'error' | 'note', text: string, filePath: string) => ({
-    level,
-    message: {
-      text: redactSecretsPreservingLayout(text),
-    },
-    locations: [
-      {
-        physicalLocation: {
-          artifactLocation: {
-            uri: normalizeSarifUri(filePath),
-            uriBaseId: '%SRCROOT%',
+  const createToolNotification = (level: 'error' | 'note', text: string, filePath?: string) => {
+    const notification: Record<string, unknown> = {
+      level,
+      message: {
+        text: redactSecretsPreservingLayout(text),
+      },
+    };
+    if (filePath && filePath !== INVARIANT_MISMATCH_SENTINEL) {
+      notification.locations = [
+        {
+          physicalLocation: {
+            artifactLocation: {
+              uri: normalizeSarifUri(filePath),
+              uriBaseId: '%SRCROOT%',
+            },
           },
         },
-      },
-    ],
-  });
+      ];
+    }
+    return notification;
+  };
 
   const partialNotifications = (options?.partialFiles ?? []).map((filePath) =>
     createToolNotification('note', PARTIAL_COVERAGE_REASON_TEXT, filePath)

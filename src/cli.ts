@@ -22,6 +22,7 @@ export {
   hasPartialAnalysisExtension,
 };
 import {
+  INVARIANT_MISMATCH_SENTINEL,
   MAX_PR_PARTIAL_FILES_DISPLAY,
   MAX_PR_SKIPPED_FILES_DISPLAY,
   PARTIAL_COVERAGE_REASON_TEXT,
@@ -40,6 +41,7 @@ import {
 import { generateSarifReport } from './sarifGenerator.js';
 
 export {
+  INVARIANT_MISMATCH_SENTINEL,
   MAX_PR_PARTIAL_FILES_DISPLAY,
   MAX_PR_SKIPPED_FILES_DISPLAY,
   PARTIAL_COVERAGE_REASON_TEXT,
@@ -626,7 +628,7 @@ function resolveCliFileArgs(args: string[]): string[] {
 
 export const MAX_AUDIT_FILE_BYTES = 1_048_576;
 
-export type IgnoredReason = 'non_code' | 'deleted';
+export type IgnoredReason = 'non_code' | 'deleted' | 'excluded_path';
 
 export interface ClassifiedFileEntry {
   filePath: string;
@@ -722,6 +724,15 @@ export function classifyFile(filePath: string, options?: ClassifyFileOptions): C
     return { filePath, status: 'ignored', reason: 'non_code' };
   }
 
+  const effectiveScopeCwd =
+    options?.cwd ??
+    (path.isAbsolute(filePath) && path.relative(process.cwd(), filePath).startsWith('..')
+      ? path.dirname(filePath)
+      : process.cwd());
+  if (options?.sourceMode !== 'explicit' && isExcludedPathFromScope(filePath, effectiveScopeCwd)) {
+    return { filePath, status: 'ignored', reason: 'excluded_path', sizeBytes: stat.size };
+  }
+
   const normalized = filePath.replace(/\\/g, '/');
   const fileName = normalized.split('/').pop() || '';
   const lowerName = fileName.toLowerCase();
@@ -810,7 +821,7 @@ export function classifyInScopeFiles(
     const missing = Math.max(1, filePaths.length - (analyzed.length + skipped.length + ignored.length));
     for (let i = 0; i < missing; i++) {
       const fallbackEntry: ClassifiedFileEntry & { status: 'skipped'; reason: SkippedReason } = {
-        filePath: '<invariant-mismatch>',
+        filePath: INVARIANT_MISMATCH_SENTINEL,
         status: 'skipped',
         reason: 'internal_error',
       };
@@ -839,7 +850,19 @@ const AUTO_DISCOVERY_EXCLUDED_DIRS = new Set([
   'scripts',
 ]);
 
-/** Returns true when a path belongs to tests, scripts, build artifacts, or excluded self-reference files. */
+/** Returns true when `cwd` is the DevGuard repository itself (`package.json` name === `"devguard"`). */
+export function isDevGuardSelfRepo(cwd: string = process.cwd()): boolean {
+  try {
+    const pkgPath = path.join(cwd, 'package.json');
+    if (!fs.existsSync(pkgPath)) return false;
+    const parsed = JSON.parse(fs.readFileSync(pkgPath, 'utf-8')) as { name?: unknown };
+    return parsed?.name === 'devguard';
+  } catch {
+    return false;
+  }
+}
+
+/** Returns true when a path belongs to tests, scripts, build artifacts, or anchored self-reference files. */
 export function isExcludedPathFromScope(filePath: string, cwd: string = process.cwd()): boolean {
   const rel = path.isAbsolute(filePath) ? path.relative(cwd, filePath) : filePath;
   const posix = rel.replace(/\\/g, '/').replace(/^\.\//, '');
@@ -850,13 +873,24 @@ export function isExcludedPathFromScope(filePath: string, cwd: string = process.
   if (segments.some((seg) => seg.startsWith('.') && seg !== '.')) return true;
   if (segments.some((seg) => AUTO_DISCOVERY_EXCLUDED_DIRS.has(seg))) return true;
 
-  return (
+  if (
     fileName.endsWith('.d.ts') ||
     fileName.includes('.test.') ||
-    fileName.includes('.spec.') ||
-    fileName === 'devguardAnalyzer.ts' ||
-    fileName === 'devguard_verify.py'
-  );
+    fileName.includes('.spec.')
+  ) {
+    return true;
+  }
+
+  if (
+    (posix === 'src/devguardAnalyzer.ts' ||
+      posix === 'scripts/devguard_verify.py' ||
+      posix === 'devguard_verify.py') &&
+    isDevGuardSelfRepo(cwd)
+  ) {
+    return true;
+  }
+
+  return false;
 }
 
 /** Returns true when a path is excluded from analyzable auto-discovery (path exclusion or non-supported extension). */
@@ -924,7 +958,7 @@ export function discoverInScopeFiles(mode: 'modified' | 'all', cwd: string = pro
       diffOutput
         .split('\n')
         .map((f) => f.trim())
-        .filter((f) => Boolean(f) && !isExcludedPathFromScope(f, cwd))
+        .filter((f) => Boolean(f))
     )
   );
 }
@@ -1086,8 +1120,8 @@ export function collectAnalysisFailures(
   postCheckValid: boolean,
   preInvariantError?: string
 ): number {
-  if ((!postCheckValid || preInvariantError) && !skippedFiles.some((s) => s.filePath === '<invariant-mismatch>')) {
-    skippedFiles.push({ filePath: '<invariant-mismatch>', reason: 'internal_error' });
+  if ((!postCheckValid || preInvariantError) && !skippedFiles.some((s) => s.filePath === INVARIANT_MISMATCH_SENTINEL)) {
+    skippedFiles.push({ filePath: INVARIANT_MISMATCH_SENTINEL, reason: 'internal_error' });
   }
   return skippedFiles.filter(
     (s) => s.reason === 'parse_error' || s.reason === 'internal_error'
@@ -1140,6 +1174,9 @@ export async function runAction() {
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`❌ Invalid configuration: ${msg}`);
+    const outputFile = process.env.GITHUB_OUTPUT;
+    writeGitHubOutput(outputFile, 'overall_score', 'N/A');
+    writeGitHubOutput(outputFile, 'audit_status', 'FAIL');
     process.exit(1);
   }
 
@@ -1159,6 +1196,9 @@ export async function runAction() {
       const resolvedArg = path.isAbsolute(argPath) ? argPath : path.resolve(process.cwd(), argPath);
       if (!fs.existsSync(resolvedArg)) {
         console.error(`❌ Target file not found (explicit CLI argument): ${argPath}`);
+        const outputFile = process.env.GITHUB_OUTPUT;
+        writeGitHubOutput(outputFile, 'overall_score', 'N/A');
+        writeGitHubOutput(outputFile, 'audit_status', 'FAIL');
         process.exit(1);
       }
     }
@@ -1238,6 +1278,7 @@ export async function runAction() {
   }));
   const ignoredNonCodeCount = classification.ignored.filter((i) => i.reason === 'non_code').length;
   const ignoredDeletedCount = classification.ignored.filter((i) => i.reason === 'deleted').length;
+  const ignoredExcludedPathCount = classification.ignored.filter((i) => i.reason === 'excluded_path').length;
   const analysisFailureCount = collectAnalysisFailures(
     skippedFiles,
     postCheck.valid,
@@ -1286,6 +1327,7 @@ export async function runAction() {
     analysisFailureCount,
     ignoredNonCodeCount,
     ignoredDeletedCount,
+    ignoredExcludedPathCount,
     overallScore: verdict.overallScore,
     failOnUnanalyzable,
   };
