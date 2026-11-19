@@ -69,8 +69,14 @@ const REGEX_PRECEDING_CHARS = new Set([
 const REGEX_PRECEDING_KEYWORDS = new Set([
   'return', 'typeof', 'void', 'delete', 'await', 'throw', 'case', 'in', 'of', 'instanceof', 'new', 'else', 'do', 'yield', 'export', 'default',
 ]);
-const SUPPRESSION_COMMENT_RE = /\bdevguard-ignore\s+(DG\d{3}(?:-DYN-0[12])?)\s*:\s*([^\r\n]+)/i;
-const VALID_DG_RULE_RE = /^(?:DG00[1-8]|DG004-DYN-0[12])$/;
+export const CRITICAL_FLOW_IDENTIFIERS = [
+  'payment', 'balance', 'wallet', 'ledger', 'transfer', 'charge',
+  'refund', 'deduct', 'invoice', 'auth', 'token', 'jwt', 'password',
+  'execute', 'query', 'transaction', 'writeFileSync',
+] as const;
+
+const SUPPRESSION_COMMENT_RE = /\bdevguard-ignore\s+(DG\d{3}(?:-DYN-0[12]|-EV-01)?)\s*:\s*([^\r\n]+)/i;
+const VALID_DG_RULE_RE = /^(?:DG00[1-8]|DG004-DYN-0[12]|DG00[58]-EV-01)$/;
 export const MEANINGFUL_SUPPRESSION_REASON_RE = /[A-Za-z]{2,}\s+[A-Za-z]{2,}/;
 
 /** Validates that a suppression justification has >= 8 chars and at least two alphabetic words. */
@@ -95,7 +101,9 @@ function parseSuppressionFromComment(
   const reason = match[2].replace(/\*\/\s*$/, '').trim();
   if (!isValidSuppressionReason(reason)) return;
 
-  const ruleId = ruleUpper as DevGuardRuleId;
+  const ruleId = (
+    ruleUpper === 'DG005-EV-01' ? 'DG005' : ruleUpper === 'DG008-EV-01' ? 'DG008' : ruleUpper
+  ) as DevGuardRuleId;
   if (isTrailing) {
     suppressions.push({ ruleId, targetLine: commentLine, commentLine, reason, kind: 'inSource' });
   } else {

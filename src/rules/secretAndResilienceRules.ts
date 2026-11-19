@@ -416,6 +416,14 @@ function findEnclosingBlockRange(maskedCode: string, pos: number): { start: numb
   return { start: Math.max(0, pos - 600), end: Math.min(maskedCode.length, pos + 600) };
 }
 
+const UNBOUNDED_LOOP_BOUNDED_EXIT_RE =
+  /\b(?:break|return|throw|process\.exit)\b|\b(?:maxRetries|maxAttempts|MAX_ATTEMPTS|attempts?|retries)(?:\+\+|--)?\s*(?:<|<=|>|>=|===|!==)/i;
+
+/** Shared body-scan helper for DG008 (`while`/`for`) and DG008-EV-01 (`do...while`). */
+function isUnboundedAsyncLoopBody(maskedBody: string): boolean {
+  return /\bawait\b/.test(maskedBody) && !UNBOUNDED_LOOP_BOUNDED_EXIT_RE.test(maskedBody);
+}
+
 /** DG008: Detects unbounded async loops and external fetch() calls lacking AbortSignal timeouts. */
 export function detectMissingTimeoutsAndLoops(
   rawCode: string,
@@ -430,7 +438,6 @@ export function detectMissingTimeoutsAndLoops(
   const flaggedLines = new Set<number>();
 
   const loopRe = /\b(?:while\s*\(\s*(?:true|1)\s*\)|for\s*\(\s*;\s*;\s*\))\s*\{/g;
-  const boundedExitRe = /\b(?:break|return|throw|process\.exit)\b|\b(?:maxRetries|maxAttempts|MAX_ATTEMPTS|attempts?|retries)\s*(?:<|<=|>|>=|===|!==)/i;
 
   let loopMatch: RegExpExecArray | null;
   while ((loopMatch = loopRe.exec(maskedCode)) !== null) {
@@ -439,7 +446,7 @@ export function detectMissingTimeoutsAndLoops(
     if (closeBraceIdx === -1) continue;
 
     const maskedBody = maskedCode.slice(openBraceIdx + 1, closeBraceIdx);
-    if (!/\bawait\b/.test(maskedBody) || boundedExitRe.test(maskedBody)) continue;
+    if (!isUnboundedAsyncLoopBody(maskedBody)) continue;
 
     const startLine = maskedCode.slice(0, loopMatch.index).split('\n').length;
     const endLine = maskedCode.slice(0, closeBraceIdx).split('\n').length;
@@ -472,6 +479,51 @@ export function detectMissingTimeoutsAndLoops(
       severity: 'error',
       message: msg,
       suggestion,
+    });
+  }
+
+  // DG008-EV-01: Unbounded async do { ... } while (true | 1) loops (SPEC §6.2)
+  const doLoopRe = /\bdo\s*\{/g;
+  let doMatch: RegExpExecArray | null;
+  while ((doMatch = doLoopRe.exec(maskedCode)) !== null) {
+    let prevIdx = doMatch.index - 1;
+    while (prevIdx >= 0 && /\s/.test(maskedCode[prevIdx])) prevIdx--;
+    if (prevIdx >= 0 && (maskedCode[prevIdx] === '.' || maskedCode[prevIdx] === ':')) continue;
+
+    const openBraceIdx = doMatch.index + doMatch[0].length - 1;
+    const closeBraceIdx = findMatchingDelim(maskedCode, openBraceIdx, '{', '}');
+    if (closeBraceIdx === -1) continue;
+
+    const afterClose = maskedCode.slice(closeBraceIdx + 1);
+    const whileClauseMatch = afterClose.match(/^\s*while\s*\(\s*(?:true|1)\s*\)/);
+    if (!whileClauseMatch) continue;
+
+    const afterWhileIdx = closeBraceIdx + 1 + whileClauseMatch[0].length;
+    if (/^\s*\{/.test(maskedCode.slice(afterWhileIdx))) continue;
+
+    const maskedBody = maskedCode.slice(openBraceIdx + 1, closeBraceIdx);
+    if (!isUnboundedAsyncLoopBody(maskedBody)) continue;
+
+    const startLine = maskedCode.slice(0, doMatch.index).split('\n').length;
+    const endLine = maskedCode.slice(0, afterWhileIdx).split('\n').length;
+    if (flaggedLines.has(startLine)) continue;
+    flaggedLines.add(startLine);
+
+    const msg = `[DG008-EV-01] Unbounded async do-while loop tanpa kondisi keluar eksplisit pada baris ${startLine} berisiko menggantungkan worker dan membengkakkan kuota API.`;
+    findings.push({
+      line: startLine,
+      category: 'correctness',
+      penalty: 10,
+      shortReason: `-10 [DG008] [DG008-EV-01] Unbounded async do-while loop tanpa break/return/batas iterasi (baris ${startLine})`,
+      detailedReason: msg,
+    });
+    inlineFindings.push({
+      ruleId: 'DG008',
+      line: startLine,
+      endLine: endLine > startLine ? endLine : undefined,
+      severity: 'warning',
+      message: msg,
+      suggestion: 'for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {',
     });
   }
 

@@ -1,4 +1,6 @@
 import {
+  CRITICAL_FLOW_IDENTIFIERS,
+  analyzeLexicalStructure,
   damerauLevenshtein,
   isCommentOrEmptyLine,
   type AuditAnalyzeOptions,
@@ -8,6 +10,8 @@ import {
   type LineFinding,
 } from './lexicalMasker.js';
 import { redactSecretsPreservingLayout } from './secretAndResilienceRules.js';
+
+export { CRITICAL_FLOW_IDENTIFIERS };
 
 export const POPULAR_NPM_PACKAGES = [
   'express', 'lodash', 'axios', 'zod', 'jsonwebtoken', 'stripe', 'prisma',
@@ -710,15 +714,134 @@ function extractBraceBlock(source: string, openBraceIdx: number): { body: string
   return null;
 }
 
-/** DG005: Detects empty or console-only catch blocks that swallow runtime failures. */
+const CRITICAL_FLOW_ALT = CRITICAL_FLOW_IDENTIFIERS.join('|');
+const CRITICAL_FLOW_RE = new RegExp(`(?:^|[^a-z])(?:${CRITICAL_FLOW_ALT})`, 'i');
+const CRITICAL_FLOW_CAMEL_RE = new RegExp(
+  `[a-z](?:${CRITICAL_FLOW_IDENTIFIERS.map((id) => id[0].toUpperCase() + id.slice(1)).join('|')})`
+);
+
+/** Shared critical-flow identifier matcher used by both DG005 try/catch and DG005-EV-01 .catch(). */
+export function matchesCriticalFlow(text: string): boolean {
+  return CRITICAL_FLOW_RE.test(text) || CRITICAL_FLOW_CAMEL_RE.test(text);
+}
+
+const CLEANUP_METHOD_NAMES = new Set([
+  'unlink', 'unlinkSync', 'rm', 'rmSync', 'rmdir', 'close', 'closeSync', 'destroy',
+]);
+
+const EMPTY_ARROW_CATCH_RE =
+  /^(?:async\s+)?(?:\(\s*(?:[A-Za-z_$][\w$]*(?:\s*\??\s*:\s*[^,)=]+)?)?\s*\)|[A-Za-z_$][\w$]*)\s*=>\s*\{\s*\}$/;
+const EMPTY_FN_CATCH_RE =
+  /^(?:async\s+)?function(?:\s+[A-Za-z_$][\w$]*)?\s*\(\s*(?:[A-Za-z_$][\w$]*(?:\s*\??\s*:\s*[^,)=]+)?)?\s*\)\s*\{\s*\}$/;
+
+function isEmptyCatchCallback(maskedArgText: string): boolean {
+  const trimmed = maskedArgText.trim();
+  if (!trimmed) return false;
+  return EMPTY_ARROW_CATCH_RE.test(trimmed) || EMPTY_FN_CATCH_RE.test(trimmed);
+}
+
+function findMatchingParenForward(maskedCode: string, openParenIdx: number): number {
+  let depth = 1;
+  for (let i = openParenIdx + 1; i < maskedCode.length; i++) {
+    const ch = maskedCode[i];
+    if (ch === '(') depth++;
+    else if (ch === ')') {
+      depth--;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+function findMatchingParenBackward(maskedCode: string, closeParenIdx: number): number {
+  let depth = 1;
+  for (let i = closeParenIdx - 1; i >= 0; i--) {
+    const ch = maskedCode[i];
+    if (ch === ')') depth++;
+    else if (ch === '(') {
+      depth--;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+interface ReceiverChainBackbone {
+  segments: string[];
+  immediateCallName: string | null;
+  immediateObjName: string | null;
+}
+
+const RECEIVER_STOP_KEYWORDS = new Set([
+  'return', 'await', 'yield', 'typeof', 'void', 'delete', 'new', 'throw', 'case', 'in', 'of', 'else', 'do',
+]);
+
+function extractReceiverBackbone(maskedCode: string, dotIdx: number): ReceiverChainBackbone {
+  const segments: string[] = [];
+  let immediateCallName: string | null = null;
+  let immediateObjName: string | null = null;
+
+  let i = dotIdx - 1;
+  let isFirstStep = true;
+  let steps = 0;
+  const MAX_CHAIN_STEPS = 64;
+
+  while (i >= 0 && steps < MAX_CHAIN_STEPS) {
+    steps++;
+    while (i >= 0 && /\s/.test(maskedCode[i])) i--;
+    if (i < 0) break;
+
+    if (maskedCode[i] === '!') {
+      i--;
+      while (i >= 0 && /\s/.test(maskedCode[i])) i--;
+      if (i < 0) break;
+    }
+
+    let hadCallParens = false;
+    while (i >= 0 && maskedCode[i] === ')') {
+      const openIdx = findMatchingParenBackward(maskedCode, i);
+      if (openIdx === -1) return { segments, immediateCallName, immediateObjName };
+      hadCallParens = true;
+      i = openIdx - 1;
+      while (i >= 0 && /\s/.test(maskedCode[i])) i--;
+    }
+
+    if (i < 0 || !/[A-Za-z0-9_$]/.test(maskedCode[i])) break;
+
+    const identEnd = i + 1;
+    while (i >= 0 && /[A-Za-z0-9_$]/.test(maskedCode[i])) i--;
+    const ident = maskedCode.slice(i + 1, identEnd);
+
+    if (RECEIVER_STOP_KEYWORDS.has(ident)) break;
+
+    segments.push(ident);
+    if (isFirstStep && hadCallParens) {
+      immediateCallName = ident;
+    } else if (segments.length === 2 && immediateCallName !== null) {
+      immediateObjName = ident;
+    }
+    isFirstStep = false;
+
+    while (i >= 0 && /\s/.test(maskedCode[i])) i--;
+    if (i >= 0 && maskedCode[i] === '.') {
+      i--;
+      if (i >= 0 && maskedCode[i] === '?') i--;
+      continue;
+    }
+    break;
+  }
+
+  return { segments, immediateCallName, immediateObjName };
+}
+
+/** DG005: Detects empty or console-only catch blocks and empty Promise .catch() on critical flows. */
 export function detectSwallowedExceptions(
   rawCode: string,
   findings: LineFinding[],
-  inlineFindings: InlineFinding[]
+  inlineFindings: InlineFinding[],
+  maskedCode?: string
 ): void {
   const tryRe = /\btry\s*\{/g;
-  const criticalFlowRe =
-    /(?:^|[^a-z])(?:payment|balance|wallet|ledger|transfer|charge|refund|deduct|invoice|auth|token|jwt|password|execute|query|transaction|writeFileSync)/i;
   const cleanupCallRe = /\b(?:unlink|unlinkSync|rm|rmSync|rmdir|close|closeSync|destroy)\s*\(/;
   const jsonParseRe = /\bJSON\.parse\s*\(/;
   const recoveryRe = /\b(?:throw|return|reject|process\.exit|rollback|abort)\b/;
@@ -744,7 +867,7 @@ export function detectSwallowedExceptions(
     if (recoveryRe.test(strippedCatch)) continue;
     if (stripBalancedConsoleCalls(strippedCatch).replace(/[;\s]/g, '').length > 0) continue;
 
-    const isCriticalContext = criticalFlowRe.test(strippedTry);
+    const isCriticalContext = matchesCriticalFlow(strippedTry);
     if (!isCriticalContext && (cleanupCallRe.test(strippedTry) || jsonParseRe.test(strippedTry))) {
       continue;
     }
@@ -794,6 +917,56 @@ export function detectSwallowedExceptions(
         message: msg,
       });
     }
+  }
+
+  // DG005-EV-01: Empty Promise .catch(<empty_callback>) on critical receiver chains (SPEC §6.3)
+  const effectiveMasked = typeof maskedCode === 'string' ? maskedCode : analyzeLexicalStructure(rawCode).maskedCode;
+  const dotCatchRe = /(\??\.)\s*catch\s*\(/g;
+  const flaggedCatchLines = new Set<number>();
+  let dotCatchMatch: RegExpExecArray | null;
+
+  while ((dotCatchMatch = dotCatchRe.exec(effectiveMasked)) !== null) {
+    const dotIdx = dotCatchMatch.index;
+    const openParenIdx = dotCatchMatch.index + dotCatchMatch[0].length - 1;
+    const closeParenIdx = findMatchingParenForward(effectiveMasked, openParenIdx);
+    if (closeParenIdx === -1) continue;
+
+    const argText = effectiveMasked.slice(openParenIdx + 1, closeParenIdx);
+    if (!isEmptyCatchCallback(argText)) continue;
+
+    const backbone = extractReceiverBackbone(effectiveMasked, dotIdx);
+    if (backbone.segments.length === 0) continue;
+
+    // Cleanup exemption applies ONLY to the call immediately preceding .catch
+    const isImmediateCleanup =
+      backbone.immediateCallName !== null &&
+      (CLEANUP_METHOD_NAMES.has(backbone.immediateCallName) ||
+        (backbone.immediateObjName === 'JSON' && backbone.immediateCallName === 'parse'));
+    if (isImmediateCleanup) continue;
+
+    if (!backbone.segments.some((seg) => matchesCriticalFlow(seg))) continue;
+
+    const catchLine = effectiveMasked.slice(0, dotIdx).split('\n').length;
+    const catchEndLine = effectiveMasked.slice(0, closeParenIdx).split('\n').length;
+    if (flaggedCatchLines.has(catchLine)) continue;
+    flaggedCatchLines.add(catchLine);
+
+    const msg = `[DG005-EV-01] Swallowed Promise rejection via empty .catch() pada alur kritis (baris ${catchLine}): tambahkan error handling atau propagasi eksplisit.`;
+    findings.push({
+      line: catchLine,
+      category: 'maintainability',
+      penalty: 10,
+      shortReason: `-10 [DG005] [DG005-EV-01] Promise .catch() kosong menelan error pada alur kritis (baris ${catchLine})`,
+      detailedReason: msg,
+    });
+    inlineFindings.push({
+      ruleId: 'DG005',
+      line: catchLine,
+      endLine: catchEndLine > catchLine ? catchEndLine : undefined,
+      severity: 'warning',
+      message: msg,
+      suggestion: `.catch((err) => {\n  console.error('Critical operation failed:', err);\n  throw err;\n})`,
+    });
   }
 }
 

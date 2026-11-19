@@ -34,11 +34,13 @@ import {
   type VirtualViewResult,
 } from './rules/lexicalMasker.js';
 import {
+  CRITICAL_FLOW_IDENTIFIERS,
   POPULAR_NPM_PACKAGES,
   detectDynamicModuleSpecifiers,
   detectHallucinatedPackages,
   detectNonAtomicBalanceMutations,
   detectSwallowedExceptions,
+  matchesCriticalFlow,
 } from './rules/packageAndExceptionRules.js';
 import {
   DG007_PROVIDER_PATTERNS,
@@ -65,6 +67,7 @@ export type {
   VirtualViewResult,
 };
 export {
+  CRITICAL_FLOW_IDENTIFIERS,
   DG007_PROVIDER_PATTERNS,
   MAX_BACKSCAN,
   MAX_FOLDED_LENGTH,
@@ -91,6 +94,7 @@ export {
   isRangeStrictlyInCodeRegion,
   isValidSuppressionReason,
   matchLinearGlob,
+  matchesCriticalFlow,
   prepareRedactedCodeForLlm,
   redactSecretsPreservingLayout,
   toOrigLineAndCol,
@@ -1381,7 +1385,7 @@ export function analyzeCodeDeterministically(
         inlineFindings
       ));
     }
-    detectSwallowedExceptions(code, findings, inlineFindings);
+    detectSwallowedExceptions(code, findings, inlineFindings, lexical.maskedCode);
     detectNonAtomicBalanceMutations(rawLines, findings, inlineFindings);
     detectMissingTimeoutsAndLoops(code, lexical.maskedCode, rawLines, findings, inlineFindings);
   }
@@ -1434,12 +1438,12 @@ export function analyzeCodeDeterministically(
         detectHallucinatedPackages(vExecLines, vMaskedLines, options, vFindings, vInlineFindings);
       }
       if (/\b(?:try|catch)\b/.test(vLex.maskedCode)) {
-        detectSwallowedExceptions(virtualView.virtualCode, vFindings, vInlineFindings);
+        detectSwallowedExceptions(virtualView.virtualCode, vFindings, vInlineFindings, vLex.maskedCode);
       }
       if (/\bawait\b/.test(vLex.maskedCode)) {
         detectNonAtomicBalanceMutations(vRawLines, vFindings, vInlineFindings);
       }
-      if (/\b(?:while|for|fetch)\b/.test(vLex.maskedCode)) {
+      if (/\b(?:while|for|do|fetch)\b/.test(vLex.maskedCode)) {
         detectMissingTimeoutsAndLoops(virtualView.virtualCode, vLex.maskedCode, vRawLines, vFindings, vInlineFindings);
       }
 
