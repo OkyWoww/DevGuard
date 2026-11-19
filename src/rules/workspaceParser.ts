@@ -29,8 +29,8 @@ export type WorkspaceBailoutReason =
   | 'extends_cycle';
 
 export type ParseResult<T> =
-  | { success: true; data: T }
-  | { success: false; reason: WorkspaceBailoutReason; error: string };
+  | { success: true; data: T; reason?: undefined; error?: undefined }
+  | { success: false; data?: undefined; reason: WorkspaceBailoutReason; error: string };
 
 function getUtf8ByteLength(str: string): number {
   if (typeof TextEncoder !== 'undefined') {

@@ -93,6 +93,16 @@ import {
   type TsconfigData,
   type WorkspaceBailoutReason,
 } from '../src/rules/workspaceParser.js';
+import {
+  buildWorkspaceContext,
+  findNearestPackageManifest,
+  resolveWorkspaceImportSpecifier,
+  extractPackageManifestData,
+  getBasePackageName as getWorkspaceBasePackageName,
+  type WorkspaceContext,
+  type WorkspaceFileAccessor,
+  type WorkspaceResolutionResult,
+} from '../src/rules/workspaceResolver.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -6639,6 +6649,419 @@ test('Test 82: Stage 6.1.a Workspace Tokenizer, Subset YAML, Glob, tsconfig, & F
   const totalFuzzDuration = Date.now() - fuzzSuiteStart;
   console.log(`✔ Total A6-8 Fuzz Suite: 30,000 iterations completed in ${totalFuzzDuration} ms (seed: 0x${fuzzSeed.toString(16)})`);
 });
+
+test('Test 83: Stage 6.1.b Workspace Resolver, Resolution Order, Anti-Sibling Splicing & Fail-Closed (SPEC §6.2, A6-9, A6-10, A6-12)', () => {
+  // Mock file accessor simulating a realistic monorepo
+  const mockRepoFiles: Record<string, string> = {
+    'package.json': JSON.stringify({
+      name: 'monorepo-root',
+      workspaces: ['packages/*', 'apps/*', '!apps/standalone'],
+      dependencies: {
+        react: '^18.2.0',
+        'react-dom': '^18.2.0',
+        shared: 'npm:real-shared-pkg@^1.0.0',
+        'scoped-alias': 'npm:@scope/real-scoped@^2.0.0',
+      },
+      imports: {
+        '#root-util': './src/util.js',
+        '#internal/*': './src/internal/*.js',
+      },
+    }),
+    'tsconfig.json': JSON.stringify({
+      compilerOptions: {
+        baseUrl: '.',
+        paths: {
+          '@alias/*': ['shared/alias/*'],
+          'exact-alias': ['shared/exact.js'],
+          '*': ['./types/*'],
+        },
+      },
+    }),
+    'internal-lib/baseUtil.ts': 'export const baseUtil = 1;\n',
+    'packages/package.json': JSON.stringify({
+      name: 'intermediate-ancestor',
+      dependencies: {
+        'intermediate-dep': '^1.0.0',
+      },
+    }),
+    'packages/ui/package.json': JSON.stringify({
+      name: '@monorepo/ui',
+      dependencies: {
+        react: '^18.0.0', // also in root
+        lodash: '^4.17.21',
+        chalk: '^5.0.0',
+      },
+      imports: {
+        '#ui-sub': './src/sub.js',
+      },
+    }),
+    'packages/core/package.json': JSON.stringify({
+      name: '@monorepo/core',
+      dependencies: {
+        axios: '^1.4.0',
+      },
+    }),
+    'packages/nameless/package.json': JSON.stringify({
+      version: '0.0.0',
+      dependencies: {
+        'nameless-dep': '^1.0.0',
+      },
+    }),
+    'apps/web/package.json': JSON.stringify({
+      name: '@monorepo/web',
+      dependencies: {
+        next: '^14.0.0',
+        'ws-alias': 'workspace:@monorepo/core@*',
+      },
+    }),
+    'apps/standalone/package.json': JSON.stringify({
+      name: 'standalone-pkg',
+      dependencies: {},
+    }),
+  };
+
+  const fileAccessor: WorkspaceFileAccessor = {
+    readFile(relPath: string) {
+      const norm = relPath.replace(/\\/g, '/');
+      return mockRepoFiles[norm] ?? null;
+    },
+    fileExists(relPath: string) {
+      const norm = relPath.replace(/\\/g, '/');
+      return Boolean(mockRepoFiles[norm]);
+    },
+    listFiles() {
+      return Object.keys(mockRepoFiles);
+    },
+  };
+
+  // 1. Build workspace context
+  const basePackages = new Set(['@monorepo/ui', '@monorepo/core', '@monorepo/web']);
+  const context = buildWorkspaceContext(fileAccessor, {
+    baseBranchPackageNames: basePackages,
+    mode: 'auto',
+  });
+
+  assert.equal(context.mode, 'auto');
+  assert.equal(context.packagesByName.size, 3); // @monorepo/ui, @monorepo/core, @monorepo/web (nameless + !apps/standalone excluded)
+  assert.ok(context.packagesByName.has('@monorepo/ui'));
+  assert.ok(context.packagesByName.has('@monorepo/core'));
+  assert.ok(context.packagesByName.has('@monorepo/web'));
+  assert.equal(context.packagesByDir.has('packages/nameless'), false, 'Nameless workspace package must be safely ignored');
+  assert.equal(context.packagesByDir.has('apps/standalone'), false, 'Negated glob !apps/standalone must be excluded');
+
+  // 2. Acceptance A6-10: Strict Fixed Resolution Order & resolvedVia Verification
+  const targetFile = 'apps/web/src/index.ts';
+  const uiTargetFile = 'packages/ui/src/Button.tsx';
+
+  // 2.1 nearest package.json
+  const resNearest = resolveWorkspaceImportSpecifier('next', targetFile, context, fileAccessor);
+  assert.equal(resNearest.resolved, true);
+  assert.equal(resNearest.resolvedVia, 'nearest', 'Dependency in nearest package.json must resolve via nearest');
+
+  // Precedence: dependency declared in BOTH nearest and root must resolve via nearest
+  const resBoth = resolveWorkspaceImportSpecifier('react', uiTargetFile, context, fileAccessor);
+  assert.equal(resBoth.resolved, true);
+  assert.equal(resBoth.resolvedVia, 'nearest', 'Dependency in both nearest and root must resolve via nearest');
+
+  // workspace: alias in nearest package.json resolves aliased workspace dep via nearest
+  const resWsAliasDeclared = resolveWorkspaceImportSpecifier('@monorepo/core', targetFile, context, fileAccessor);
+  assert.equal(resWsAliasDeclared.resolved, true);
+  assert.equal(resWsAliasDeclared.resolvedVia, 'nearest', 'workspace:@monorepo/core@* alias target in nearest resolves via nearest');
+
+  // 2.2 root repo package.json ONLY
+  const resRoot = resolveWorkspaceImportSpecifier('react', targetFile, context, fileAccessor);
+  assert.equal(resRoot.resolved, true);
+  assert.equal(resRoot.resolvedVia, 'root', 'Dependency only in root package.json must resolve via root');
+
+  const resNpmAlias = resolveWorkspaceImportSpecifier('shared', targetFile, context, fileAccessor);
+  assert.equal(resNpmAlias.resolved, true);
+  assert.equal(resNpmAlias.resolvedVia, 'root', 'npm: alias key in root must resolve via root');
+
+  const resNpmTarget = resolveWorkspaceImportSpecifier('real-shared-pkg', targetFile, context, fileAccessor);
+  assert.equal(resNpmTarget.resolved, true);
+  assert.equal(resNpmTarget.resolvedVia, 'root', 'Unscoped npm: alias target in root must resolve via root');
+
+  const resNpmSpecifier = resolveWorkspaceImportSpecifier('npm:real-shared-pkg@^1.0.0', targetFile, context, fileAccessor);
+  assert.equal(resNpmSpecifier.resolved, true);
+  assert.equal(resNpmSpecifier.resolvedVia, 'root', 'Direct npm: specifier targeting root dep resolves via root');
+
+  const resScopedAliasKey = resolveWorkspaceImportSpecifier('scoped-alias', targetFile, context, fileAccessor);
+  assert.equal(resScopedAliasKey.resolved, true);
+  assert.equal(resScopedAliasKey.resolvedVia, 'root', 'Scoped npm: alias key in root resolves via root');
+
+  const resScopedAliasTarget = resolveWorkspaceImportSpecifier('@scope/real-scoped', targetFile, context, fileAccessor);
+  assert.equal(resScopedAliasTarget.resolved, true);
+  assert.equal(resScopedAliasTarget.resolvedVia, 'root', 'Scoped npm:@scope/pkg alias target in root resolves via root');
+
+  const resScopedNpmSpec = resolveWorkspaceImportSpecifier('npm:@scope/real-scoped@^2.0.0', targetFile, context, fileAccessor);
+  assert.equal(resScopedNpmSpec.resolved, true);
+  assert.equal(resScopedNpmSpec.resolvedVia, 'root', 'Direct scoped npm: specifier targeting root dep resolves via root');
+
+  const resNpmPhantom = resolveWorkspaceImportSpecifier('npm:phantom-uninstalled@^1.0.0', targetFile, context, fileAccessor);
+  assert.equal(resNpmPhantom.resolved, false);
+  assert.equal(resNpmPhantom.resolvedVia, 'unresolved', 'npm: specifier pointing to undeclared phantom pkg must fail');
+
+  // 2.3 workspace package name map (ordered strictly BEFORE Step 4 self-reference/tsconfig)
+  const countBefore = context.undeclaredWorkspaceImportsCount;
+  const resWs = resolveWorkspaceImportSpecifier('@monorepo/ui', targetFile, context, fileAccessor);
+  assert.equal(resWs.resolved, true);
+  assert.equal(resWs.resolvedVia, 'workspace', 'Workspace package name must resolve via workspace');
+  assert.equal(resWs.isUndeclaredWorkspaceImport, true, 'Undeclared cross-workspace import must be flagged');
+  assert.equal(context.undeclaredWorkspaceImportsCount, countBefore + 1);
+
+  // Repeat call tests per-run resolutionCache + consistent counter increment
+  const resWsCached = resolveWorkspaceImportSpecifier('@monorepo/ui', targetFile, context, fileAccessor);
+  assert.equal(resWsCached.resolved, true);
+  assert.equal(resWsCached.resolvedVia, 'workspace');
+  assert.equal(resWsCached.isUndeclaredWorkspaceImport, true);
+  assert.equal(context.undeclaredWorkspaceImportsCount, countBefore + 2, 'Cached undeclared workspace import must still increment count');
+
+  // Subpath package import
+  const resWsSub = resolveWorkspaceImportSpecifier('@monorepo/ui/components', targetFile, context, fileAccessor);
+  assert.equal(resWsSub.resolved, true);
+  assert.equal(resWsSub.resolvedVia, 'workspace', 'Workspace subpath import must resolve to base package');
+
+  // Workspace package importing itself: resolves at Step 3 ('workspace'), NOT marked undeclared
+  const countBeforeSelf = context.undeclaredWorkspaceImportsCount;
+  const resWsSelf = resolveWorkspaceImportSpecifier('@monorepo/web', targetFile, context, fileAccessor);
+  assert.equal(resWsSelf.resolved, true);
+  assert.equal(resWsSelf.resolvedVia, 'workspace', 'Workspace package importing own name resolves via Step 3 workspace map');
+  assert.equal(resWsSelf.isUndeclaredWorkspaceImport, false, 'Self-import must NOT be counted as undeclared workspace import');
+  assert.equal(context.undeclaredWorkspaceImportsCount, countBeforeSelf);
+
+  // 2.4 tsconfig paths & baseUrl, and package imports / self-reference
+  const resTsconfig = resolveWorkspaceImportSpecifier('@alias/button', targetFile, context, fileAccessor);
+  assert.equal(resTsconfig.resolved, true);
+  assert.equal(resTsconfig.resolvedVia, 'tsconfig', 'tsconfig path alias must resolve via tsconfig');
+
+  const resTsconfigExact = resolveWorkspaceImportSpecifier('exact-alias', targetFile, context, fileAccessor);
+  assert.equal(resTsconfigExact.resolved, true);
+  assert.equal(resTsconfigExact.resolvedVia, 'tsconfig', 'tsconfig exact alias must resolve via tsconfig');
+
+  const resBaseUrl = resolveWorkspaceImportSpecifier('internal-lib/baseUtil', targetFile, context, fileAccessor);
+  assert.equal(resBaseUrl.resolved, true);
+  assert.equal(resBaseUrl.resolvedVia, 'tsconfig', 'Existing module under tsconfig baseUrl must resolve via tsconfig');
+
+  // Node builtins & internal protocols
+  for (const builtinOrProto of ['node:fs', 'fs/promises', 'workspace:./local', 'file:../local', 'link:../local']) {
+    const resProto = resolveWorkspaceImportSpecifier(builtinOrProto, targetFile, context, fileAccessor);
+    assert.equal(resProto.resolved, true, `${builtinOrProto} must be treated as resolved/ignored`);
+    assert.equal(resProto.resolvedVia, 'unresolved', `${builtinOrProto} must return resolvedVia: 'unresolved'`);
+  }
+
+  // Self-reference by package name when NOT in workspace map (root or standalone package) -> Step 4 'imports'
+  const resRootSelf = resolveWorkspaceImportSpecifier('monorepo-root', 'src/index.ts', context, fileAccessor);
+  assert.equal(resRootSelf.resolved, true);
+  assert.equal(resRootSelf.resolvedVia, 'imports', 'Root self-reference by package name resolves via Step 4 imports');
+
+  const resStandaloneSelf = resolveWorkspaceImportSpecifier('standalone-pkg', 'apps/standalone/src/index.ts', context, fileAccessor);
+  assert.equal(resStandaloneSelf.resolved, true);
+  assert.equal(resStandaloneSelf.resolvedVia, 'imports', 'Standalone self-reference not in workspace map resolves via Step 4 imports');
+
+  // Subpath imports (#...) exact and wildcard
+  const resSubpath = resolveWorkspaceImportSpecifier('#ui-sub', uiTargetFile, context, fileAccessor);
+  assert.equal(resSubpath.resolved, true);
+  assert.equal(resSubpath.resolvedVia, 'imports', 'Exact subpath import #... must resolve via imports');
+
+  const resRootSubpath = resolveWorkspaceImportSpecifier('#root-util', targetFile, context, fileAccessor);
+  assert.equal(resRootSubpath.resolved, true);
+  assert.equal(resRootSubpath.resolvedVia, 'imports', 'Root subpath import #... must resolve via imports');
+
+  const resWildcardSubpath = resolveWorkspaceImportSpecifier('#internal/deep/helper', targetFile, context, fileAccessor);
+  assert.equal(resWildcardSubpath.resolved, true);
+  assert.equal(resWildcardSubpath.resolvedVia, 'imports', 'Wildcard subpath import #internal/* must resolve via imports');
+
+  // 3. Acceptance A6-9: Anti-Phantom & Hard Sibling / Intermediate Ancestor Prohibition
+  const resSiblingLodash = resolveWorkspaceImportSpecifier('lodash', targetFile, context, fileAccessor);
+  assert.equal(resSiblingLodash.resolved, false);
+  assert.equal(resSiblingLodash.resolvedVia, 'unresolved', 'Sibling dependency lodash MUST NOT resolve in apps/web');
+
+  const resSiblingChalk = resolveWorkspaceImportSpecifier('chalk', targetFile, context, fileAccessor);
+  assert.equal(resSiblingChalk.resolved, false);
+  assert.equal(resSiblingChalk.resolvedVia, 'unresolved', 'Sibling dependency chalk MUST NOT resolve in apps/web');
+
+  const resSiblingAxios = resolveWorkspaceImportSpecifier('axios', targetFile, context, fileAccessor);
+  assert.equal(resSiblingAxios.resolved, false);
+  assert.equal(resSiblingAxios.resolvedVia, 'unresolved', 'Sibling dependency axios MUST NOT resolve in apps/web');
+
+  const resIntermediateFromWeb = resolveWorkspaceImportSpecifier('intermediate-dep', targetFile, context, fileAccessor);
+  assert.equal(resIntermediateFromWeb.resolved, false);
+  assert.equal(resIntermediateFromWeb.resolvedVia, 'unresolved', 'Intermediate ancestor dependency MUST NOT resolve in apps/web');
+
+  // True ancestor path check: packages/ui/src/Button.tsx has parent packages/package.json declaring intermediate-dep
+  const resIntermediateFromUi = resolveWorkspaceImportSpecifier('intermediate-dep', uiTargetFile, context, fileAccessor);
+  assert.equal(resIntermediateFromUi.resolved, false);
+  assert.equal(resIntermediateFromUi.resolvedVia, 'unresolved', 'Intermediate ancestor packages/package.json MUST NOT resolve in packages/ui/src/Button.tsx');
+
+  // Phantom package (must also NOT match catch-all tsconfig path "*")
+  const resPhantom = resolveWorkspaceImportSpecifier('phantom-pkg', targetFile, context, fileAccessor);
+  assert.equal(resPhantom.resolved, false);
+  assert.equal(resPhantom.resolvedVia, 'unresolved', 'Non-existent phantom package must remain unresolved');
+
+  // 4. Acceptance A6-12: pnpm Strict Known Limitation + object workspaces format
+  const pnpmRepoFiles: Record<string, string> = {
+    'package.json': JSON.stringify({
+      name: 'pnpm-root',
+      dependencies: {
+        typescript: '^5.0.0',
+      },
+    }),
+    'pnpm-workspace.yaml': 'packages:\n  - "packages/*"',
+    'packages/pkg-a/package.json': JSON.stringify({
+      name: 'pkg-a',
+      dependencies: {},
+    }),
+  };
+  const pnpmAccessor: WorkspaceFileAccessor = {
+    readFile: (p) => pnpmRepoFiles[p.replace(/\\/g, '/')] ?? null,
+    fileExists: (p) => Boolean(pnpmRepoFiles[p.replace(/\\/g, '/')]),
+    listFiles: () => Object.keys(pnpmRepoFiles),
+  };
+  const pnpmContext = buildWorkspaceContext(pnpmAccessor);
+  assert.ok(pnpmContext.packagesByName.has('pkg-a'));
+  const pnpmRes = resolveWorkspaceImportSpecifier('typescript', 'packages/pkg-a/src/index.ts', pnpmContext, pnpmAccessor);
+  assert.equal(pnpmRes.resolved, true);
+  assert.equal(pnpmRes.resolvedVia, 'root', 'pnpm strict known limitation: root dependency resolves via root');
+
+  const objWorkspaceFiles: Record<string, string> = {
+    'package.json': JSON.stringify({
+      name: 'obj-root',
+      workspaces: { packages: ['packages/*'] },
+    }),
+    'packages/pkg-obj/package.json': JSON.stringify({
+      name: '@obj/pkg-a',
+    }),
+    'packages/web/package.json': JSON.stringify({
+      name: '@obj/web',
+    }),
+  };
+  const objAccessor: WorkspaceFileAccessor = {
+    readFile: (p) => objWorkspaceFiles[p.replace(/\\/g, '/')] ?? null,
+    fileExists: (p) => Boolean(objWorkspaceFiles[p.replace(/\\/g, '/')]),
+    listFiles: () => Object.keys(objWorkspaceFiles),
+  };
+  const objContext = buildWorkspaceContext(objAccessor);
+  assert.ok(objContext.packagesByName.has('@obj/pkg-a'), 'workspaces object form { packages: [...] } must be supported');
+  const resObjWs = resolveWorkspaceImportSpecifier('@obj/pkg-a', 'packages/web/src/index.ts', objContext, objAccessor);
+  assert.equal(resObjWs.resolved, true);
+  assert.equal(resObjWs.resolvedVia, 'workspace');
+
+  // 5. Anti-Bypass DG004-WS-NEW (SPEC §6.3)
+  const prNewFiles: Record<string, string> = {
+    'package.json': JSON.stringify({
+      name: 'root',
+      workspaces: ['packages/*'],
+    }),
+    'packages/existing/package.json': JSON.stringify({ name: '@corp/existing' }),
+    'packages/brand-new/package.json': JSON.stringify({ name: '@corp/brand-new' }),
+  };
+  const prAccessor: WorkspaceFileAccessor = {
+    readFile: (p) => prNewFiles[p.replace(/\\/g, '/')] ?? null,
+    fileExists: (p) => Boolean(prNewFiles[p.replace(/\\/g, '/')]),
+    listFiles: () => Object.keys(prNewFiles),
+  };
+  const prContext = buildWorkspaceContext(prAccessor, {
+    baseBranchPackageNames: new Set(['@corp/existing']),
+  });
+  const newNotices = prContext.diagnostics.filter((d) => d.ruleId === 'DG004-WS-NEW');
+  assert.equal(newNotices.length, 1);
+  assert.equal(newNotices[0].ruleId, 'DG004-WS-NEW');
+  assert.equal(newNotices[0].scoring, false, 'DG004-WS-NEW must be non-scoring');
+  assert.ok(newNotices[0].message.includes('@corp/brand-new'), 'DG004-WS-NEW must identify new package name');
+
+  // 6. Fail-Closed per Source & Size Limits (DG004-WS-UNPARSED)
+  // 6.1 pnpm-workspace.yaml with unsupported flow sequence
+  const badYamlFiles: Record<string, string> = {
+    'package.json': JSON.stringify({ name: 'root' }),
+    'pnpm-workspace.yaml': 'packages: ["packages/*"]',
+  };
+  const badYamlAccessor: WorkspaceFileAccessor = {
+    readFile: (p) => badYamlFiles[p.replace(/\\/g, '/')] ?? null,
+    fileExists: (p) => Boolean(badYamlFiles[p.replace(/\\/g, '/')]),
+  };
+  const badYamlContext = buildWorkspaceContext(badYamlAccessor);
+  const yamlNotices = badYamlContext.diagnostics.filter((d) => d.ruleId === 'DG004-WS-UNPARSED');
+  assert.equal(yamlNotices.length, 1);
+  assert.equal(yamlNotices[0].reason, 'yaml_unsupported_construct');
+  assert.equal(yamlNotices[0].scoring, false);
+  assert.equal(badYamlContext.packagesByName.size, 0, 'Fail-closed: 0 packages contributed from unsupported YAML');
+
+  // 6.2 pnpm-workspace.yaml exceeding 256 KiB size limit
+  const overYamlFiles: Record<string, string> = {
+    'package.json': JSON.stringify({ name: 'root' }),
+    'pnpm-workspace.yaml': 'packages:\n  - ' + 'x'.repeat(MAX_CONFIG_FILE_SIZE + 50),
+  };
+  const overYamlAccessor: WorkspaceFileAccessor = {
+    readFile: (p) => overYamlFiles[p.replace(/\\/g, '/')] ?? null,
+    fileExists: (p) => Boolean(overYamlFiles[p.replace(/\\/g, '/')]),
+  };
+  const overYamlContext = buildWorkspaceContext(overYamlAccessor);
+  const overNotices = overYamlContext.diagnostics.filter((d) => d.ruleId === 'DG004-WS-UNPARSED');
+  assert.equal(overNotices.length, 1);
+  assert.equal(overNotices[0].reason, 'size_limit');
+
+  // 6.3 tsconfig with circular extends
+  const cycleTsFiles: Record<string, string> = {
+    'package.json': JSON.stringify({ name: 'root' }),
+    'tsconfig.json': JSON.stringify({ extends: './tsconfig.json' }),
+  };
+  const cycleAccessor: WorkspaceFileAccessor = {
+    readFile: (p) => cycleTsFiles[p.replace(/\\/g, '/')] ?? null,
+    fileExists: (p) => Boolean(cycleTsFiles[p.replace(/\\/g, '/')]),
+  };
+  const cycleContext = buildWorkspaceContext(cycleAccessor);
+  const cycleNotices = cycleContext.diagnostics.filter((d) => d.ruleId === 'DG004-WS-UNPARSED');
+  assert.equal(cycleNotices.length, 1);
+  assert.equal(cycleNotices[0].reason, 'extends_cycle');
+
+  // 6.4 corrupt nearest package.json MUST fail closed and MUST NOT walk past into intermediate ancestor
+  const corruptNearestFiles: Record<string, string> = {
+    'package.json': JSON.stringify({ name: 'root', workspaces: ['packages/ok'] }),
+    'packages/package.json': JSON.stringify({ name: 'intermediate', dependencies: { 'intermediate-dep': '^1.0.0' } }),
+    'packages/broken/package.json': '{ invalid jsonc',
+  };
+  const corruptNearestAccessor: WorkspaceFileAccessor = {
+    readFile: (p) => corruptNearestFiles[p.replace(/\\/g, '/')] ?? null,
+    fileExists: (p) => Boolean(corruptNearestFiles[p.replace(/\\/g, '/')]),
+    listFiles: () => Object.keys(corruptNearestFiles),
+  };
+  const corruptNearestCtx = buildWorkspaceContext(corruptNearestAccessor);
+  const resBrokenIntermediate = resolveWorkspaceImportSpecifier(
+    'intermediate-dep',
+    'packages/broken/src/index.ts',
+    corruptNearestCtx,
+    corruptNearestAccessor
+  );
+  assert.equal(resBrokenIntermediate.resolved, false, 'Corrupt nearest package.json must fail closed and never walk past to intermediate ancestor');
+  assert.equal(resBrokenIntermediate.resolvedVia, 'unresolved');
+  const nearestNotices = corruptNearestCtx.diagnostics.filter(
+    (d) => d.ruleId === 'DG004-WS-UNPARSED' && d.sourceFile === 'packages/broken/package.json'
+  );
+  assert.equal(nearestNotices.length, 1);
+  assert.equal(nearestNotices[0].reason, 'jsonc_syntax');
+  assert.equal(nearestNotices[0].scoring, false);
+
+  // 7. Workspaces Mode 'off' (SPEC §6.4)
+  const offContext = buildWorkspaceContext(fileAccessor, { mode: 'off' });
+  assert.equal(offContext.mode, 'off');
+  const resOffWs = resolveWorkspaceImportSpecifier('@monorepo/ui', targetFile, offContext, fileAccessor);
+  assert.equal(resOffWs.resolved, false, 'In mode off, workspace package name map must not resolve');
+  assert.equal(resOffWs.resolvedVia, 'unresolved');
+  const resOffTsconfig = resolveWorkspaceImportSpecifier('@alias/button', targetFile, offContext, fileAccessor);
+  assert.equal(resOffTsconfig.resolved, false, 'In mode off, tsconfig paths must not resolve');
+  assert.equal(resOffTsconfig.resolvedVia, 'unresolved');
+  const resOffNearest = resolveWorkspaceImportSpecifier('next', targetFile, offContext, fileAccessor);
+  assert.equal(resOffNearest.resolved, true, 'In mode off, nearest declared dependencies still resolve');
+  assert.equal(resOffNearest.resolvedVia, 'nearest');
+  const resOffRoot = resolveWorkspaceImportSpecifier('react', targetFile, offContext, fileAccessor);
+  assert.equal(resOffRoot.resolved, true, 'In mode off, root declared dependencies still resolve');
+  assert.equal(resOffRoot.resolvedVia, 'root');
+  const resOffImports = resolveWorkspaceImportSpecifier('#root-util', targetFile, offContext, fileAccessor);
+  assert.equal(resOffImports.resolved, true, 'In mode off, subpath #imports still resolve');
+  assert.equal(resOffImports.resolvedVia, 'imports');
+});
+
+
 
 
 
