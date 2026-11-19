@@ -419,9 +419,93 @@ function findEnclosingBlockRange(maskedCode: string, pos: number): { start: numb
 const UNBOUNDED_LOOP_BOUNDED_EXIT_RE =
   /\b(?:break|return|throw|process\.exit)\b|\b(?:maxRetries|maxAttempts|MAX_ATTEMPTS|attempts?|retries)(?:\+\+|--)?\s*(?:<|<=|>|>=|===|!==)/i;
 
-/** Shared body-scan helper for DG008 (`while`/`for`) and DG008-EV-01 (`do...while`). */
+const BOUNDED_LOOP_EXIT_RE =
+  /\b(?:return|throw|process\.exit)\b|\b(?:maxRetries|maxAttempts|MAX_ATTEMPTS|attempts?|retries)(?:\+\+|--)?\s*(?:<|<=|>|>=|===|!==)/i;
+
+function blankBraceInterior(chars: string[], openBraceIdx: number): number {
+  const closeIdx = findMatchingDelim(chars.join(''), openBraceIdx, '{', '}');
+  if (closeIdx === -1) return openBraceIdx;
+  for (let i = openBraceIdx + 1; i < closeIdx; i++) {
+    if (chars[i] !== '\n') chars[i] = ' ';
+  }
+  return closeIdx;
+}
+
+function stripNestedFunctionBodies(maskedBody: string): string {
+  const chars = maskedBody.split('');
+  const fnOrArrowRe = /\bfunction\b(?:\s+[A-Za-z_$][\w$]*)?\s*\(|=>\s*\{/g;
+  let m: RegExpExecArray | null;
+  while ((m = fnOrArrowRe.exec(maskedBody)) !== null) {
+    if (m[0].endsWith('{')) {
+      blankBraceInterior(chars, m.index + m[0].length - 1);
+      continue;
+    }
+    const openParenIdx = m.index + m[0].length - 1;
+    const closeParenIdx = findMatchingDelim(maskedBody, openParenIdx, '(', ')');
+    if (closeParenIdx === -1) continue;
+    let i = closeParenIdx + 1;
+    while (i < maskedBody.length && maskedBody[i] !== '{' && maskedBody[i] !== ';') {
+      i++;
+    }
+    if (i < maskedBody.length && maskedBody[i] === '{') {
+      blankBraceInterior(chars, i);
+    }
+  }
+  return chars.join('');
+}
+
+function stripNestedControlBodies(outerFnScope: string): string {
+  const chars = outerFnScope.split('');
+  const innerControlRe = /\b(?:for|while|switch)\s*\(|\bdo\s*\{/g;
+  let m: RegExpExecArray | null;
+  while ((m = innerControlRe.exec(outerFnScope)) !== null) {
+    if (m[0].endsWith('{')) {
+      blankBraceInterior(chars, m.index + m[0].length - 1);
+      continue;
+    }
+    const openParenIdx = m.index + m[0].length - 1;
+    const closeParenIdx = findMatchingDelim(outerFnScope, openParenIdx, '(', ')');
+    if (closeParenIdx === -1) continue;
+    let i = closeParenIdx + 1;
+    while (i < outerFnScope.length && /\s/.test(outerFnScope[i])) i++;
+    if (outerFnScope[i] === '{') {
+      blankBraceInterior(chars, i);
+    }
+  }
+  return chars.join('');
+}
+
+function hasOuterLabeledBreak(outerFnScope: string): boolean {
+  const innerLabels = new Set<string>();
+  const labelDefRe = /(?:^|[;{}])\s*([A-Za-z_$][\w$]*)\s*:/gm;
+  let lm: RegExpExecArray | null;
+  while ((lm = labelDefRe.exec(outerFnScope)) !== null) {
+    if (lm[1] !== 'case' && lm[1] !== 'default') {
+      innerLabels.add(lm[1]);
+    }
+  }
+  const labeledBreakRe = /\bbreak\s+([A-Za-z_$][\w$]*)\b/g;
+  let bm: RegExpExecArray | null;
+  while ((bm = labeledBreakRe.exec(outerFnScope)) !== null) {
+    if (!innerLabels.has(bm[1])) return true;
+  }
+  return false;
+}
+
+/** Shared scope-aware body-scan helper for DG008 (`while`/`for`) and DG008-EV-01 (`do...while`). */
 function isUnboundedAsyncLoopBody(maskedBody: string): boolean {
-  return /\bawait\b/.test(maskedBody) && !UNBOUNDED_LOOP_BOUNDED_EXIT_RE.test(maskedBody);
+  if (!/\bawait\b/.test(maskedBody)) return false;
+  // Preserve fast path when outer body has neither exit keywords nor retry counters at all
+  if (!UNBOUNDED_LOOP_BOUNDED_EXIT_RE.test(maskedBody)) return true;
+
+  const outerFnScope = stripNestedFunctionBodies(maskedBody);
+  if (BOUNDED_LOOP_EXIT_RE.test(outerFnScope)) return false;
+
+  const outerLoopScope = stripNestedControlBodies(outerFnScope);
+  if (/\bbreak\b/.test(outerLoopScope)) return false;
+  if (hasOuterLabeledBreak(outerFnScope)) return false;
+
+  return true;
 }
 
 /** DG008: Detects unbounded async loops and external fetch() calls lacking AbortSignal timeouts. */

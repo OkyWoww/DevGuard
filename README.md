@@ -3,11 +3,11 @@
 [![Zero-Dependency Runtime](https://img.shields.io/badge/Runtime-100%25%20Zero--Dependency-emerald.svg)](#hybrid-dual-layer-architecture)
 [![OASIS SARIF v2.1.0](https://img.shields.io/badge/SARIF-v2.1.0%20Compliant-blue.svg)](#quick-start-fork-safe-ci-setup)
 [![GitHub Action](https://img.shields.io/badge/GitHub%20Action-v1.3.0-black.svg)](#quick-start-fork-safe-ci-setup)
-[![Tests 75/75 Passing](https://img.shields.io/badge/Tests-75%2F75%20Passing-success.svg)](#local-development--verification)
+[![Tests 81/81 Passing](https://img.shields.io/badge/Tests-81%2F81%20Passing-success.svg)](#local-development--verification)
 
 **DevGuard** is a deterministic CI/CD security gatekeeper engineered to catch silent failures, slopsquatting, leaked API keys, and financial race conditions hidden inside AI-generated (*Cursor, Windsurf, Copilot, Antigravity*) Pull Requests before they reach production.
 
-Unlike generic LLM code reviewers that only leave probabilistic chat comments, DevGuard combines a **0-latency Deterministic Single-Pass Lexical & Heuristic Engine** (`Pass-O` + additive `Pass-V` virtual constant folding) with optional **Gemini Adversarial Reasoning**, posts **One-Click GitHub Suggested Changes** directly on offending diff lines, and uploads **OASIS SARIF v2.1.0** reports to GitHub Code Scanning.
+Unlike generic LLM code reviewers that only leave probabilistic chat comments, DevGuard combines an **offline, low-latency Deterministic Lexical & Heuristic Engine** (`Pass-O` + additive `Pass-V` virtual constant folding) with optional **Gemini Adversarial Reasoning**, posts **One-Click GitHub Suggested Changes** directly on offending diff lines, and uploads **OASIS SARIF v2.1.0** reports to GitHub Code Scanning.
 
 ---
 
@@ -53,12 +53,12 @@ In `v1.3.0`, DevGuard introduces a deterministic, syntax-guarded **Virtual Foldi
    * **`FOLD-02` (Array Join Folding):** Folds pure string literal array `.join()` calls (e.g., `['sk', 'live', '51H9...'].join('_')`) with delimiter validation and multiline/escape exclusion.
    * **`FOLD-04` (Bracket-to-Dot Member Access):** Rewrites safe identifier bracket lookups (e.g., `globalThis["eval"]`, `wallet["balance"]`, `wallet["deduct"]`) to dot notation using backward scanning (`MAX_BACKSCAN = 256`) to reject declarations (`const x["a"]`), computed object properties (`{ ["a"]: 1 }`), destructuring, and keyword collisions.
 2. **Additive `Pass-V` & `SpanMap` Remapping ([src/devguardAnalyzer.ts](src/devguardAnalyzer.ts)):**
-   * When `editsApplied === 0`, DevGuard pays **zero `Pass-V` overhead** and produces identical results to `Pass-O`.
-   * When `editsApplied > 0`, detectors re-run on virtual code `V`, map every line/span back to original source `O` via binary-search `toOrigLineAndCol` / `toOrigSpan` (`SpanMap`), deduplicate against `Pass-O`, apply suppressions on original lines `O`, and tag virtual-only findings with `[via-fold]`.
+   * When `editsApplied === 0`, DevGuard skips the secondary `Pass-V` detector pass (`+0.02%` measured overhead on the `108`-case non-fold baseline subset vs `Pass-O` alone) and produces identical results to `Pass-O`.
+   * When `editsApplied > 0`, detectors re-run on virtual code `V`, map `[line, endLine]` spans back to original source `O` via binary-search `toOrigLineAndCol` / `toOrigSpan` (`SpanMap`) — including semicolon-separated statements collapsed onto a single virtual line — deduplicate against `Pass-O`, apply range-aware inline suppressions on original lines `O`, and tag virtual-only findings with `[via-fold]`.
    * `DG004-DYN-01/02` runs in `virtual-only` mode whenever `editsApplied > 0`, automatically silencing spurious dynamic-specifier warnings on statically resolvable concatenations such as `require("node:p" + "ath")`.
-3. **Deterministic DoS Bounds & SARIF Visibility:**
-   * Hard-capped at `MAX_FOLD_DEPTH = 4`, `MAX_FOLD_OPERANDS = 64`, `MAX_FOLDED_LENGTH = 4096`, `MAX_FOLD_EDITS = 2000`, and `MAX_BACKSCAN = 256` with non-overlapping monotonic `SpanMap` invariants verified by property tests.
-   * Files hitting fold limits degrade safely with partial folds and emit a deduplicated `level: "note"` notification (`descriptor.id: "fold_limit_exceeded"`) in SARIF `runs[0].invocations[0].toolExecutionNotifications[]`.
+3. **Deterministic DoS Bounds, Priority Budgeting, & SARIF Visibility:**
+   * Hard-capped at `MAX_FOLD_DEPTH = 4`, `MAX_FOLD_OPERANDS = 64`, `MAX_FOLDED_LENGTH = 4096`, `MAX_FOLD_EDITS = 2000`, and `MAX_BACKSCAN = 256` with $O(\log N)$ binary-search region/literal lookups and non-overlapping monotonic `SpanMap` invariants verified by property tests.
+   * When a file exceeds `MAX_FOLD_EDITS`, priority scheduling caps noisy `FOLD-03` backtick floods, reserves edit capacity for downstream `FOLD-02`/`FOLD-04` transforms, prioritizes security-sensitive/dynamic-sink contexts (`eval`, `require`, `import`, secret prefixes, balance/transfer/fetch chains), and spreads fallback selection across head/tail regions before emitting a deduplicated SARIF `fold_limit_exceeded` (`level: "note"`) notification.
 
 ---
 
@@ -254,8 +254,8 @@ jobs:
 DevGuard tracks detector precision, recall, and remaining evasion boundaries transparently in [tests/corpus/cases.ts](tests/corpus/cases.ts) (`npm run corpus:report`). Because Layer 1 operates deterministically without inter-procedural symbolic execution or arbitrary control-flow analysis, multi-hop variable aliasing (`const fn = eval`) and indirect helper indirection remain explicitly documented as `knownMiss` cases below.
 
 ### Automated Corpus Benchmark (`n = 129`, `v1.3.0`)
-- **Total Cases:** `n = 129` (`TP = 48`, `TN = 63`, `EVASION = 18`, `knownMiss = 8`, `knownFP = 0`)
-- **Cross-Rule TN Guarantee:** All `63/63` negative cases produce **0 false positives** across all rules (`DG001`–`DG008`, `DG004-DYN-01/02`, `DG005-EV-01`, `DG008-EV-01`).
+- **Total Curated Cases:** `n = 129` (`TP = 48`, `TN = 63`, `EVASION = 18`, `knownMiss = 8`, `knownFP = 0`)
+- **Curated Corpus TN Guarantee:** All `63/63` negative cases in the labeled test corpus produce `0` findings across all rules (`DG001`–`DG008`, `DG004-DYN-01/02`, `DG005-EV-01`, `DG008-EV-01`). (See the External OSS Validation table below for observed real-world false positives, especially `DG004` in monorepos.)
 
 | Rule | TP (hit/total) | TN (FP/total) | EVASION (hit/total) | knownMiss | knownFP |
 | :--- | :---: | :---: | :---: | :---: | :---: |
@@ -268,9 +268,20 @@ DevGuard tracks detector precision, recall, and remaining evasion boundaries tra
 | `DG007` | `7/7` | `0/9` | `3/3` | `0` | `0` |
 | `DG008` | `7/7` | `0/9` | `1/3` | `2` | `0` |
 
-#### Pass-O vs Pass-O+V Performance Benchmark Gate (`Test 70`, Median of 25 Iterations)
-* **Full Corpus (`129` cases):** `Pass-O Only = 38.21 ms` vs `Pass-O+V = 40.43 ms` (**`+5.80%` overhead**, well under the `SPEC.md` §9 `<= +25%` gate; `0.313 ms/case`).
-* **Non-Fold Baseline Subset (`108` cases with `editsApplied === 0`):** `Pass-O Only = 31.68 ms` vs `Pass-O+V = 31.46 ms` (**`-0.69%` overhead**, `3,191 cases/sec`).
+#### Pass-O vs Pass-O+V Performance & Scale Benchmarks (`Tests 70 & 80`, Node `v26.13.0` Windows Host)
+* **Full Corpus (`129` cases, median of 25 iterations after warmup, `Test 70`):** `Pass-O Only = 160.47 ms` (`1.244 ms/case`) vs `Pass-O+V = 172.18 ms` (`1.335 ms/case`, **`+7.30%` overhead**, within the `SPEC.md` §9 `<= +25%` gate).
+* **Non-Fold Baseline Subset (`108` cases with `editsApplied === 0`, `Test 70`):** `Pass-O Only = 134.30 ms` vs `Pass-O+V = 134.33 ms` (**`+0.02%` overhead**, `749 cases/sec`).
+* **Single-File Scaling & 1 MB Worst-Case Stress (`Test 80`):**
+
+| Workload | File Size | `Pass-O` Time | `Pass-O+V` Time | Latency Delta | Heap Delta | Folds Applied |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| Large Module (`100 KB`) | `99 KB` | `40.82 ms` | `69.85 ms` | `+29.03 ms` | `+10.03 MB` | `62` |
+| Large Module (`250 KB`) | `248 KB` | `67.64 ms` | `175.33 ms` | `+107.68 ms` | `+7.94 MB` | `156` |
+| Large Module (`500 KB`) | `499 KB` | `131.06 ms` | `284.07 ms` | `+153.01 ms` | `+23.18 MB` | `313` |
+| Max Analysis Limit (`1 MB`) | `999 KB` | `252.62 ms` | `509.79 ms` | `+257.17 ms` | `+51.05 MB` | `627` |
+| Dense Fold Stress (`1 MB Worst-Case`) | `1000 KB` | `327.44 ms` | `1199.84 ms` | `+872.40 ms` | `-27.66 MB`* | `2000` (capped) |
+
+*\*Negative heap delta reflects V8 garbage collection occurring during the unforced memory measurement.*
 
 #### Remaining Documented `knownMiss` Corpus Cases (`n = 8`, `0` in `v1.3.0` Scope)
 Compared to `v1.2.1` (`14 knownMiss`), **`v1.3.0` resolved 6 documented evasion cases** (`DG004-EV-02` via `Pass-V`, `DG005-EV-01` via empty `.catch()` detector, `DG006-EV-01` via `FOLD-04`, `DG007-EV-01` & `DG007-EV-03` via `FOLD-01`/`02`, and `DG008-EV-01` via `do...while(true|1)`). The remaining `8` cases intentionally sit outside Stage 5 lexical/single-statement scope (inter-statement or inter-procedural aliasing):
@@ -283,13 +294,23 @@ Compared to `v1.2.1` (`14 knownMiss`), **`v1.3.0` resolved 6 documented evasion 
 - **`DG008-EV-02`** (`DG008`, `knownMiss`): Aliased `fetch` reference (`const httpGet = fetch`) bypasses literal `fetch()` call matcher.
 - **`DG008-EV-03`** (`DG008`, `knownMiss`): `while (running)` async loop where boolean guard is never mutated or broken.
 
-#### External Real-World OSS Repository Validation (`SPEC.md` §9 & §10)
-Validated offline (`DEVGUARD_TARGET=all`, `GEMINI_API_KEY=""`, zero temp artifacts left in repo) against shallow clones (`--depth 1`) of two production TypeScript repositories in `os.tmpdir()`:
+#### External Real-World OSS Repository Validation (`n = 10` Convenience Sample, `4,318` Analyzed Files)
+Validated offline (`DEVGUARD_TARGET=all`, `GEMINI_API_KEY=""`, zero temp artifacts left in repo) against shallow clones (`--depth 1`) of 10 production JS/TS repositories in `os.tmpdir()`. *(Because this `n = 10` cohort is a convenience sample rather than a random statistical cross-section, results illustrate ecosystem behavior and failure modes rather than universal precision rates.)*
 
-| Repository | Commit SHA | In-Scope / Analyzed / Skipped | Wall-Clock Time | Findings Breakdown | SARIF v2.1.0 & v1.3.0 FP Audit |
-| :--- | :--- | :---: | :---: | :--- | :--- |
-| **`sindresorhus/ky`** | `3541888` | `107` / `98` (`98 full`) / `0` | `661 ms` (`694 ms` CLI) | `DG004`: `21` (in `test-d/`), `DG005`: `3`, `DG008`: `285` (unbounded test/fetch calls); `fold_limit_exceeded`: `2` notes (`test/response-size.ts`, `test/retry.ts`) | SARIF valid (`519` results, `0` crashes); **`0` FP** across `DG004-DYN-01/02`, `DG005-EV-01`, `DG008-EV-01`, and `[via-fold]`; real `catch {}` confirmed at `source/core/Ky.ts:107` & `source/errors/NonError.ts:29` |
-| **`colinhacks/zod`** | `e32e088` | `490` / `307` (`307 full`) / `1` (`should-build-site.sh`) | `1,423 ms` (`1,148 ms` CLI) | `DG001`: `1` (`packages/bench/memory/dict-mode.ts:13` `eval(...)`), `DG004-DYN-01`: `1` (`packages/bench/benchUtil.ts:5` dynamic `import(new URL(...).href)`), `DG005`: `31`, `DG008`: `1` | SARIF valid (`656` results, avg score `91/100`, `0` analysis failures); **`0` FP** across `DG004-DYN-01/02`, `DG005-EV-01`, `DG008-EV-01`, and `[via-fold]` |
+| Repository | Commit SHA | Ecosystem | Analyzed / Skipped | Wall-Clock Time | Findings Summary | Audit Observations |
+| :--- | :--- | :--- | :---: | :---: | :--- | :--- |
+| **`sindresorhus/ky`** | `3541888` | HTTP / ESM TS | `98` / `0` | `662.5 ms` | `DG004`: `21`, `DG005`: `3`, `DG008`: `285`, `fold_limit`: `2` | `0` crashes; `DG004` flags self-imports (`'ky'`) inside `test-d/`; confirmed `catch {}` (`source/core/Ky.ts:107`) |
+| **`colinhacks/zod`** | `e32e088` | Monorepo / TS | `307` / `1` | `3,729.2 ms` | `DG001`: `1`, `DG004-DYN-01`: `1`, `DG005`: `31`, `DG008`: `1` | `0` crashes; `DG001` (`packages/bench/memory/dict-mode.ts:13` `eval(...)`) & `DG004-DYN-01` (`benchUtil.ts:5`) accurate |
+| **`expressjs/express`** | `43fca52` | Backend / CJS | `142` / `0` | `1,540.9 ms` | `DG004-DYN-02`: `3`, `DG004`: `3` | `0` crashes; `DG004-DYN-02` accurately surfaced dynamic `require(path/file/mod)` loaders |
+| **`fastify/fastify`** | `825d772` | Backend / CJS | `85` / `1` | `767.8 ms` | `0` findings | `0` crashes, `0` false positives |
+| **`honojs/hono`** | `75ff8e3` | Edge / TS | `290` / `1` | `2,591.6 ms` | `DG004-DYN-01`: `3`, `DG005`: `14`, `DG008`: `2`, `DG004`: `1` | `0` crashes; `0` observed FPs in sampled `DG004-DYN-01` results |
+| **`vercel/swr`** | `8148ef0` | React / Next.js | `213` / `0` | `1,829.0 ms` | `DG008`: `35`, `DG004`: `1`, `DG005`: `2` | `0` crashes; `DG008` reflects test/runtime `fetch` without `AbortSignal.timeout()` |
+| **`vitejs/vite`** | `ef295d5` | Build / Monorepo | `1,452` / `13` | `14,987.4 ms` | `DG001`: `3` *(down from `4`)*, `DG004`: `48`, `DG005`: `30`, `DG004-DYN-01`: `57`, `DG004-DYN-02`: `1`, `DG008`: `7` | Fixed Playwright `page.$eval()` FP (`4 -> 3`); `DG004` flags monorepo aliases, self-imports & `preact` typosquat FPs |
+| **`nestjs/nest`** | `bbbfaf1` | Enterprise / TS | `1,682` / `0` | `14,429.3 ms` | `DG001`: `0` *(down from `1`)*, `DG004`: `481`, `DG008`: `10`, `DG004-DYN-01`: `5`, `DG005`: `13` | Fixed `async exec()` method-decl FP (`1 -> 0`); heavy `DG004` workspace/monorepo package FPs (`481`) |
+| **`tj/commander.js`** | `a5a7dc0` | CLI Tooling | `46` / `8` | `367.1 ms` | `DG004`: `39` | `0` crashes; `DG004` flags workspace self-package imports |
+| **`electron/electron-quick-start`** | `de47e7e` | Desktop / Electron | `3` / `0` | `26.3 ms` | `0` findings | `0` crashes, `0` false positives |
+
+* **Key OSS Validation Takeaways:** Across `4,318` analyzed files (`0` `analysisFailures`), `DG004-DYN-01/02`, `DG005-EV-01`, `DG008-EV-01`, and `[via-fold]` produced `0` observed false positives in manually inspected findings. However, **`DG004` emits substantial false positives in monorepos and workspace packages** (`481` in NestJS, `48` in Vite, `39` in Commander.js, `21` in Ky `test-d/`), requiring base-branch `.devguard.json` allowlists in monorepo setups; two real-world `DG001` FPs (`page.$eval` and `async exec() {}`) were also identified and eliminated during this validation pass.
 
 See also [docs/benchmarks/realworld-2026-11-16.md](docs/benchmarks/realworld-2026-11-16.md) for the initial DevGuard `src/` self-scan baseline (`7` files under `src`, `0` false-positive findings across `DG001`–`DG008`).
 
@@ -305,7 +326,7 @@ See also [docs/benchmarks/realworld-2026-11-16.md](docs/benchmarks/realworld-202
 
 ## 🧪 Local Development & Verification
 
-DevGuard enforces a strict zero-dependency test harness using Node's built-in assertion & test runner (`node:test` compiled via `tsconfig.test.json` and executed in-process), currently verified at **75/75 passing tests** across [tests/corpus.test.ts](tests/corpus.test.ts) (`Corpus Benchmark`) and [tests/integration.test.ts](tests/integration.test.ts) (`Tests 1–74`):
+DevGuard enforces a strict zero-dependency test harness using Node's built-in assertion & test runner (`node:test` compiled via `tsconfig.test.json` and executed in-process), currently verified at **81/81 passing tests** across [tests/corpus.test.ts](tests/corpus.test.ts) (`Corpus Benchmark`) and [tests/integration.test.ts](tests/integration.test.ts) (`Tests 1–80`):
 
 ```bash
 # 1. Typecheck application, CLI, & tests
@@ -314,7 +335,7 @@ npm run lint
 # 2. Build standalone web UI bundle
 npm run build
 
-# 3. Run zero-dependency benchmark + integration test suite (75/75 scenarios)
+# 3. Run zero-dependency benchmark + integration test suite (81/81 scenarios)
 npm test
 
 # 4. Print DevGuard CLI version cleanly under Node --experimental-strip-types

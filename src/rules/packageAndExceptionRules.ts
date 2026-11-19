@@ -164,8 +164,104 @@ export function detectHallucinatedPackages(
   const builtinSet = getNodeBuiltinModuleSet(options?.builtinModules);
   const { declaredDeps, subpathImports } = resolvePackageMetadata(options);
   const staticImportRe = /^\s*(?:(?:import|export)\b[^'"]*\bfrom\s+|import\s+|\}\s*from\s+)['"]([^'"]+)['"]/;
-  const dynamicOrRequireRe = /(?:^|[^\w.'"`])\b(?:require|import)\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
+  const dynamicOrRequireRe =
+    /(?:^|[^\w.'"`])\b(?:require|import)\s*\(\s*['"]([^'"]+)['"]\s*(?:,|\))/g;
   const maskedImportOrRequireRe = /^\s*(?:import\b|export\b[^\n;]*\bfrom\b|\}\s*from\b)|(?:^|[^\w.'"`])\b(?:require|import)\s*\(/;
+
+  const evalSpec = (num: number, rawSpec: string, lineText: string): void => {
+    if (!rawSpec) return;
+
+    if (rawSpec.startsWith('#')) {
+      if (subpathImports && !matchesSubpathImport(rawSpec, subpathImports)) {
+        const msg = `Subpath import '${rawSpec}' tidak terdaftar pada field "imports" di package.json (baris ${num}).`;
+        findings.push({
+          line: num,
+          category: 'security',
+          penalty: 35,
+          shortReason: `-35 [DG004] Undeclared subpath import '${rawSpec}' (baris ${num})`,
+          detailedReason: msg,
+          isCritical: true,
+        });
+        inlineFindings.push({ ruleId: 'DG004', line: num, severity: 'error', message: msg });
+      }
+      return;
+    }
+
+    if (
+      rawSpec.startsWith('.') ||
+      rawSpec.startsWith('/') ||
+      rawSpec.startsWith('@/') ||
+      rawSpec.startsWith('~/') ||
+      rawSpec.startsWith('virtual:') ||
+      (/^[a-z]+:/i.test(rawSpec) && !rawSpec.startsWith('node:'))
+    ) {
+      return;
+    }
+
+    const strippedNode = rawSpec.startsWith('node:') ? rawSpec.slice(5) : rawSpec;
+    const baseStripped = getBasePackageName(strippedNode);
+    if (builtinSet.has(strippedNode) || builtinSet.has(baseStripped)) return;
+
+    const basePkg = getBasePackageName(rawSpec);
+
+    if (!POPULAR_NPM_SET.has(basePkg)) {
+      let bestCandidate: string | undefined;
+      let bestDist = Number.POSITIVE_INFINITY;
+
+      for (const popular of POPULAR_NPM_PACKAGES) {
+        const dist = damerauLevenshtein(basePkg, popular);
+        const isMatch = (dist === 1 && basePkg.length >= 5) || (dist === 2 && basePkg.length >= 8);
+        if (isMatch && dist < bestDist) {
+          bestDist = dist;
+          bestCandidate = popular;
+        }
+      }
+
+      if (bestCandidate) {
+        const replacementPkg = rawSpec === basePkg ? bestCandidate : rawSpec.replace(basePkg, bestCandidate);
+        const suggestion = lineText.replace(rawSpec, replacementPkg);
+        const msg = `Potensi slopsquatting / typosquatting pada paket '${rawSpec}' (jarak edit ${bestDist} dari '${bestCandidate}').`;
+        findings.push({
+          line: num,
+          category: 'security',
+          penalty: 40,
+          shortReason: `-40 [DG004] Typosquatting paket '${rawSpec}' -> '${bestCandidate}' (baris ${num})`,
+          detailedReason: msg,
+          isCritical: true,
+        });
+        inlineFindings.push({
+          ruleId: 'DG004',
+          line: num,
+          severity: 'error',
+          message: msg,
+          suggestion,
+        });
+        return;
+      }
+    }
+
+    if (declaredDeps && !declaredDeps.has(basePkg)) {
+      const msg = `Phantom dependency '${basePkg}' diimpor pada baris ${num} namun tidak terdaftar di package.json.`;
+      findings.push({
+        line: num,
+        category: 'security',
+        penalty: 35,
+        shortReason: `-35 [DG004] Phantom dependency '${basePkg}' absen dari package.json (baris ${num})`,
+        detailedReason: msg,
+        isCritical: true,
+      });
+      inlineFindings.push({
+        ruleId: 'DG004',
+        line: num,
+        severity: 'error',
+        message: msg,
+      });
+    }
+  };
+
+  const seenSpecs = new Set<string>();
+  const lineTextByNum = new Map<number, string>();
+  for (const l of execLines) lineTextByNum.set(l.num, l.text);
 
   for (const { num, text } of execLines) {
     if (!maskedImportOrRequireRe.test(maskedLines[num - 1] ?? '')) continue;
@@ -178,94 +274,31 @@ export function detectHallucinatedPackages(
     }
 
     for (const rawSpec of specs) {
-      if (!rawSpec) continue;
+      const key = `${num}:${rawSpec}`;
+      if (seenSpecs.has(key)) continue;
+      seenSpecs.add(key);
+      evalSpec(num, rawSpec, text);
+    }
+  }
 
-      if (rawSpec.startsWith('#')) {
-        if (subpathImports && !matchesSubpathImport(rawSpec, subpathImports)) {
-          const msg = `Subpath import '${rawSpec}' tidak terdaftar pada field "imports" di package.json (baris ${num}).`;
-          findings.push({
-            line: num,
-            category: 'security',
-            penalty: 35,
-            shortReason: `-35 [DG004] Undeclared subpath import '${rawSpec}' (baris ${num})`,
-            detailedReason: msg,
-            isCritical: true,
-          });
-          inlineFindings.push({ ruleId: 'DG004', line: num, severity: 'error', message: msg });
-        }
-        continue;
-      }
-
-      if (
-        rawSpec.startsWith('.') ||
-        rawSpec.startsWith('/') ||
-        rawSpec.startsWith('@/') ||
-        rawSpec.startsWith('~/') ||
-        rawSpec.startsWith('virtual:') ||
-        (/^[a-z]+:/i.test(rawSpec) && !rawSpec.startsWith('node:'))
-      ) {
-        continue;
-      }
-
-      const strippedNode = rawSpec.startsWith('node:') ? rawSpec.slice(5) : rawSpec;
-      const baseStripped = getBasePackageName(strippedNode);
-      if (builtinSet.has(strippedNode) || builtinSet.has(baseStripped)) continue;
-
-      const basePkg = getBasePackageName(rawSpec);
-
-      if (!POPULAR_NPM_SET.has(basePkg)) {
-        let bestCandidate: string | undefined;
-        let bestDist = Number.POSITIVE_INFINITY;
-
-        for (const popular of POPULAR_NPM_PACKAGES) {
-          const dist = damerauLevenshtein(basePkg, popular);
-          const isMatch = (dist === 1 && basePkg.length >= 5) || (dist === 2 && basePkg.length >= 8);
-          if (isMatch && dist < bestDist) {
-            bestDist = dist;
-            bestCandidate = popular;
-          }
-        }
-
-        if (bestCandidate) {
-          const replacementPkg = rawSpec === basePkg ? bestCandidate : rawSpec.replace(basePkg, bestCandidate);
-          const suggestion = text.replace(rawSpec, replacementPkg);
-          const msg = `Potensi slopsquatting / typosquatting pada paket '${rawSpec}' (jarak edit ${bestDist} dari '${bestCandidate}').`;
-          findings.push({
-            line: num,
-            category: 'security',
-            penalty: 40,
-            shortReason: `-40 [DG004] Typosquatting paket '${rawSpec}' -> '${bestCandidate}' (baris ${num})`,
-            detailedReason: msg,
-            isCritical: true,
-          });
-          inlineFindings.push({
-            ruleId: 'DG004',
-            line: num,
-            severity: 'error',
-            message: msg,
-            suggestion,
-          });
-          continue;
-        }
-      }
-
-      if (declaredDeps && !declaredDeps.has(basePkg)) {
-        const msg = `Phantom dependency '${basePkg}' diimpor pada baris ${num} namun tidak terdaftar di package.json.`;
-        findings.push({
-          line: num,
-          category: 'security',
-          penalty: 35,
-          shortReason: `-35 [DG004] Phantom dependency '${basePkg}' absen dari package.json (baris ${num})`,
-          detailedReason: msg,
-          isCritical: true,
-        });
-        inlineFindings.push({
-          ruleId: 'DG004',
-          line: num,
-          severity: 'error',
-          message: msg,
-        });
-      }
+  // Also catch multi-line dynamic import(\n 'pkg'\n) / require(\n 'pkg'\n) spanning lines
+  if (execLines.length > 1) {
+    const joinedExec = execLines.map((l) => l.text).join('\n');
+    const joinedMasked = execLines.map((l) => maskedLines[l.num - 1] ?? '').join('\n');
+    const multiLineCallRe = /(?:^|[^\w.'"`])\b(?:require|import)\s*\(\s*\n\s*['"]([^'"]+)['"]\s*(?:,|\))/g;
+    let mm: RegExpExecArray | null;
+    while ((mm = multiLineCallRe.exec(joinedExec)) !== null) {
+      const prefixOffset = mm.index + (mm[0].search(/\b(?:require|import)\b/) || 0);
+      const execIdx = joinedExec.slice(0, prefixOffset).split('\n').length - 1;
+      const lineEntry = execLines[execIdx];
+      if (!lineEntry) continue;
+      const maskedSlice = joinedMasked.slice(mm.index, mm.index + mm[0].length);
+      if (!/\b(?:require|import)\s*\(/.test(maskedSlice)) continue;
+      const rawSpec = mm[1];
+      const key = `${lineEntry.num}:${rawSpec}`;
+      if (seenSpecs.has(key)) continue;
+      seenSpecs.add(key);
+      evalSpec(lineEntry.num, rawSpec, lineEntry.text);
     }
   }
 }

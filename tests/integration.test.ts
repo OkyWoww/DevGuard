@@ -5689,6 +5689,366 @@ test('Test 74: Total Corpus TP/TN Quota Verification (SPEC §8.1)', () => {
   assert.ok(totalNewTn >= 40, `SPEC §8.1 requires >= 40 total new TN cases across 8 patterns (found ${totalNewTn})`);
 });
 
+// =============================================================================
+// STAGE 5.5 REMEDIATION: Adversarial Hardening, Precision, Fuzzing, & Large-File Gate
+// =============================================================================
+
+test('Test 75: Fold Budget Exhaustion EOF Bypass Defense (P1 #3)', () => {
+  const eofPayloads = [
+    'const run = (userInput: string) => globalThis["ev" + "al"](userInput);',
+    'export const eofSecret = "sk_live_" + "51H9xY2zA3bC4dE5fG6hI7jK8lM9nO0p";',
+    'export async function eofSwallow(wallet: Record<string, any>, amt: number) { await wallet["ded" + "uct"](amt).catch(() => {}); }',
+    'export async function eofTypo() { return await import("lod" + "ahs"); }',
+  ].join('\n');
+
+  const padVariants = [
+    { name: 'FOLD-03 backtick flood (2200 lines)', line: 'const pad = `benign`;' },
+    { name: 'FOLD-01 concat flood (2200 lines)', line: 'const pad = "aa" + "bb";' },
+  ];
+
+  for (const variant of padVariants) {
+    const code = Array(2200).fill(variant.line).join('\n') + '\n' + eofPayloads + '\n';
+    const report = analyzeCodeDeterministically(code, { filePath: 'src/eofBypass.ts' });
+    assert.equal(report.virtualView?.limitExceeded, true, `${variant.name}: expected limitExceeded=true`);
+    assert.ok(
+      (report.virtualView?.editsApplied ?? 0) <= MAX_FOLD_EDITS,
+      `${variant.name}: editsApplied must respect MAX_FOLD_EDITS`
+    );
+
+    const inline = report.inlineFindings ?? [];
+    for (const ruleId of ['DG001', 'DG004', 'DG005', 'DG007'] as const) {
+      const hit = inline.find((f) => f.ruleId === ruleId && f.message.includes('[via-fold]'));
+      assert.ok(hit, `${variant.name}: EOF ${ruleId} finding with [via-fold] was hidden by budget exhaustion`);
+    }
+  }
+});
+
+test('Test 76: SpanMap Multi-Line / Statement Remapping Precision & Suppression Consistency (P2 #4 & #5)', () => {
+  // 1. Multi-line fold preserves starting line and endLine across newlines
+  const multiLineFetch = [
+    'window[',
+    '  "fe" +',
+    '  "tch"',
+    ']("https://api.stripe.com/v1/charges");',
+  ].join('\n');
+  const repFetch = analyzeCodeDeterministically(multiLineFetch, { filePath: 'src/pay/mlFetch.ts' });
+  const dg008Fetch = (repFetch.inlineFindings ?? []).find((f) => f.ruleId === 'DG008');
+  assert.ok(dg008Fetch, 'Expected DG008 on multi-line folded window["fe"+"tch"]');
+  assert.equal(dg008Fetch.line, 1);
+  assert.equal(dg008Fetch.endLine, 4);
+
+  // 2. Multi-statement virtual line after a multi-line fold attributes second statement to its true line O=2
+  const twoStmtsAfterFold = [
+    'const prefix = ["a",',
+    '"b"].join(""); eval(cmd);',
+  ].join('\n');
+  const repTwo = analyzeCodeDeterministically(twoStmtsAfterFold, { filePath: 'src/evalTwo.ts' });
+  const dg001Two = (repTwo.inlineFindings ?? []).find((f) => f.ruleId === 'DG001');
+  assert.ok(dg001Two, 'Expected DG001 on second statement eval(cmd)');
+  assert.equal(dg001Two.line, 2, `Expected eval(cmd) remapped to line 2, got ${dg001Two.line}`);
+
+  // 3. Suppression consistency across leading, block, and trailing suppressions on multi-line folded code
+  const leadingSup = [
+    'export async function callWithLeadSup(x: number) {',
+    '  if (typeof x !== "number") throw new TypeError("x");',
+    '  // devguard-ignore DG008: upstream controller handles timeout cleanly',
+    '  window[',
+    '    "fe" +',
+    '    "tch"',
+    '  ]("https://api.example.com/health");',
+    '}',
+  ].join('\n');
+  const repLeadSup = analyzeCodeDeterministically(leadingSup, { filePath: 'src/pay/leadSup.ts' });
+  assert.equal((repLeadSup.inlineFindings ?? []).filter((f) => f.ruleId === 'DG008').length, 0);
+  assert.equal(repLeadSup.skor.correctness, 100);
+
+  const trailingSup = [
+    'export async function callWithTrailSup(x: number) {',
+    '  if (typeof x !== "number") throw new TypeError("x");',
+    '  window[',
+    '    "fe" +',
+    '    "tch"',
+    '  ]("https://api.example.com/health"); // devguard-ignore DG008: upstream controller handles timeout cleanly',
+    '}',
+  ].join('\n');
+  const repTrailSup = analyzeCodeDeterministically(trailingSup, { filePath: 'src/pay/trailSup.ts' });
+  assert.equal(
+    (repTrailSup.inlineFindings ?? []).filter((f) => f.ruleId === 'DG008').length,
+    0,
+    'Trailing suppression on endLine of multi-line folded expression must suppress DG008'
+  );
+  assert.equal(repTrailSup.skor.correctness, 100);
+
+  const blockSup = [
+    'export async function runSafe(wallet: Record<string, any>, amt: number) {',
+    '  /* devguard-ignore DG005-EV-01: best effort cache wallet ledger notification */',
+    '  await wallet["ded" + "uct"](amt).catch(() => {});',
+    '}',
+  ].join('\n');
+  const repBlockSup = analyzeCodeDeterministically(blockSup, { filePath: 'src/wallet/blockSup.ts' });
+  assert.equal((repBlockSup.inlineFindings ?? []).filter((f) => f.ruleId === 'DG005').length, 0);
+});
+
+test('Test 77: Nested Loop, Switch, & Callback Return Evasion in DG008 & DG008-EV-01 (P2 #6)', () => {
+  // Inner break / switch break / callback return must NOT satisfy outer loop bounded-exit check
+  const evasiveWhileForBreak = [
+    'export async function pollWithInnerForBreak(n: number) {',
+    '  if (typeof n !== "number") throw new Error("bad");',
+    '  while (true) {',
+    '    const items = await fetchBatch();',
+    '    for (const item of items) {',
+    '      if (item.skip) break;',
+    '    }',
+    '  }',
+    '}',
+  ].join('\n');
+  const evasiveSwitchBreak = [
+    'export async function pollWithSwitchBreak(n: number) {',
+    '  if (typeof n !== "number") throw new Error("bad");',
+    '  while (true) {',
+    '    const st = await pollStatus();',
+    '    switch (st) {',
+    '      case "pending": break;',
+    '    }',
+    '  }',
+    '}',
+  ].join('\n');
+  const evasiveCallbackReturn = [
+    'export async function pollWithCallbackReturn(n: number) {',
+    '  if (typeof n !== "number") throw new Error("bad");',
+    '  while (true) {',
+    '    const rows = await fetchBatch();',
+    '    rows.map((r) => { return r.id; });',
+    '  }',
+    '}',
+  ].join('\n');
+  const evasiveDoWhileInnerBreak = [
+    'export async function doWhileInnerBreak(n: number) {',
+    '  if (typeof n !== "number") throw new Error("bad");',
+    '  do {',
+    '    const rows = await fetchBatch();',
+    '    for (const r of rows) { if (r.skip) break; }',
+    '  } while (true);',
+    '}',
+  ].join('\n');
+  const evasiveDoWhileFnReturn = [
+    'export async function doWhileFnReturn(n: number) {',
+    '  if (typeof n !== "number") throw new Error("bad");',
+    '  do {',
+    '    await fetchBatch();',
+    '    function helper() { return 1; }',
+    '    helper();',
+    '  } while (1);',
+    '}',
+  ].join('\n');
+
+  for (const snippet of [
+    evasiveWhileForBreak,
+    evasiveSwitchBreak,
+    evasiveCallbackReturn,
+    evasiveDoWhileInnerBreak,
+    evasiveDoWhileFnReturn,
+  ]) {
+    const res = analyzeCodeDeterministically(snippet, { filePath: 'src/worker/nestedEvasion.ts' });
+    const dg008 = (res.inlineFindings ?? []).filter((f) => f.ruleId === 'DG008');
+    assert.equal(dg008.length, 1, `Expected DG008 on nested-exit evasion:\n${snippet}`);
+  }
+
+  // Genuine outer exits (including labeled outer break and outer return) must stay safe TNs
+  const validOuterLabeledBreak = [
+    'export async function labeledOuterBreak() {',
+    '  outer: while (true) {',
+    '    const items = await fetchBatch();',
+    '    for (const item of items) {',
+    '      if (item.done) break outer;',
+    '    }',
+    '  }',
+    '}',
+  ].join('\n');
+  const validOuterReturnAfterInnerLoop = [
+    'export async function outerReturn() {',
+    '  while (true) {',
+    '    const items = await fetchBatch();',
+    '    for (const item of items) { if (item.skip) continue; }',
+    '    return items;',
+    '  }',
+    '}',
+  ].join('\n');
+
+  for (const safeSnippet of [validOuterLabeledBreak, validOuterReturnAfterInnerLoop]) {
+    const res = analyzeCodeDeterministically(safeSnippet, { filePath: 'src/worker/safeOuter.ts' });
+    assert.equal((res.inlineFindings ?? []).filter((f) => f.ruleId === 'DG008').length, 0);
+  }
+});
+
+test('Test 78: Fold Regression Safety — 2-Arg import() & Multi-Line import/require Visibility (P2 #10)', () => {
+  const cases = [
+    {
+      name: '2-arg import() after FOLD-01',
+      code: 'export async function loadJson() { return await import("lod" + "ahs", { with: { type: "json" } }); }',
+    },
+    {
+      name: 'multi-line import() after FOLD-01',
+      code: 'export async function loadMl() {\n  return await import(\n    "lod" + "ahs"\n  );\n}',
+    },
+    {
+      name: 'multi-line require() after FOLD-01',
+      code: 'export function reqMl() {\n  return require(\n    "lod" + "ahs"\n  );\n}',
+    },
+  ];
+
+  for (const tc of cases) {
+    const res = analyzeCodeDeterministically(tc.code, { filePath: 'src/foldSafe.ts' });
+    const dg004 = (res.inlineFindings ?? []).find((f) => f.ruleId === 'DG004');
+    assert.ok(dg004, `${tc.name}: expected DG004 finding after fold, got ${JSON.stringify(res.inlineFindings)}`);
+    assert.ok(dg004.message.includes('[via-fold]'), `${tc.name}: expected [via-fold] tag`);
+  }
+
+  // Real-world DG001 precision guards discovered during 10-repo OSS validation (NestJS async exec() & Vite/Playwright page.$eval())
+  const safeRealWorldDg001 = [
+    'export class LazyController { async exec() { return true; } }',
+    'export async function checkCss(page: any) { return await page.$eval("h1", (el: Element) => el.textContent); }',
+    'export function regexMatch(re: RegExp, input: string) { return re.exec(input); }',
+  ];
+  for (const safeCode of safeRealWorldDg001) {
+    const res = analyzeCodeDeterministically(safeCode, { filePath: 'src/realworldSafe.ts' });
+    assert.equal(
+      (res.inlineFindings ?? []).filter((f) => f.ruleId === 'DG001').length,
+      0,
+      `Unexpected DG001 FP on: ${safeCode}`
+    );
+  }
+});
+
+test('Test 79: Adversarial Pass-V Fuzzing Suite — 500+ Inputs Zero Crash & Determinism (P2 #9)', () => {
+  let seed = 0x517cc1b7;
+  const nextRand = (): number => {
+    seed = (seed + 0x6d2b79f5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+  const pick = <T>(arr: readonly T[]): T => arr[Math.floor(nextRand() * arr.length)];
+
+  const tokens = [
+    '"hello"',
+    "'world'",
+    '`tpl`',
+    '`deep ${`in ${x}`}`',
+    '`unclosed',
+    '"unclosed\\',
+    "'mix\"quote'",
+    '"\\u0041\\x42\\n"',
+    ' + ',
+    ' * ',
+    ' ?. ',
+    '["prop"]',
+    '?.["ev" + "al"]',
+    '["a", "b"].join("")',
+    '["a", `b`].join()',
+    '/regex\\/trap[/]/gi',
+    '// line comment\n',
+    '/* block comment */',
+    '\n',
+    ';',
+    '(',
+    ')',
+    '[',
+    ']',
+    '{',
+    '}',
+  ] as const;
+
+  const fixedEdgeCases = [
+    'const u = `nested ${`inner ${`level3 ${"a" + "b"}`}`}`;',
+    'const r = /https:\\/\\/example\\.com\\/["a"+"b"]/g; const s = "x" + "y";',
+    'const m = "a" + "b\\u0041" + "c\\x41";',
+    'const q = "unclosed string literal',
+    'const t = `unclosed template ${1 + 2',
+    'const f = "a" + /foo\\/bar/ + "b";',
+    'const esc = "foo\\\\" + "bar";',
+    'const ml = `line1\nline2` + "line3";',
+  ];
+
+  const allInputs: string[] = [...fixedEdgeCases];
+  for (let i = 0; i < 500; i++) {
+    const len = 4 + Math.floor(nextRand() * 14);
+    let out = '';
+    for (let j = 0; j < len; j++) {
+      out += pick(tokens);
+    }
+    allInputs.push(out);
+  }
+
+  for (let idx = 0; idx < allInputs.length; idx++) {
+    const sample = allInputs[idx];
+    const v1 = buildVirtualView(sample);
+    const v2 = buildVirtualView(sample);
+    assert.equal(v1.virtualCode, v2.virtualCode, `Non-deterministic virtualCode at fuzz #${idx}`);
+    assert.equal(v1.editsApplied, v2.editsApplied, `Non-deterministic editsApplied at fuzz #${idx}`);
+    const inv = verifySpanMapInvariants(sample, v1.virtualCode, v1.spanMap);
+    assert.equal(inv.valid, true, `SpanMap invariant failure at fuzz #${idx}: ${inv.error}`);
+    const rep = analyzeCodeDeterministically(sample, { filePath: `src/fuzz_${idx}.ts` });
+    assert.ok(rep.skor.totalScore >= 0 && rep.skor.totalScore <= 100);
+  }
+});
+
+test('Test 80: Large File Latency & Memory Benchmark (100 KB, 250 KB, 500 KB, 1 MB, Worst-Case — P2 #8)', () => {
+  const sizes = [
+    { label: '100 KB', targetBytes: 100 * 1024, denseFold: false },
+    { label: '250 KB', targetBytes: 250 * 1024, denseFold: false },
+    { label: '500 KB', targetBytes: 500 * 1024, denseFold: false },
+    { label: '1 MB', targetBytes: 1000 * 1024, denseFold: false },
+    { label: '1 MB Worst-Case', targetBytes: 1000 * 1024, denseFold: true },
+  ];
+
+  const benignBlock =
+    'export function computeValue(input: number): number {\n' +
+    '  if (typeof input !== "number") throw new TypeError("expected number");\n' +
+    '  try { return input * 2 + 1; } catch (err) { throw err; }\n' +
+    '}\n';
+  const foldBlock =
+    'export function buildGreeting(name: string): string {\n' +
+    '  const prefix = "Hello, " + "world!";\n' +
+    '  return prefix + String(name);\n' +
+    '}\n';
+  const denseFoldUnit = 'const p = "aa" + "bb";\n';
+
+  console.log('\n=== Large File Benchmark (Pass-O vs Pass-O+V Latency & Heap Delta) ===');
+  console.log('| File Size | Pass-O ms | Pass-O+V ms | Latency Delta | Heap Delta MB | Edits Applied |');
+  console.log('| :--- | :---: | :---: | :---: | :---: | :---: |');
+
+  for (const spec of sizes) {
+    const unit = spec.denseFold ? denseFoldUnit : benignBlock.repeat(8) + foldBlock;
+    const repeats = Math.max(1, Math.floor(spec.targetBytes / Buffer.byteLength(unit, 'utf-8')));
+    const code = unit.repeat(repeats);
+
+    // Warmup
+    analyzeCodeDeterministically(code, { filePath: 'src/large.ts', disableFolding: true });
+    analyzeCodeDeterministically(code, { filePath: 'src/large.ts' });
+
+    const memBefore = process.memoryUsage().heapUsed;
+    const tO0 = performance.now();
+    analyzeCodeDeterministically(code, { filePath: 'src/large.ts', disableFolding: true });
+    const msO = performance.now() - tO0;
+
+    const tOV0 = performance.now();
+    const resOV = analyzeCodeDeterministically(code, { filePath: 'src/large.ts' });
+    const msOV = performance.now() - tOV0;
+    const memAfter = process.memoryUsage().heapUsed;
+
+    const heapDeltaMb = (memAfter - memBefore) / (1024 * 1024);
+    const deltaMs = msOV - msO;
+    const edits = resOV.virtualView?.editsApplied ?? 0;
+
+    console.log(
+      `| ${spec.label} (${(Buffer.byteLength(code, 'utf-8') / 1024).toFixed(0)} KB) | ${msO.toFixed(2)} | ${msOV.toFixed(2)} | ${deltaMs >= 0 ? '+' : ''}${deltaMs.toFixed(2)} ms | ${heapDeltaMb.toFixed(2)} | ${edits} |`
+    );
+
+    assert.ok(msOV < 5000, `Large file ${spec.label} must analyze under 5000ms (took ${msOV.toFixed(2)}ms)`);
+  }
+});
+
 
 
 

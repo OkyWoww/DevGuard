@@ -31,19 +31,74 @@ function isSafeLiteral(rawText: string, value: string): boolean {
   return true;
 }
 
+function findRegionIndexForStart(regions: ReadonlyArray<LexicalRegion>, start: number): number {
+  let lo = 0;
+  let hi = regions.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >>> 1;
+    const r = regions[mid];
+    if (r.end <= start) {
+      lo = mid + 1;
+    } else if (r.start > start) {
+      hi = mid - 1;
+    } else {
+      return mid;
+    }
+  }
+  return lo;
+}
+
 function overlapsCommentOrRegex(
   start: number,
   end: number,
   regions: ReadonlyArray<LexicalRegion>
 ): boolean {
-  for (const r of regions) {
-    if (r.kind === 'comment' || r.kind === 'regex') {
-      if (Math.max(start, r.start) < Math.min(end, r.end)) {
-        return true;
-      }
+  if (regions.length === 0 || end <= start) return false;
+  let i = findRegionIndexForStart(regions, start);
+  while (i < regions.length && regions[i].start < end) {
+    const r = regions[i];
+    if ((r.kind === 'comment' || r.kind === 'regex') && Math.max(start, r.start) < Math.min(end, r.end)) {
+      return true;
     }
+    i++;
   }
   return false;
+}
+
+function isInTemplateRegion(
+  start: number,
+  end: number,
+  regions: ReadonlyArray<LexicalRegion>
+): boolean {
+  if (regions.length === 0) return false;
+  const idx = findRegionIndexForStart(regions, start);
+  if (idx >= regions.length) return false;
+  const r = regions[idx];
+  return r.kind === 'template' && start >= r.start && end <= r.end;
+}
+
+function findLiteralsInRange(
+  stringLiterals: ReadonlyArray<ExtractedStringLiteral>,
+  rangeStart: number,
+  rangeEnd: number
+): ExtractedStringLiteral[] {
+  let lo = 0;
+  let hi = stringLiterals.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (stringLiterals[mid].startOffset < rangeStart) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  const matches: ExtractedStringLiteral[] = [];
+  for (let i = lo; i < stringLiterals.length; i++) {
+    const lit = stringLiterals[i];
+    if (lit.startOffset >= rangeEnd) break;
+    if (lit.endOffset <= rangeEnd) matches.push(lit);
+  }
+  return matches;
 }
 
 export interface SpanMapSeg {
@@ -196,10 +251,19 @@ export function composeSpanMaps(
     const v1Start = segNext.oStart;
     const v1End = segNext.oEnd;
 
-    // Find all segments in prevMap that overlap with [v1Start, v1End)
-    const overlapping = prevMap.filter(
-      (p) => Math.max(v1Start, p.vStart) < Math.min(v1End, p.vEnd)
-    );
+    // Binary search first prevMap segment whose vEnd > v1Start
+    let lo = 0;
+    let hi = prevMap.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (prevMap[mid].vEnd <= v1Start) lo = mid + 1;
+      else hi = mid;
+    }
+
+    const overlapping: SpanMapSeg[] = [];
+    for (let k = lo; k < prevMap.length && prevMap[k].vStart < v1End; k++) {
+      overlapping.push(prevMap[k]);
+    }
 
     if (overlapping.length === 0) {
       continue;
@@ -503,14 +567,7 @@ function collectFold03Edits(
     if (overlapsCommentOrRegex(lit.startOffset, lit.endOffset, regions)) continue;
 
     // Check region kind: must be template region
-    let inTemplate = false;
-    for (const r of regions) {
-      if (lit.startOffset >= r.start && lit.endOffset <= r.end) {
-        if (r.kind === 'template') inTemplate = true;
-        break;
-      }
-    }
-    if (!inTemplate) continue;
+    if (!isInTemplateRegion(lit.startOffset, lit.endOffset, regions)) continue;
 
     // Guard: not a tagged template (token before ` cannot be identifier, ), ], or literal quote)
     let prevIdx = lit.startOffset - 1;
@@ -767,9 +824,7 @@ function collectFold02Edits(
     const innerText = source.slice(openBracketIdx + 1, closeBracketIdx);
     if (innerText.includes('[') || innerText.includes('{') || innerText.includes('(')) continue;
 
-    const lits = stringLiterals.filter(
-      (l) => l.startOffset >= openBracketIdx + 1 && l.endOffset <= closeBracketIdx
-    );
+    const lits = findLiteralsInRange(stringLiterals, openBracketIdx + 1, closeBracketIdx);
     if (lits.length === 0) continue;
     if (lits.length > MAX_FOLD_OPERANDS) {
       limitFlag = true;
@@ -813,9 +868,7 @@ function collectFold02Edits(
     const arg = source.slice(openParenIdx + 1, closeParenIdx).trim();
     let separator = ',';
     if (arg !== '') {
-      const argLits = stringLiterals.filter(
-        (l) => l.startOffset >= openParenIdx + 1 && l.endOffset <= closeParenIdx
-      );
+      const argLits = findLiteralsInRange(stringLiterals, openParenIdx + 1, closeParenIdx);
       if (argLits.length !== 1) continue;
       const argLit = argLits[0];
       if (source.slice(argLit.startOffset, argLit.endOffset) !== arg) continue;
@@ -925,9 +978,7 @@ function collectFold04Edits(
     if (closeBracketIdx === -1) continue;
 
     const inner = source.slice(openBracketIdx + 1, closeBracketIdx).trim();
-    const innerLits = stringLiterals.filter(
-      (l) => l.startOffset >= openBracketIdx + 1 && l.endOffset <= closeBracketIdx
-    );
+    const innerLits = findLiteralsInRange(stringLiterals, openBracketIdx + 1, closeBracketIdx);
     if (innerLits.length !== 1) continue;
     const propLit = innerLits[0];
     if (source.slice(propLit.startOffset, propLit.endOffset) !== inner) continue;
@@ -945,6 +996,113 @@ function collectFold04Edits(
   }
 
   return { edits, limitFlag };
+}
+
+const HIGH_PRIORITY_FOLD_CONTEXT_RE =
+  /\b(?:eval|exec|Function|system|import|require|fetch|catch|globalThis|window|global|self|child_process|payment|balance|wallet|ledger|transfer|charge|refund|deduct|invoice|auth|token|jwt|password|execute|query|transaction|writeFileSync|saldo|stock|credits|secret|api_key|apikey)\b|sk[_-]|pk[_-]|rk[_-]|AIza|gh[pousr]_|github_pat_|AKIA|ASIA|xox[baprs]-|eyJ|-----BEGIN/i;
+
+function isHighPriorityFoldEdit(
+  currentCode: string,
+  maskedCode: string,
+  edit: FoldTextEdit
+): boolean {
+  if (edit.replacement.startsWith('.') || edit.replacement.startsWith('?.')) {
+    return true;
+  }
+  const beforeStart = Math.max(0, edit.start - 64);
+  const afterEnd = Math.min(currentCode.length, edit.end + 64);
+  const beforeMasked = maskedCode.slice(beforeStart, edit.start);
+  const afterMasked = maskedCode.slice(edit.end, afterEnd);
+
+  // Bracket expression candidates (`obj["ev" + "al"]`) sit directly inside `[ ... ]`
+  const beforeTrimEnd = beforeMasked.trimEnd();
+  const afterTrimStart = afterMasked.trimStart();
+  if (beforeTrimEnd.endsWith('[') && afterTrimStart.startsWith(']')) {
+    return true;
+  }
+
+  return (
+    HIGH_PRIORITY_FOLD_CONTEXT_RE.test(edit.replacement) ||
+    HIGH_PRIORITY_FOLD_CONTEXT_RE.test(beforeMasked) ||
+    HIGH_PRIORITY_FOLD_CONTEXT_RE.test(afterMasked)
+  );
+}
+
+function selectWithHeadTailStride(items: FoldTextEdit[], budget: number): FoldTextEdit[] {
+  if (items.length <= budget || budget <= 0) {
+    return budget <= 0 ? [] : items;
+  }
+  const tailBudget = Math.min(Math.max(16, Math.floor(budget / 4)), items.length);
+  const headAndMidBudget = budget - tailBudget;
+  const tailStart = items.length - tailBudget;
+  const selected: FoldTextEdit[] = [];
+
+  if (headAndMidBudget > 0 && tailStart > 0) {
+    const headCount = Math.min(headAndMidBudget, Math.max(1, Math.floor(headAndMidBudget / 2)));
+    for (let i = 0; i < headCount; i++) {
+      selected.push(items[i]);
+    }
+    const midBudget = headAndMidBudget - headCount;
+    const midSpan = tailStart - headCount;
+    if (midBudget > 0 && midSpan > 0) {
+      const step = midSpan / midBudget;
+      for (let k = 0; k < midBudget; k++) {
+        const idx = headCount + Math.min(midSpan - 1, Math.floor(k * step));
+        selected.push(items[idx]);
+      }
+    }
+  }
+  for (let i = tailStart; i < items.length; i++) {
+    selected.push(items[i]);
+  }
+  return selected;
+}
+
+function selectPrioritizedEdits(
+  currentCode: string,
+  maskedCode: string,
+  edits: FoldTextEdit[],
+  budget: number
+): FoldTextEdit[] {
+  if (edits.length <= budget || budget <= 0) {
+    return budget <= 0 ? [] : edits;
+  }
+
+  const highPriority: FoldTextEdit[] = [];
+  const lowPriority: FoldTextEdit[] = [];
+
+  for (const edit of edits) {
+    if (isHighPriorityFoldEdit(currentCode, maskedCode, edit)) {
+      highPriority.push(edit);
+    } else {
+      lowPriority.push(edit);
+    }
+  }
+
+  const chosenHigh =
+    highPriority.length <= budget
+      ? highPriority
+      : selectWithHeadTailStride(highPriority, budget);
+
+  const remBudget = budget - chosenHigh.length;
+  let chosenLow: FoldTextEdit[] = [];
+  if (remBudget > 0 && lowPriority.length > 0) {
+    if (lowPriority.length <= remBudget) {
+      chosenLow = lowPriority;
+    } else {
+      const tailReserve = Math.min(128, Math.floor(remBudget / 2), lowPriority.length);
+      const headBudget = remBudget - tailReserve;
+      const tailStart = lowPriority.length - tailReserve;
+      for (let i = 0; i < headBudget && i < tailStart; i++) {
+        chosenLow.push(lowPriority[i]);
+      }
+      for (let i = tailStart; i < lowPriority.length; i++) {
+        chosenLow.push(lowPriority[i]);
+      }
+    }
+  }
+
+  return [...chosenHigh, ...chosenLow].sort((a, b) => a.start - b.start);
 }
 
 /**
@@ -1007,9 +1165,39 @@ export function buildVirtualView(
         }
         if (edits.length === 0) continue;
 
+        const remainingBudget = MAX_FOLD_EDITS - totalEdits;
+        let opBudget = remainingBudget;
+        const hasDownstreamFoldTokens = /(?:\.join\s*\(|\[)/.test(currentCode);
+        if (
+          foldOp === collectFold03Edits &&
+          edits.length > 1000 &&
+          /(?:\+|\.join\s*\(|\[)/.test(currentCode)
+        ) {
+          const highPriorityCount = edits.filter((e) =>
+            isHighPriorityFoldEdit(currentCode, currentLex.maskedCode, e)
+          ).length;
+          opBudget = Math.min(remainingBudget, Math.max(1000, highPriorityCount));
+        } else if (
+          foldOp !== collectFold04Edits &&
+          edits.length > remainingBudget &&
+          hasDownstreamFoldTokens
+        ) {
+          const highPriorityCount = edits.filter((e) =>
+            isHighPriorityFoldEdit(currentCode, currentLex.maskedCode, e)
+          ).length;
+          // Reserve slots so downstream FOLD-02 / FOLD-04 passes cannot be starved by earlier spam
+          const reserveForDownstream = Math.min(512, Math.floor(remainingBudget / 4));
+          opBudget = Math.min(
+            remainingBudget,
+            Math.max(remainingBudget - reserveForDownstream, highPriorityCount)
+          );
+        }
+
         let toApply = edits;
-        if (totalEdits + toApply.length > MAX_FOLD_EDITS) {
-          toApply = toApply.slice(0, MAX_FOLD_EDITS - totalEdits);
+        if (toApply.length > opBudget) {
+          toApply = selectPrioritizedEdits(currentCode, currentLex.maskedCode, toApply, opBudget);
+          limitExceeded = true;
+        } else if (opBudget < edits.length) {
           limitExceeded = true;
         }
         if (toApply.length === 0) break;
