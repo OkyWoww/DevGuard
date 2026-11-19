@@ -8,8 +8,8 @@ import {
   type ExtractedStringLiteral,
   type InlineFinding,
   type LineFinding,
-} from './lexicalMasker.js';
-import { redactSecretsPreservingLayout } from './secretAndResilienceRules.js';
+} from './lexicalMasker.ts';
+import { redactSecretsPreservingLayout } from './secretAndResilienceRules.ts';
 
 export { CRITICAL_FLOW_IDENTIFIERS };
 

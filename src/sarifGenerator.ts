@@ -1,6 +1,6 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { redactSecretsPreservingLayout } from './devguardAnalyzer.js';
+import { redactSecretsPreservingLayout } from './devguardAnalyzer.ts';
 import {
   INVARIANT_MISMATCH_SENTINEL,
   PARTIAL_COVERAGE_REASON_TEXT,
@@ -8,7 +8,7 @@ import {
   getDevGuardVersion,
   type FileAuditSummary,
   type SkippedFileReportItem,
-} from './githubCommenter.js';
+} from './githubCommenter.ts';
 
 function normalizeSarifUri(filePath: string): string {
   const relPath = path.isAbsolute(filePath)

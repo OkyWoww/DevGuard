@@ -4,7 +4,7 @@ import {
   type ExtractedStringLiteral,
   type InlineFinding,
   type LineFinding,
-} from './lexicalMasker.js';
+} from './lexicalMasker.ts';
 
 export const DG007_PROVIDER_PATTERNS: ReadonlyArray<{
   label: string;

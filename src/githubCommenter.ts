@@ -6,7 +6,7 @@ import {
   redactSecretsPreservingLayout,
   type InlineFinding,
   type ParsedSuppression,
-} from './devguardAnalyzer.js';
+} from './devguardAnalyzer.ts';
 
 export interface PrEnvironmentInfo {
   isPullRequest: boolean;

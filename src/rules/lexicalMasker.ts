@@ -1,4 +1,4 @@
-export * from './spanMap.js';
+export * from './spanMap.ts';
 export type DevGuardRuleId =
   | 'DG001' | 'DG002' | 'DG003' | 'DG004'
   | 'DG004-DYN-01' | 'DG004-DYN-02'

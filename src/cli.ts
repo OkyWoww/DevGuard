@@ -16,7 +16,7 @@ import {
   redactSecretsPreservingLayout,
   type AllowlistRuleId,
   type ParsedDevGuardReport,
-} from './devguardAnalyzer.js';
+} from './devguardAnalyzer.ts';
 
 export {
   ANALYZABLE_EXTENSIONS,
@@ -44,8 +44,8 @@ import {
   type PrEnvironmentInfo,
   type SkippedFileReportItem,
   type SkippedReason,
-} from './githubCommenter.js';
-import { generateSarifReport } from './sarifGenerator.js';
+} from './githubCommenter.ts';
+import { generateSarifReport } from './sarifGenerator.ts';
 
 export {
   INVARIANT_MISMATCH_SENTINEL,
@@ -1174,6 +1174,12 @@ export function computeOverallGateVerdict(
 }
 
 export async function runAction() {
+  const cliArgs = process.argv.slice(2);
+  if (cliArgs.includes('--version') || cliArgs.includes('-v')) {
+    console.log(getDevGuardVersion());
+    process.exit(0);
+  }
+
   if (process.env.GITHUB_EVENT_NAME === 'pull_request_target') {
     console.error(
       '🚨 Fatal Security Error: Running DevGuard on pull_request_target is forbidden due to pwn-request secret-exfiltration risks. Switch workflow trigger to pull_request.'

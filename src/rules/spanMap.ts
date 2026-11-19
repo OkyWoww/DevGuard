@@ -1,5 +1,5 @@
-import type { ExtractedStringLiteral, LexicalRegion } from './lexicalMasker.js';
-import { analyzeLexicalStructure, isRangeStrictlyInCodeRegion } from './lexicalMasker.js';
+import type { ExtractedStringLiteral, LexicalRegion } from './lexicalMasker.ts';
+import { analyzeLexicalStructure, isRangeStrictlyInCodeRegion } from './lexicalMasker.ts';
 
 export const MAX_FOLD_DEPTH = 4;
 export const MAX_FOLD_OPERANDS = 64;

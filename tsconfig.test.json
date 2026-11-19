@@ -7,8 +7,7 @@
     "module": "nodenext",
     "moduleResolution": "nodenext",
     "rewriteRelativeImportExtensions": true,
-    "types": ["node"],
-    "allowImportingTsExtensions": false
+    "types": ["node"]
   },
   "include": ["src/**/*.ts", "tests/**/*.ts"],
   "exclude": ["src/App.tsx", "src/main.tsx"]

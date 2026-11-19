@@ -32,7 +32,7 @@ import {
   type SpanMap,
   type SpanMapSeg,
   type VirtualViewResult,
-} from './rules/lexicalMasker.js';
+} from './rules/lexicalMasker.ts';
 import {
   CRITICAL_FLOW_IDENTIFIERS,
   POPULAR_NPM_PACKAGES,
@@ -41,7 +41,7 @@ import {
   detectNonAtomicBalanceMutations,
   detectSwallowedExceptions,
   matchesCriticalFlow,
-} from './rules/packageAndExceptionRules.js';
+} from './rules/packageAndExceptionRules.ts';
 import {
   DG007_PROVIDER_PATTERNS,
   detectHardcodedSecrets,
@@ -50,7 +50,7 @@ import {
   prepareRedactedCodeForLlm,
   redactSecretsPreservingLayout,
   type PrepareLlmOptions,
-} from './rules/secretAndResilienceRules.js';
+} from './rules/secretAndResilienceRules.ts';
 
 export type {
   AllowlistRuleId,
