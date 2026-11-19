@@ -45,6 +45,7 @@ export interface AuditAnalyzeOptions {
 
 export interface LineFinding {
   line: number;
+  endLine?: number;
   extraLines?: number[];
   category: 'security' | 'correctness' | 'maintainability';
   penalty: number;

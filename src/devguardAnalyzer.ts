@@ -14,6 +14,7 @@ import {
   createIdentitySpanMap,
   damerauLevenshtein,
   isCommentOrEmptyLine,
+  isHighPriorityFoldEdit,
   isRangeStrictlyInCodeRegion,
   isValidSuppressionReason,
   matchLinearGlob,
@@ -60,6 +61,7 @@ export type {
   InlineFinding,
   LexicalRegion,
   LexicalRegionKind,
+  LineFinding,
   ParsedSuppression,
   PrepareLlmOptions,
   SpanMap,
@@ -91,6 +93,7 @@ export {
   detectNonAtomicBalanceMutations,
   detectSwallowedExceptions,
   findResidualSecretLikeTokens,
+  isHighPriorityFoldEdit,
   isRangeStrictlyInCodeRegion,
   isValidSuppressionReason,
   matchLinearGlob,
@@ -472,7 +475,10 @@ function applySuppressionPolicy(
         const notice = ` [Suppression ignored: ${f.ruleId} cannot be suppressed inline]`;
         if (!f.message.includes(notice)) f.message += notice;
         for (const lf of findings) {
-          if (lf.line === f.line && lf.shortReason.includes(`[${f.ruleId}]`) && !lf.detailedReason.includes(notice)) {
+          const matchesSpan =
+            lf.line === f.line ||
+            (lf.endLine !== undefined && f.line >= lf.line && f.line <= lf.endLine);
+          if (matchesSpan && lf.shortReason.includes(`[${f.ruleId}]`) && !lf.detailedReason.includes(notice)) {
             lf.detailedReason += notice;
           }
         }
@@ -484,8 +490,14 @@ function applySuppressionPolicy(
   for (let i = findings.length - 1; i >= 0; i--) {
     const lf = findings[i];
     const tagMatch = lf.shortReason.match(/\[(DG\d{3})\]/);
-    if (tagMatch?.[1] && suppressedInlineKeys.has(`${lf.line}:${tagMatch[1]}`)) {
-      findings.splice(i, 1);
+    if (tagMatch?.[1]) {
+      const lfLast = lf.endLine ?? lf.line;
+      for (let ln = lf.line; ln <= lfLast; ln++) {
+        if (suppressedInlineKeys.has(`${ln}:${tagMatch[1]}`)) {
+          findings.splice(i, 1);
+          break;
+        }
+      }
     }
   }
 
@@ -494,7 +506,10 @@ function applySuppressionPolicy(
     if (sup.ruleId === 'DG001' || sup.ruleId === 'DG002' || sup.ruleId === 'DG003') {
       const notice = ` [Suppression ignored: ${sup.ruleId} cannot be suppressed inline]`;
       for (const lf of findings) {
-        const hitsLine = lf.line === sup.targetLine || (lf.extraLines?.includes(sup.targetLine) ?? false);
+        const hitsLine =
+          lf.line === sup.targetLine ||
+          (lf.endLine !== undefined && sup.targetLine >= lf.line && sup.targetLine <= lf.endLine) ||
+          (lf.extraLines?.includes(sup.targetLine) ?? false);
         const isUnprefixedDg001 = !/\[DG00[4-8]\]/.test(lf.shortReason);
         if (hitsLine && isUnprefixedDg001 && !lf.detailedReason.includes(notice)) {
           lf.detailedReason += notice;
@@ -504,6 +519,49 @@ function applySuppressionPolicy(
   }
 
   return activeSuppressions.sort((a, b) => a.targetLine - b.targetLine);
+}
+
+/** Replaces virtual-code line references with mapped original source line numbers. */
+export function replaceVirtualLineInText(text: string, vLine: number, oLine: number): string {
+  if (vLine === oLine) return text;
+  const vStr = String(vLine);
+  const oStr = String(oLine);
+  return text
+    .replace(new RegExp(`(baris\\s+)${vStr}\\b`, 'gi'), `$1${oStr}`)
+    .replace(new RegExp(`(line\\s+)${vStr}\\b`, 'gi'), `$1${oStr}`)
+    .replace(new RegExp(`:${vStr}\\b`, 'g'), `:${oStr}`);
+}
+
+const EVAL_SINK_RE =
+  /(?:^|[^.\w$])(?:eval|exec)\s*\(|\b[A-Za-z_$][\w$]*\.eval\s*\(|\b(?:globalThis|window|global|self|child_process)\.exec\s*\(|os\.system\s*\(|\bnew\s+Function\s*\(/i;
+const METHOD_HEADER_EVAL_EXEC_RE =
+  /(^|[;{}])\s*((?:(?:export|default|public|private|protected|abstract|override|static|async|declare|get|set)\s+)*(?:function\s*\*?\s*)?)(?:eval|exec)(\s*\([^();]*\)\s*(?::\s*[A-Za-z_$][\w$<>\[\]|&\s,.?]*\s*)?)(?=\{)/g;
+const MASKED_GLOBAL_BRACKET_RE = /\b(?:globalThis|window|global|self)\b[^\n;]*\[/;
+const BRACKET_EVAL_RE = /\b(?:globalThis|window|global|self)\b[^\n;]*\[\s*['"](?:eval|exec)['"]\s*\]/;
+
+function findEvalExecLines(
+  execLines: ReadonlyArray<{ num: number; text: string }>,
+  maskedLines: ReadonlyArray<string>
+): number[] {
+  return execLines
+    .filter(({ num, text }) => {
+      const maskedLine = maskedLines[num - 1] ?? '';
+      const lineSansDecl = maskedLine.replace(METHOD_HEADER_EVAL_EXEC_RE, '$1$2__METHOD_DECL__$3');
+      if (EVAL_SINK_RE.test(lineSansDecl)) return true;
+      return MASKED_GLOBAL_BRACKET_RE.test(maskedLine) && BRACKET_EVAL_RE.test(text);
+    })
+    .map((l) => l.num);
+}
+
+function getFindingRuleKey(lf: LineFinding): string {
+  const tag = lf.shortReason.match(/\[(DG\d{3}(?:-EV-01)?)\]/);
+  if (tag?.[1]) {
+    if (tag[1] === 'DG005-EV-01') return 'DG005';
+    if (tag[1] === 'DG008-EV-01') return 'DG008';
+    return tag[1];
+  }
+  if (lf.shortReason.includes('Eksekusi kode/perintah dinamis')) return 'DG001';
+  return `${lf.category}:${lf.shortReason.replace(/\(baris.*\)/, '').trim()}`;
 }
 
 export function analyzeCodeDeterministically(
@@ -1245,18 +1303,7 @@ export function analyzeCodeDeterministically(
   // 6. CUSTOM SCRATCHPAD / GENERAL CODE RULES
   // ---------------------------------------------------------------------------
   else {
-    const evalSinkRe = /(?:^|[^.\w$])(?:eval|exec)\s*\(|\b[A-Za-z_$][\w$]*\.eval\s*\(|\b(?:globalThis|window|global|self|child_process)\.exec\s*\(|os\.system\s*\(|\bnew\s+Function\s*\(/i;
-    const evalExecMethodDeclRe = /(?:^|[;{}])\s*(?:(?:export|default|public|private|protected|abstract|override|static|async|declare|get|set)\s+)*(?:function\s*\*?\s*)?(?:eval|exec)\s*\([^()]*\)\s*(?::\s*[A-Za-z_$][\w$<>\[\]|&\s,.?]*\s*)?\{/;
-    const maskedGlobalBracketRe = /\b(?:globalThis|window|global|self)\b[^\n;]*\[/;
-    const bracketEvalRe = /\b(?:globalThis|window|global|self)\b[^\n;]*\[\s*['"](?:eval|exec)['"]\s*\]/;
-    const evalLines = execLines
-      .filter(({ num, text }) => {
-        const maskedLine = maskedLines[num - 1] ?? '';
-        if (evalExecMethodDeclRe.test(maskedLine)) return false;
-        if (evalSinkRe.test(maskedLine)) return true;
-        return maskedGlobalBracketRe.test(maskedLine) && bracketEvalRe.test(text);
-      })
-      .map((l) => l.num);
+    const evalLines = findEvalExecLines(execLines, maskedLines);
     if (evalLines.length > 0) {
       findings.push({
         line: evalLines[0],
@@ -1471,16 +1518,6 @@ export function analyzeCodeDeterministically(
       return toOrigLineAndCol(code, virtualView.spanMap, vStart, vEnd);
     };
 
-    const replaceVirtualLineInText = (text: string, vLine: number, oLine: number): string => {
-      if (vLine === oLine) return text;
-      const vStr = String(vLine);
-      const oStr = String(oLine);
-      return text
-        .replace(new RegExp(`(baris\\s+)${vStr}\\b`, 'gi'), `$1${oStr}`)
-        .replace(new RegExp(`(line\\s+)${vStr}\\b`, 'gi'), `$1${oStr}`)
-        .replace(new RegExp(`:${vStr}\\b`), `:${oStr}`);
-    };
-
     // DG004-DYN-01/02 in virtual-only mode: evaluated on virtualView.virtualCode
     if (!isPython) {
       const vDynFindings: InlineFinding[] = [];
@@ -1532,18 +1569,7 @@ export function analyzeCodeDeterministically(
 
       // DG001 on V (eval/exec dynamic sinks in general code domain)
       if (!isSqlDomain && !isPingDomain && !isAuthDomain && !isFileDomain && !isCartDomain) {
-        const evalSinkRe = /(?:^|[^.\w$])(?:eval|exec)\s*\(|\b[A-Za-z_$][\w$]*\.eval\s*\(|\b(?:globalThis|window|global|self|child_process)\.exec\s*\(|os\.system\s*\(|\bnew\s+Function\s*\(/i;
-        const evalExecMethodDeclRe = /(?:^|[;{}])\s*(?:(?:export|default|public|private|protected|abstract|override|static|async|declare|get|set)\s+)*(?:function\s*\*?\s*)?(?:eval|exec)\s*\([^()]*\)\s*(?::\s*[A-Za-z_$][\w$<>\[\]|&\s,.?]*\s*)?\{/;
-        const maskedGlobalBracketRe = /\b(?:globalThis|window|global|self)\b[^\n;]*\[/;
-        const bracketEvalRe = /\b(?:globalThis|window|global|self)\b[^\n;]*\[\s*['"](?:eval|exec)['"]\s*\]/;
-        const vEvalLines = vExecLines
-          .filter(({ num, text }) => {
-            const mLine = vMaskedLines[num - 1] ?? '';
-            if (evalExecMethodDeclRe.test(mLine)) return false;
-            if (evalSinkRe.test(mLine)) return true;
-            return maskedGlobalBracketRe.test(mLine) && bracketEvalRe.test(text);
-          })
-          .map((l) => l.num);
+        const vEvalLines = findEvalExecLines(vExecLines, vMaskedLines);
         if (vEvalLines.length > 0) {
           vFindings.push({
             line: vEvalLines[0],
@@ -1594,15 +1620,19 @@ export function analyzeCodeDeterministically(
     }
 
     for (const vFinding of vFindings) {
-      const tagMatch = vFinding.shortReason.match(/\[(DG\d{3})\]/);
-      const hintRe = tagMatch?.[1] ? getRuleHintRe(tagMatch[1] as DevGuardRuleId) : undefined;
-      const mapped = remapVirtualLineRange(vFinding.line, undefined, hintRe);
+      const ruleKey = getFindingRuleKey(vFinding);
+      const hintRe = /^DG\d{3}$/.test(ruleKey) ? getRuleHintRe(ruleKey as DevGuardRuleId) : undefined;
+      const mapped = remapVirtualLineRange(vFinding.line, vFinding.endLine, hintRe);
       const oLine = mapped.line;
+      const oEndLine = mapped.endLine > oLine ? mapped.endLine : undefined;
 
       const isDuplicate = findings.some(
         (orig) =>
-          orig.category === vFinding.category &&
-          (orig.line === oLine || (orig.extraLines?.includes(oLine) ?? false))
+          getFindingRuleKey(orig) === ruleKey &&
+          (orig.line === oLine ||
+            (orig.endLine !== undefined && oLine >= orig.line && oLine <= orig.endLine) ||
+            (oEndLine !== undefined && orig.line >= oLine && orig.line <= oEndLine) ||
+            (orig.extraLines?.includes(oLine) ?? false))
       );
 
       if (!isDuplicate) {
@@ -1612,6 +1642,7 @@ export function analyzeCodeDeterministically(
         findings.push({
           ...vFinding,
           line: oLine,
+          endLine: oEndLine,
           extraLines: vFinding.extraLines
             ? vFinding.extraLines.map((el) => remapVirtualLineRange(el, undefined, hintRe).line)
             : undefined,

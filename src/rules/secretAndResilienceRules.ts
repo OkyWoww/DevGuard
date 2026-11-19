@@ -416,11 +416,21 @@ function findEnclosingBlockRange(maskedCode: string, pos: number): { start: numb
   return { start: Math.max(0, pos - 600), end: Math.min(maskedCode.length, pos + 600) };
 }
 
+const RETRY_COUNTER_MUTATION_RE =
+  /(?:\b(?:attempts?|retries)\s*(?:\+\+|--|\+=|-=)|(?:\+\+|--)\s*\b(?:attempts?|retries)\b|\b(?:attempts?|retries)\s*=(?!=)(?!\s*(?:0|null|undefined|false)\b))/i;
+
+const RETRY_COUNTER_COMPARE_RE =
+  /\b(?:maxRetries|maxAttempts|MAX_ATTEMPTS|attempts?|retries)\s*(?:\+\+|--)?\s*(?:<|<=|>|>=|===|!==)|(?:<|<=|>|>=|===|!==)\s*(?:\+\+|--)?\s*\b(?:maxRetries|maxAttempts|MAX_ATTEMPTS|attempts?|retries)\b/i;
+
 const UNBOUNDED_LOOP_BOUNDED_EXIT_RE =
-  /\b(?:break|return|throw|process\.exit)\b|\b(?:maxRetries|maxAttempts|MAX_ATTEMPTS|attempts?|retries)(?:\+\+|--)?\s*(?:<|<=|>|>=|===|!==)/i;
+  /\b(?:break|return|throw|process\.exit)\b|\b(?:maxRetries|maxAttempts|MAX_ATTEMPTS|attempts?|retries)\s*(?:\+\+|--)\s*(?:<|<=|>|>=|===|!==)|(?:\+\+|--)\s*\b(?:attempts?|retries)\s*(?:<|<=|>|>=|===|!==)/i;
 
 const BOUNDED_LOOP_EXIT_RE =
-  /\b(?:return|throw|process\.exit)\b|\b(?:maxRetries|maxAttempts|MAX_ATTEMPTS|attempts?|retries)(?:\+\+|--)?\s*(?:<|<=|>|>=|===|!==)/i;
+  /\b(?:return|throw|process\.exit)\b|\b(?:maxRetries|maxAttempts|MAX_ATTEMPTS|attempts?|retries)\s*(?:\+\+|--)\s*(?:<|<=|>|>=|===|!==)|(?:\+\+|--)\s*\b(?:attempts?|retries)\s*(?:<|<=|>|>=|===|!==)/i;
+
+function hasMutatedRetryBound(scopeText: string): boolean {
+  return RETRY_COUNTER_MUTATION_RE.test(scopeText) && RETRY_COUNTER_COMPARE_RE.test(scopeText);
+}
 
 function blankBraceInterior(chars: string[], openBraceIdx: number): number {
   const closeIdx = findMatchingDelim(chars.join(''), openBraceIdx, '{', '}');
@@ -495,11 +505,15 @@ function hasOuterLabeledBreak(outerFnScope: string): boolean {
 /** Shared scope-aware body-scan helper for DG008 (`while`/`for`) and DG008-EV-01 (`do...while`). */
 function isUnboundedAsyncLoopBody(maskedBody: string): boolean {
   if (!/\bawait\b/.test(maskedBody)) return false;
-  // Preserve fast path when outer body has neither exit keywords nor retry counters at all
-  if (!UNBOUNDED_LOOP_BOUNDED_EXIT_RE.test(maskedBody)) return true;
+  // Preserve fast path when outer body has neither exit keywords nor a mutated retry bound
+  if (!UNBOUNDED_LOOP_BOUNDED_EXIT_RE.test(maskedBody) && !hasMutatedRetryBound(maskedBody)) {
+    return true;
+  }
 
   const outerFnScope = stripNestedFunctionBodies(maskedBody);
-  if (BOUNDED_LOOP_EXIT_RE.test(outerFnScope)) return false;
+  if (BOUNDED_LOOP_EXIT_RE.test(outerFnScope) || hasMutatedRetryBound(outerFnScope)) {
+    return false;
+  }
 
   const outerLoopScope = stripNestedControlBodies(outerFnScope);
   if (/\bbreak\b/.test(outerLoopScope)) return false;

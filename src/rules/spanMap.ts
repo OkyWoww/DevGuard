@@ -1001,25 +1001,46 @@ function collectFold04Edits(
 const HIGH_PRIORITY_FOLD_CONTEXT_RE =
   /\b(?:eval|exec|Function|system|import|require|fetch|catch|globalThis|window|global|self|child_process|payment|balance|wallet|ledger|transfer|charge|refund|deduct|invoice|auth|token|jwt|password|execute|query|transaction|writeFileSync|saldo|stock|credits|secret|api_key|apikey)\b|sk[_-]|pk[_-]|rk[_-]|AIza|gh[pousr]_|github_pat_|AKIA|ASIA|xox[baprs]-|eyJ|-----BEGIN/i;
 
-function isHighPriorityFoldEdit(
-  currentCode: string,
+export function isHighPriorityFoldEdit(
+  _currentCode: string,
   maskedCode: string,
   edit: FoldTextEdit
 ): boolean {
   if (edit.replacement.startsWith('.') || edit.replacement.startsWith('?.')) {
     return true;
   }
-  const beforeStart = Math.max(0, edit.start - 64);
-  const afterEnd = Math.min(currentCode.length, edit.end + 64);
-  const beforeMasked = maskedCode.slice(beforeStart, edit.start);
-  const afterMasked = maskedCode.slice(edit.end, afterEnd);
 
-  // Bracket expression candidates (`obj["ev" + "al"]`) sit directly inside `[ ... ]`
-  const beforeTrimEnd = beforeMasked.trimEnd();
-  const afterTrimStart = afterMasked.trimStart();
-  if (beforeTrimEnd.endsWith('[') && afterTrimStart.startsWith(']')) {
+  // Strictly match `[ <expr> ]` only when immediate non-whitespace tokens in maskedCode wrap [edit.start, edit.end)
+  let prevIdx = edit.start - 1;
+  while (prevIdx >= 0 && /[ \t\r\n]/.test(maskedCode[prevIdx])) prevIdx--;
+  let nextIdx = edit.end;
+  while (nextIdx < maskedCode.length && /[ \t\r\n]/.test(maskedCode[nextIdx])) nextIdx++;
+  if (prevIdx >= 0 && nextIdx < maskedCode.length && maskedCode[prevIdx] === '[' && maskedCode[nextIdx] === ']') {
     return true;
   }
+
+  const beforeStart = Math.max(0, edit.start - 64);
+  const afterEnd = Math.min(maskedCode.length, edit.end + 64);
+  const rawBefore = maskedCode.slice(beforeStart, edit.start);
+  const rawAfter = maskedCode.slice(edit.end, afterEnd);
+
+  // Clip context window at statement/block delimiters so adjacent statements never leak keywords
+  const lastBoundaryBefore = Math.max(
+    rawBefore.lastIndexOf(';'),
+    rawBefore.lastIndexOf('{'),
+    rawBefore.lastIndexOf('}')
+  );
+  const beforeMasked = lastBoundaryBefore >= 0 ? rawBefore.slice(lastBoundaryBefore + 1) : rawBefore;
+
+  let firstBoundaryAfter = rawAfter.length;
+  for (let i = 0; i < rawAfter.length; i++) {
+    const ch = rawAfter[i];
+    if (ch === ';' || ch === '{' || ch === '}') {
+      firstBoundaryAfter = i;
+      break;
+    }
+  }
+  const afterMasked = rawAfter.slice(0, firstBoundaryAfter);
 
   return (
     HIGH_PRIORITY_FOLD_CONTEXT_RE.test(edit.replacement) ||

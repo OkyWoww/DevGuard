@@ -67,7 +67,9 @@ import {
   buildVirtualView,
   composeSpanMaps,
   createIdentitySpanMap,
+  isHighPriorityFoldEdit,
   isRangeStrictlyInCodeRegion,
+  replaceVirtualLineInText,
   toOrigLineAndCol,
   toOrigSpan,
   verifySpanMapInvariants,
@@ -6047,6 +6049,214 @@ test('Test 80: Large File Latency & Memory Benchmark (100 KB, 250 KB, 500 KB, 1 
 
     assert.ok(msOV < 5000, `Large file ${spec.label} must analyze under 5000ms (took ${msOV.toFixed(2)}ms)`);
   }
+});
+
+test('Test 81: Audit C1-C4 Regression Suite (Bracket Priority, Unmutated Retry Counter, Global Line Replace & endLine, Strict Method Decl)', () => {
+  // C1: Bracket priority check must require immediate non-whitespace `[` and `]` around [start, end)
+  const codeOutsideBrackets = 'const a = arr[0]; const pad = "aa" + "bb"; const b = arr[1];';
+  const lexOutside = analyzeLexicalStructure(codeOutsideBrackets, false);
+  const startOutside = codeOutsideBrackets.indexOf('"aa" + "bb"');
+  const endOutside = startOutside + '"aa" + "bb"'.length;
+  assert.equal(
+    isHighPriorityFoldEdit(codeOutsideBrackets, lexOutside.maskedCode, {
+      start: startOutside,
+      end: endOutside,
+      replacement: "'aabb'",
+    }),
+    false,
+    'Edit outside unrelated [ ... ] brackets must NOT be marked high priority'
+  );
+
+  const codeAdjacentToken = 'const token = "x"; const pad = "aa" + "bb";';
+  const lexToken = analyzeLexicalStructure(codeAdjacentToken, false);
+  const startTokenPad = codeAdjacentToken.indexOf('"aa" + "bb"');
+  const endTokenPad = startTokenPad + '"aa" + "bb"'.length;
+  assert.equal(
+    isHighPriorityFoldEdit(codeAdjacentToken, lexToken.maskedCode, {
+      start: startTokenPad,
+      end: endTokenPad,
+      replacement: "'aabb'",
+    }),
+    false,
+    'Adjacent statement identifier (token before ;) must NOT leak into fold priority window'
+  );
+
+  const codeInsideBrackets = 'obj[ "ev" + "al" ]();';
+  const lexInside = analyzeLexicalStructure(codeInsideBrackets, false);
+  const startInside = codeInsideBrackets.indexOf('"ev" + "al"');
+  const endInside = startInside + '"ev" + "al"'.length;
+  assert.equal(
+    isHighPriorityFoldEdit(codeInsideBrackets, lexInside.maskedCode, {
+      start: startInside,
+      end: endInside,
+      replacement: "'eval'",
+    }),
+    true,
+    'Edit directly flanked by [ and ] must be marked high priority'
+  );
+
+  // C2: Unmutated retry counters must NOT satisfy bounded-exit check, while valid mutations & outer breaks pass
+  const unmutatedWhile = [
+    'export async function staleWhile(x: number) {',
+    '  if (typeof x !== "number") throw new Error("bad");',
+    '  let attempts = 0;',
+    '  while (true) {',
+    '    await poll();',
+    '    if (attempts > 5) {}',
+    '  }',
+    '}',
+  ].join('\n');
+  const repStaleWhile = analyzeCodeDeterministically(unmutatedWhile, { filePath: 'src/staleWhile.ts' });
+  assert.ok(
+    (repStaleWhile.inlineFindings ?? []).some((f) => f.ruleId === 'DG008'),
+    'Unmutated attempts > 5 inside while(true) must trigger DG008'
+  );
+
+  const unmutatedDoWhile = [
+    'export async function staleDoWhile(x: number) {',
+    '  if (typeof x !== "number") throw new Error("bad");',
+    '  let retries = 0;',
+    '  do {',
+    '    await poll();',
+    '    if (retries > 3) {}',
+    '  } while (true);',
+    '}',
+  ].join('\n');
+  const repStaleDoWhile = analyzeCodeDeterministically(unmutatedDoWhile, { filePath: 'src/staleDoWhile.ts' });
+  assert.ok(
+    (repStaleDoWhile.inlineFindings ?? []).some((f) => f.ruleId === 'DG008' && f.message.includes('DG008-EV-01')),
+    'Unmutated retries > 3 inside do...while(true) must trigger DG008-EV-01'
+  );
+
+  const zeroResetWhile = [
+    'export async function resetZeroWhile(x: number) {',
+    '  if (typeof x !== "number") throw new Error("bad");',
+    '  let attempts = 0;',
+    '  while (true) {',
+    '    attempts = 0;',
+    '    await poll();',
+    '    if (attempts > 5) {}',
+    '  }',
+    '}',
+  ].join('\n');
+  const repZeroReset = analyzeCodeDeterministically(zeroResetWhile, { filePath: 'src/resetZero.ts' });
+  assert.ok(
+    (repZeroReset.inlineFindings ?? []).some((f) => f.ruleId === 'DG008'),
+    'Constant-zero reset attempts = 0 inside loop must still trigger DG008'
+  );
+
+  const validIncWhile = [
+    'export async function boundedInc(x: number) {',
+    '  if (typeof x !== "number") throw new Error("bad");',
+    '  let attempts = 0;',
+    '  while (true) {',
+    '    await poll();',
+    '    if (attempts++ > 5) log();',
+    '  }',
+    '}',
+  ].join('\n');
+  assert.equal(
+    (analyzeCodeDeterministically(validIncWhile, { filePath: 'src/validInc.ts' }).inlineFindings ?? []).filter(
+      (f) => f.ruleId === 'DG008'
+    ).length,
+    0,
+    'Mutated attempts++ > 5 must be treated as bounded'
+  );
+
+  const validPlusEqWhile = [
+    'export async function boundedPlusEq(x: number) {',
+    '  if (typeof x !== "number") throw new Error("bad");',
+    '  let attempts = 0;',
+    '  while (true) {',
+    '    await poll();',
+    '    attempts += 1;',
+    '    if (attempts > 5) log();',
+    '  }',
+    '}',
+  ].join('\n');
+  assert.equal(
+    (analyzeCodeDeterministically(validPlusEqWhile, { filePath: 'src/validPlusEq.ts' }).inlineFindings ?? []).filter(
+      (f) => f.ruleId === 'DG008'
+    ).length,
+    0,
+    'Mutated attempts += 1 with attempts > 5 must be treated as bounded'
+  );
+
+  const validOuterBreaks = [
+    'export async function validOuter(x: number) {',
+    '  if (typeof x !== "number") throw new Error("bad");',
+    '  outerLoop: while (true) {',
+    '    for (let i = 0; i < 2; i++) {',
+    '      if (await checkDone()) break outerLoop;',
+    '    }',
+    '  }',
+    '  while (true) {',
+    '    if (await checkDone()) break;',
+    '  }',
+    '}',
+  ].join('\n');
+  assert.equal(
+    (analyzeCodeDeterministically(validOuterBreaks, { filePath: 'src/validOuter.ts' }).inlineFindings ?? []).filter(
+      (f) => f.ruleId === 'DG008'
+    ).length,
+    0,
+    'Valid direct break and labeled outer break must remain bounded'
+  );
+
+  // C3: Global :vLine\b replacement + consistent endLine on Pass-V findings
+  assert.equal(
+    replaceVirtualLineInText('Ref a.ts:2, b.ts:2, keep c.ts:20 and baris 2 / line 2', 2, 9),
+    'Ref a.ts:9, b.ts:9, keep c.ts:20 and baris 9 / line 9',
+    'replaceVirtualLineInText must replace all :vLine occurrences without corrupting :20'
+  );
+
+  const multiLineEvalWithEndLineSup = [
+    'globalThis[',
+    '  "ev" +',
+    '  "al"',
+    '](userInput); // devguard-ignore DG001: attempt bypass on endLine',
+  ].join('\n');
+  const repMlEval = analyzeCodeDeterministically(multiLineEvalWithEndLineSup, { filePath: 'src/mlEval.ts' });
+  const dg001Ml = (repMlEval.inlineFindings ?? []).find((f) => f.ruleId === 'DG001');
+  assert.ok(dg001Ml, 'Multi-line folded globalThis["ev"+"al"] must trigger DG001');
+  assert.equal(dg001Ml.line, 1);
+  assert.equal(dg001Ml.endLine, 4, 'Multi-line folded finding must preserve endLine = 4');
+  assert.ok(
+    repMlEval.temuanUtama.description.includes('Suppression ignored'),
+    'LineFinding endLine consistency must propagate ignored-suppression notice on DG001'
+  );
+
+  // C4: evalExecMethodDeclRe must only skip pure method/function signatures, never same-line eval(cmd) sinks
+  const sameLineEvalAndDecl = 'eval(cmd); function exec() {}';
+  const repSameLine = analyzeCodeDeterministically(sameLineEvalAndDecl, { filePath: 'src/sameLine.ts' });
+  assert.ok(
+    (repSameLine.inlineFindings ?? []).some((f) => f.ruleId === 'DG001'),
+    'eval(cmd); function exec() {} on the same line must still trigger DG001'
+  );
+
+  const singleLineBodyEval = 'function exec() { eval(cmd); }';
+  const repSingleBody = analyzeCodeDeterministically(singleLineBodyEval, { filePath: 'src/singleBody.ts' });
+  assert.ok(
+    (repSingleBody.inlineFindings ?? []).some((f) => f.ruleId === 'DG001'),
+    'function exec() { eval(cmd); } must still trigger DG001'
+  );
+
+  const benignMethodDecls = [
+    'export class QueryRunner {',
+    '  async exec(cmd: string): Promise<void> {',
+    '    return;',
+    '  }',
+    '  public execEmpty() {}',
+    '  public exec() {}',
+    '}',
+  ].join('\n');
+  assert.equal(
+    (analyzeCodeDeterministically(benignMethodDecls, { filePath: 'src/runner.ts' }).inlineFindings ?? []).filter(
+      (f) => f.ruleId === 'DG001'
+    ).length,
+    0,
+    'Benign async exec(cmd: string): Promise<void> { and public exec() {} declarations must not trigger DG001'
+  );
 });
 
 
