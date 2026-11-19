@@ -14,6 +14,9 @@ import {
   redactSecretsPreservingLayout,
   type AuditAnalyzeOptions,
 } from '../src/devguardAnalyzer.js';
+import { CRITICAL_FLOW_IDENTIFIERS, matchesCriticalFlow } from '../src/devguardAnalyzer.js';
+import { CRITICAL_FLOW_IDENTIFIERS as LEXICAL_CRITICAL_FLOW_IDENTIFIERS } from '../src/rules/lexicalMasker.js';
+import { CRITICAL_FLOW_IDENTIFIERS as PKG_CRITICAL_FLOW_IDENTIFIERS } from '../src/rules/packageAndExceptionRules.js';
 import {
   ANALYZABLE_EXTENSIONS,
   MAX_AUDIT_FILE_BYTES,
@@ -5470,6 +5473,220 @@ test('70. Suppression & Redaction on Folded Spans + Benchmark Gate', () => {
   assert.ok(timePassOV < 5000, `Full benchmark must complete in < 5000ms (took ${timePassOV.toFixed(2)}ms)`);
   assert.ok(overheadPct <= 25, `SPEC §9 benchmark gate on full corpus exceeded: ${overheadPct.toFixed(2)}% > 25%`);
   assert.ok(overheadNfPct <= 25, `SPEC §9 benchmark gate on non-fold baseline exceeded: ${overheadNfPct.toFixed(2)}% > 25%`);
+});
+
+// =============================================================================
+// STAGE 5.4: DG008-EV-01, DG005-EV-01, & Shared CRITICAL_FLOW_IDENTIFIERS
+// =============================================================================
+
+test('Test 71: DG008-EV-01 Detection, Shared Body-Scan Parity, & False-Positive Guards', () => {
+  // 1. Positive detections: do { await ... } while (true) and while (1)
+  const doTrueCode = [
+    'export async function pollLoop(x: number) {',
+    '  if (typeof x !== "number") throw new Error("bad");',
+    '  do {',
+    '    await poll();',
+    '  } while (true);',
+    '}',
+  ].join('\n');
+  const doOneCode = [
+    'export async function stepLoop(x: number) {',
+    '  if (typeof x !== "number") throw new Error("bad");',
+    '  do {',
+    '    await step();',
+    '  } while (1);',
+    '}',
+  ].join('\n');
+
+  for (const snippet of [doTrueCode, doOneCode]) {
+    const res = analyzeCodeDeterministically(snippet, { filePath: 'src/worker/poll.ts' });
+    const dg008 = (res.inlineFindings ?? []).filter((f) => f.ruleId === 'DG008');
+    assert.equal(dg008.length, 1, `Expected 1 DG008-EV-01 finding, got ${JSON.stringify(dg008)}`);
+    assert.equal(dg008[0].severity, 'warning');
+    assert.equal(dg008[0].line, 3);
+    assert.ok(dg008[0].message.includes('[DG008-EV-01]'), `Expected [DG008-EV-01] tag in ${dg008[0].message}`);
+    assert.equal(res.skor.correctness, 90, `Expected -10 correctness penalty (90), got ${res.skor.correctness}`);
+  }
+
+  // 2. False-positive guards & exit variations (shared body-scan parity)
+  const safeSnippets = [
+    'export async function withBreak() { do { await poll(); if (done) break; } while (true); }',
+    'export async function withReturn() { do { const v = await poll(); if (v) return v; } while (true); }',
+    'export async function withThrow() { do { await poll(); throw new Error("stop"); } while (true); }',
+    'export async function withProcessExit() { do { await poll(); process.exit(0); } while (true); }',
+    'export async function withRetryCounter(max: number) { let attempts = 0; do { await poll(); if (attempts++ > max) log(); } while (true); }',
+    'export function syncOnlyDoWhile() { do { syncOnly(); } while (true); }',
+    'export function methodCallDo() { stream.do(() => {}); const obj = { do() { return 1; } }; return obj.do(); }',
+    'export async function standaloneBlockBeforeWhile() { { await init(); } while (true) { await tick(); break; } }',
+    'export async function boundedCondition(ok: boolean) { do { await poll(); } while (ok); }',
+  ];
+
+  for (const snippet of safeSnippets) {
+    const res = analyzeCodeDeterministically(snippet, { filePath: 'src/worker/safe.ts' });
+    const dg008 = (res.inlineFindings ?? []).filter((f) => f.ruleId === 'DG008');
+    assert.equal(dg008.length, 0, `Unexpected DG008 FP on: ${snippet} -> ${JSON.stringify(dg008)}`);
+  }
+
+  // 3. Inline suppression with both DG008 and DG008-EV-01
+  const suppressedDg008 = [
+    'export async function daemonLoop(x: number) {',
+    '  if (typeof x !== "number") throw new Error("bad");',
+    '  // devguard-ignore DG008: intentional daemon heartbeat loop',
+    '  do {',
+    '    await poll();',
+    '  } while (true);',
+    '}',
+  ].join('\n');
+  const supRes1 = analyzeCodeDeterministically(suppressedDg008, { filePath: 'src/worker/daemon.ts' });
+  assert.equal((supRes1.inlineFindings ?? []).filter((f) => f.ruleId === 'DG008').length, 0);
+  assert.equal(supRes1.skor.correctness, 100);
+
+  const suppressedEv01 = suppressedDg008.replace('devguard-ignore DG008:', 'devguard-ignore DG008-EV-01:');
+  const supRes2 = analyzeCodeDeterministically(suppressedEv01, { filePath: 'src/worker/daemon.ts' });
+  assert.equal((supRes2.inlineFindings ?? []).filter((f) => f.ruleId === 'DG008').length, 0);
+  assert.equal(supRes2.skor.correctness, 100);
+});
+
+test('Test 72: DG005-EV-01 Receiver Backbone Matching, Immediate Cleanup Rule, & Shared CRITICAL_FLOW_IDENTIFIERS', () => {
+  // 1. Shared single-constant export parity (17 exact items)
+  assert.equal(CRITICAL_FLOW_IDENTIFIERS.length, 17);
+  assert.strictEqual(CRITICAL_FLOW_IDENTIFIERS, LEXICAL_CRITICAL_FLOW_IDENTIFIERS);
+  assert.strictEqual(CRITICAL_FLOW_IDENTIFIERS, PKG_CRITICAL_FLOW_IDENTIFIERS);
+  assert.equal(matchesCriticalFlow('chargePayment'), true);
+  assert.equal(matchesCriticalFlow('processInvoice'), true);
+  assert.equal(matchesCriticalFlow('analytics.track'), false);
+
+  // 2. All empty callback shapes on critical receiver chains must be detected (-10 maintainability, warning)
+  const tpSnippets = [
+    'export async function a(x: string) { await payment.charge(x).catch(() => {}); }',
+    'export async function b(q: string) { await db.query(q).then((r) => r).catch(_ => {}); }',
+    'export async function c(x: string) { await wallet.deduct(x).catch((e) => {}); }',
+    'export async function d(x: string) { await authService.verifyToken(x).catch(function () {}); }',
+    'export async function e(x: string) { await ledger.transfer(x).catch(function (e) { /* comment */ }); }',
+    'export async function f(x: string, tmp: string) { await pay.charge(x).then(() => fs.unlink(tmp)).catch(() => {}); }',
+  ];
+
+  for (const snippet of tpSnippets) {
+    const res = analyzeCodeDeterministically(snippet, { filePath: 'src/billing/flow.ts' });
+    const dg005 = (res.inlineFindings ?? []).filter((f) => f.ruleId === 'DG005');
+    assert.equal(dg005.length, 1, `Expected 1 DG005-EV-01 finding on: ${snippet}`);
+    assert.equal(dg005[0].severity, 'warning');
+    assert.ok(dg005[0].message.includes('[DG005-EV-01]'), `Expected [DG005-EV-01] tag in ${dg005[0].message}`);
+    // Baseline maintainability without structured logging is 90; -10 from DG005-EV-01 => 80
+    assert.equal(res.skor.maintainability, 80, `Expected -10 maintainability penalty on: ${snippet}`);
+  }
+
+  // 3. Mandatory TNs: immediate cleanup, non-critical receiver, token in args, non-empty callbacks
+  const tnSnippets = [
+    'export async function a(tmp: string) { await fs.unlink(tmp).catch(() => {}); }',
+    'export async function b(server: any) { await server.close().catch(() => {}); }',
+    'export async function c(url: string, token: string) { await fetch(url, { headers: { token } }).catch(() => {}); }',
+    'export async function d(id: string) { return chargePayment(id).catch(() => null); }',
+    'export async function e(id: string) { return chargePayment(id).catch(() => undefined); }',
+    'export async function f(id: string) { return chargePayment(id).catch(noop); }',
+    'export async function g(id: string) { return chargePayment(id).then(ok, () => {}); }',
+    'export async function h(ev: string) { await analytics.track(ev).catch(() => {}); }',
+    'export async function i(id: string) { await chargePayment(id).catch((err) => logger.warn(err)); }',
+  ];
+
+  for (const snippet of tnSnippets) {
+    const res = analyzeCodeDeterministically(snippet, { filePath: 'src/billing/safe.ts' });
+    const dg005 = (res.inlineFindings ?? []).filter((f) => f.ruleId === 'DG005');
+    assert.equal(dg005.length, 0, `Unexpected DG005 FP on: ${snippet} -> ${JSON.stringify(dg005)}`);
+  }
+});
+
+test('Test 73: Pass-V Additive Interaction with DG005-EV-01 & DG008-EV-01 + Secret Redaction Safety', () => {
+  // 1. wallet["ded" + "uct"](amt).catch(() => {}) folded by FOLD-01 + FOLD-04 in Pass-V
+  const foldedCode = [
+    'export async function deductQuietly(wallet: Record<string, any>, amt: number) {',
+    '  await wallet["ded" + "uct"](amt).catch(() => {});',
+    '}',
+  ].join('\n');
+
+  const foldedRes = analyzeCodeDeterministically(foldedCode, { filePath: 'src/wallet/folded.ts' });
+  const dg005Folded = (foldedRes.inlineFindings ?? []).filter((f) => f.ruleId === 'DG005');
+  assert.equal(dg005Folded.length, 1, `Expected Pass-V DG005-EV-01 finding, got ${JSON.stringify(dg005Folded)}`);
+  assert.equal(dg005Folded[0].line, 2, 'Finding line must map back to original line O=2');
+  assert.equal(dg005Folded[0].severity, 'warning');
+  assert.ok(dg005Folded[0].message.includes('[DG005-EV-01]'));
+  assert.ok(dg005Folded[0].message.includes('[via-fold]'), `Expected [via-fold] tag in ${dg005Folded[0].message}`);
+
+  // 2. Inline suppression on original line O suppresses Pass-V [via-fold] finding
+  const suppressedFolded = [
+    'export async function deductQuietly(wallet: Record<string, any>, amt: number) {',
+    '  // devguard-ignore DG005: best effort background ledger sync',
+    '  await wallet["ded" + "uct"](amt).catch(() => {});',
+    '}',
+  ].join('\n');
+  const supFoldedRes = analyzeCodeDeterministically(suppressedFolded, { filePath: 'src/wallet/folded.ts' });
+  assert.equal((supFoldedRes.inlineFindings ?? []).filter((f) => f.ruleId === 'DG005').length, 0);
+
+  // 3. Secret redaction safety: secret embedded in arguments must never leak in DG005-EV-01 or DG008-EV-01 messages
+  const fakeSecretPartA = 'sk_live_';
+  const fakeSecretPartB = '51H9xY2zA3bC4dE5fG6hI7jK8lM9nO0p';
+  const secretToken = fakeSecretPartA + fakeSecretPartB;
+  const secretInArgsCode = [
+    'export async function leakyCalls() {',
+    `  await chargePayment("${fakeSecretPartA}" + "${fakeSecretPartB}").catch(() => {});`,
+    '  do {',
+    `    await pollWithKey("${fakeSecretPartA}" + "${fakeSecretPartB}");`,
+    '  } while (true);',
+    '}',
+  ].join('\n');
+
+  const secretRes = analyzeCodeDeterministically(secretInArgsCode, { filePath: 'src/billing/redact.ts' });
+  const evFindings = (secretRes.inlineFindings ?? []).filter((f) => f.ruleId === 'DG005' || f.ruleId === 'DG008');
+  assert.equal(evFindings.length, 2, `Expected both DG005-EV-01 and DG008-EV-01, got ${JSON.stringify(evFindings)}`);
+  for (const f of evFindings) {
+    assert.equal(f.message.includes(secretToken), false, `Secret leaked in ${f.ruleId} message`);
+    assert.equal(f.message.includes(fakeSecretPartB), false, `Secret fragment leaked in ${f.ruleId} message`);
+  }
+});
+
+test('Test 74: Total Corpus TP/TN Quota Verification (SPEC §8.1)', () => {
+  const requiredPatterns = [
+    'DG004-DYN-01',
+    'DG004-DYN-02',
+    'DG005-EV-01',
+    'DG008-EV-01',
+    'FOLD-01',
+    'FOLD-02',
+    'FOLD-03',
+    'FOLD-04',
+  ] as const;
+
+  let totalNewTn = 0;
+
+  for (const pattern of requiredPatterns) {
+    const tps = CORPUS_CASES.filter((c) => c.id.startsWith(`${pattern}-TP-`) && c.label === 'TP');
+    const tns = CORPUS_CASES.filter((c) => c.id.startsWith(`${pattern}-TN-`) && c.label === 'TN');
+    assert.ok(tps.length >= 3, `Pattern ${pattern} must have >= 3 TP cases (found ${tps.length})`);
+    assert.ok(tns.length >= 5, `Pattern ${pattern} must have >= 5 TN cases (found ${tns.length})`);
+
+    const ossProvenanceCount = tns.filter((c) => Boolean(c.provenance?.source)).length;
+    assert.ok(
+      ossProvenanceCount >= 2,
+      `Pattern ${pattern} must have >= 2 TN cases with OSS provenance (found ${ossProvenanceCount})`
+    );
+
+    for (const tn of tns) {
+      const report = analyzeCodeDeterministically(tn.code, {
+        filePath: tn.filePath,
+        declaredDependencies: tn.declaredDependencies,
+      });
+      const anyInline = report.inlineFindings ?? [];
+      assert.equal(
+        anyInline.length,
+        0,
+        `Cross-rule TN violation on ${tn.id}: unexpected findings ${JSON.stringify(anyInline)}`
+      );
+    }
+
+    totalNewTn += tns.length;
+  }
+
+  assert.ok(totalNewTn >= 40, `SPEC §8.1 requires >= 40 total new TN cases across 8 patterns (found ${totalNewTn})`);
 });
 
 
