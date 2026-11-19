@@ -81,6 +81,18 @@ import {
 } from '../src/devguardAnalyzer.js';
 import { CORPUS_CASES } from './corpus/cases.js';
 import { MAX_FOLD_EDITS } from '../src/devguardAnalyzer.js';
+import {
+  MAX_CONFIG_FILE_SIZE,
+  createMulberry32,
+  matchGlobPattern,
+  matchesWorkspaceGlobList,
+  parseJsonc,
+  parsePnpmWorkspaceYaml,
+  parseTsconfig,
+  type ParseResult,
+  type TsconfigData,
+  type WorkspaceBailoutReason,
+} from '../src/rules/workspaceParser.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -6258,6 +6270,376 @@ test('Test 81: Audit C1-C4 Regression Suite (Bracket Priority, Unmutated Retry C
     'Benign async exec(cmd: string): Promise<void> { and public exec() {} declarations must not trigger DG001'
   );
 });
+
+test('Test 82: Stage 6.1.a Workspace Tokenizer, Subset YAML, Glob, tsconfig, & Fuzz Suite (A6-8, A6-11)', () => {
+  // 1. JSONC Parser
+  const validJsonc = [
+    '{',
+    '  // Top-level comment',
+    '  "paths": {',
+    '    "#internal/*": ["src/internal/*"],',
+    '    "utils/*": ["src/utils/*"],',
+    '  },',
+    '  /* Multi-line comment */',
+    '  "url": "https://api.domain.com/v1/*not-comment*/",',
+    '  "items": [1, 2, 3,],',
+    '}',
+  ].join('\r\n');
+  const resJsonc = parseJsonc(validJsonc);
+  assert.equal(resJsonc.success, true);
+  if (resJsonc.success) {
+    const data = resJsonc.data as any;
+    assert.deepEqual(data.paths['#internal/*'], ['src/internal/*']);
+    assert.equal(data.url, 'https://api.domain.com/v1/*not-comment*/');
+    assert.deepEqual(data.items, [1, 2, 3]);
+  }
+
+  // BOM support
+  const bomJsonc = parseJsonc('\uFEFF{"bom": true}');
+  assert.equal(bomJsonc.success, true);
+
+  // Rejects unclosed block comment (jsonc_syntax)
+  assert.equal(parseJsonc('{"a": 1 /* unclosed').success, false);
+  assert.equal((parseJsonc('{"a": 1 /* unclosed') as any).reason, 'jsonc_syntax');
+
+  // Rejects unclosed string literal (jsonc_syntax)
+  assert.equal(parseJsonc('{"a": "unclosed').success, false);
+  assert.equal((parseJsonc('{"a": "unclosed') as any).reason, 'jsonc_syntax');
+
+  // Rejects # outside string (jsonc_syntax)
+  assert.equal(parseJsonc('{"a": 1 # comment\n}').success, false);
+  assert.equal((parseJsonc('{"a": 1 # comment\n}') as any).reason, 'jsonc_syntax');
+
+  // Rejects oversized input (size_limit)
+  const oversizedJsonc = '{"data": "' + 'x'.repeat(MAX_CONFIG_FILE_SIZE + 10) + '"}';
+  const resOver = parseJsonc(oversizedJsonc);
+  assert.equal(resOver.success, false);
+  assert.equal((resOver as any).reason, 'size_limit');
+
+  // 2. Subset YAML Parser (pnpm-workspace.yaml)
+  const validYaml = [
+    '# Top-level comment',
+    'packages:',
+    '  - "packages/*"',
+    '  - \'apps/**\'',
+    '  - shared/core',
+    '  - "!packages/legacy"',
+    '  - "packages/#hash"',
+  ].join('\n');
+  const resYaml = parsePnpmWorkspaceYaml(validYaml);
+  assert.equal(resYaml.success, true);
+  if (resYaml.success) {
+    assert.deepEqual(resYaml.data.packages, [
+      'packages/*',
+      'apps/**',
+      'shared/core',
+      '!packages/legacy',
+      'packages/#hash',
+    ]);
+  }
+
+  // Empty or comment-only YAML returns empty array
+  const emptyYaml = parsePnpmWorkspaceYaml('# only comment\n\n');
+  assert.equal(emptyYaml.success, true);
+  if (emptyYaml.success) assert.deepEqual(emptyYaml.data.packages, []);
+
+  // Rejects flow sequence (yaml_unsupported_construct)
+  const flowYaml = parsePnpmWorkspaceYaml('packages: ["pkg-a", "pkg-b"]');
+  assert.equal(flowYaml.success, false);
+  assert.equal((flowYaml as any).reason, 'yaml_unsupported_construct');
+
+  // Rejects flow mapping (yaml_unsupported_construct)
+  const flowMapYaml = parsePnpmWorkspaceYaml('packages:\n  - { name: "pkg" }');
+  assert.equal(flowMapYaml.success, false);
+  assert.equal((flowMapYaml as any).reason, 'yaml_unsupported_construct');
+
+  // Rejects tabs in indentation or content (yaml_unsupported_construct)
+  const tabYaml = parsePnpmWorkspaceYaml('packages:\n\t- packages/*');
+  assert.equal(tabYaml.success, false);
+  assert.equal((tabYaml as any).reason, 'yaml_unsupported_construct');
+
+  // Rejects multi-document (yaml_unsupported_construct)
+  const multiDocYaml = parsePnpmWorkspaceYaml('---\npackages:\n  - packages/*');
+  assert.equal(multiDocYaml.success, false);
+  assert.equal((multiDocYaml as any).reason, 'yaml_unsupported_construct');
+
+  // Rejects block scalars (yaml_unsupported_construct)
+  const blockScalarYaml = parsePnpmWorkspaceYaml('packages: |\n  - packages/*');
+  assert.equal(blockScalarYaml.success, false);
+  assert.equal((blockScalarYaml as any).reason, 'yaml_unsupported_construct');
+
+  // Rejects anchors and aliases (yaml_unsupported_construct)
+  const anchorYaml = parsePnpmWorkspaceYaml('packages: &pkgs\n  - packages/*');
+  assert.equal(anchorYaml.success, false);
+  assert.equal((anchorYaml as any).reason, 'yaml_unsupported_construct');
+
+  const aliasYaml = parsePnpmWorkspaceYaml('packages:\n  - *pkgs');
+  assert.equal(aliasYaml.success, false);
+  assert.equal((aliasYaml as any).reason, 'yaml_unsupported_construct');
+
+  // Rejects unexpected top-level keys (yaml_unsupported_construct)
+  const otherKeyYaml = parsePnpmWorkspaceYaml('catalog:\n  react: 18.0.0');
+  assert.equal(otherKeyYaml.success, false);
+  assert.equal((otherKeyYaml as any).reason, 'yaml_unsupported_construct');
+
+  // Rejects oversized YAML (size_limit)
+  const oversizedYaml = 'packages:\n  - ' + 'x'.repeat(MAX_CONFIG_FILE_SIZE + 10);
+  const resOverYaml = parsePnpmWorkspaceYaml(oversizedYaml);
+  assert.equal(resOverYaml.success, false);
+  assert.equal((resOverYaml as any).reason, 'size_limit');
+
+  // 3. Glob Matcher (matchGlobPattern & matchesWorkspaceGlobList)
+  assert.equal(matchGlobPattern('packages/*', 'packages/ui'), true);
+  assert.equal(matchGlobPattern('packages/*', 'packages/ui/deep'), false);
+  assert.equal(matchGlobPattern('apps/**', 'apps/web'), true);
+  assert.equal(matchGlobPattern('apps/**', 'apps/web/admin'), true);
+  assert.equal(matchGlobPattern('tools/cli', 'tools/cli'), true);
+  assert.equal(matchGlobPattern('tools/cli', 'tools/ui'), false);
+  assert.equal(matchGlobPattern('*', 'packages'), true);
+  assert.equal(matchGlobPattern('*', 'packages/ui'), false);
+  assert.equal(matchGlobPattern('**', 'any/deep/path'), true);
+
+  const globList = ['packages/*', 'apps/**', '!packages/legacy'];
+  assert.equal(matchesWorkspaceGlobList(globList, 'packages/ui'), true);
+  assert.equal(matchesWorkspaceGlobList(globList, 'apps/web/admin'), true);
+  assert.equal(matchesWorkspaceGlobList(globList, 'packages/legacy'), false);
+  assert.equal(matchesWorkspaceGlobList(globList, 'other/dir'), false);
+
+  // 4. tsconfig Parser (parseTsconfig)
+  const directTsconfig = parseTsconfig(
+    '{"compilerOptions": {"baseUrl": ".", "paths": {"@/*": ["src/*"]}}}',
+    '/repo/tsconfig.json'
+  );
+  assert.equal(directTsconfig.success, true);
+  if (directTsconfig.success) {
+    assert.equal(directTsconfig.data.baseUrl, '.');
+    assert.deepEqual(directTsconfig.data.paths?.['@/*'], ['src/*']);
+  }
+
+  // Rejects external npm package extends (extends_external)
+  const extExternal = parseTsconfig(
+    '{"extends": "@tsconfig/node18/tsconfig.json"}',
+    '/repo/tsconfig.json'
+  );
+  assert.equal(extExternal.success, false);
+  assert.equal((extExternal as any).reason, 'extends_external');
+
+  const extExternalBare = parseTsconfig(
+    '{"extends": "base-config"}',
+    '/repo/tsconfig.json'
+  );
+  assert.equal(extExternalBare.success, false);
+  assert.equal((extExternalBare as any).reason, 'extends_external');
+
+  // Extends resolution with relative path & property merging
+  const mockFiles: Record<string, string> = {
+    [path.resolve('/repo/base.json')]: JSON.stringify({
+      compilerOptions: { baseUrl: './src', paths: { 'common/*': ['shared/*'], '@/*': ['base/*'] } },
+    }),
+    [path.resolve('/repo/cycle-a.json')]: JSON.stringify({ extends: './cycle-b.json' }),
+    [path.resolve('/repo/cycle-b.json')]: JSON.stringify({ extends: './cycle-a.json' }),
+    [path.resolve('/repo/depth-1.json')]: JSON.stringify({ extends: './depth-2.json' }),
+    [path.resolve('/repo/depth-2.json')]: JSON.stringify({ extends: './depth-3.json' }),
+    [path.resolve('/repo/depth-3.json')]: JSON.stringify({ extends: './depth-4.json' }),
+    [path.resolve('/repo/depth-4.json')]: JSON.stringify({ compilerOptions: {} }),
+  };
+  const mockAccessor = (p: string) => mockFiles[path.resolve(p)] ?? null;
+
+  const childTsconfig = parseTsconfig(
+    '{"extends": "./base.json", "compilerOptions": {"paths": {"@/*": ["override/*"]}}}',
+    path.resolve('/repo/tsconfig.json'),
+    mockAccessor
+  );
+  assert.equal(childTsconfig.success, true);
+  if (childTsconfig.success) {
+    assert.equal(childTsconfig.data.baseUrl, './src');
+    assert.deepEqual(childTsconfig.data.paths?.['common/*'], ['shared/*']);
+    assert.deepEqual(childTsconfig.data.paths?.['@/*'], ['override/*']);
+  }
+
+  // Circular extends detection (extends_cycle)
+  const cycleTsconfig = parseTsconfig(
+    '{"extends": "./cycle-b.json"}',
+    path.resolve('/repo/cycle-a.json'),
+    mockAccessor
+  );
+  assert.equal(cycleTsconfig.success, false);
+  assert.equal((cycleTsconfig as any).reason, 'extends_cycle');
+  assert.ok((cycleTsconfig as any).error.includes('Circular'));
+
+  // Self-cycle detection
+  const selfCycleTsconfig = parseTsconfig(
+    '{"extends": "./self.json"}',
+    path.resolve('/repo/self.json'),
+    mockAccessor
+  );
+  assert.equal(selfCycleTsconfig.success, false);
+  assert.equal((selfCycleTsconfig as any).reason, 'extends_cycle');
+  assert.ok((selfCycleTsconfig as any).error.includes('Circular'));
+
+  // Excessive depth > 3 detection (extends_cycle)
+  const deepTsconfig = parseTsconfig(
+    '{"extends": "./depth-1.json"}',
+    path.resolve('/repo/root-deep.json'),
+    mockAccessor
+  );
+  assert.equal(deepTsconfig.success, false);
+  assert.equal((deepTsconfig as any).reason, 'extends_cycle');
+  assert.ok((deepTsconfig as any).error.includes('exceeded maximum'));
+
+  // Valid chain up to depth 3 succeeds without being falsely flagged as cycle
+  const mockChainFiles: Record<string, string> = {
+    [path.resolve('/repo/chain-0.json')]: JSON.stringify({ extends: './chain-1.json', compilerOptions: { paths: { 'a/*': ['a/*'] } } }),
+    [path.resolve('/repo/chain-1.json')]: JSON.stringify({ extends: './chain-2.json', compilerOptions: { paths: { 'b/*': ['b/*'] } } }),
+    [path.resolve('/repo/chain-2.json')]: JSON.stringify({ extends: './chain-3.json', compilerOptions: { paths: { 'c/*': ['c/*'] } } }),
+    [path.resolve('/repo/chain-3.json')]: JSON.stringify({ compilerOptions: { baseUrl: './src', paths: { 'd/*': ['d/*'] } } }),
+  };
+  const mockChainAccessor = (p: string) => mockChainFiles[path.resolve(p)] ?? null;
+  const validChain = parseTsconfig(
+    mockChainFiles[path.resolve('/repo/chain-0.json')],
+    path.resolve('/repo/chain-0.json'),
+    mockChainAccessor
+  );
+  assert.equal(validChain.success, true);
+  if (validChain.success) {
+    assert.equal(validChain.data.baseUrl, './src');
+    assert.deepEqual(validChain.data.paths?.['a/*'], ['a/*']);
+    assert.deepEqual(validChain.data.paths?.['b/*'], ['b/*']);
+    assert.deepEqual(validChain.data.paths?.['c/*'], ['c/*']);
+    assert.deepEqual(validChain.data.paths?.['d/*'], ['d/*']);
+  }
+
+  // 5. Acceptance A6-8 Fuzz Suite: 10,000 Iterations per Parser
+  const fuzzSeed = process.env.DEVGUARD_FUZZ_SEED
+    ? parseInt(process.env.DEVGUARD_FUZZ_SEED, 10)
+    : 0x1337beef;
+  console.log(`\n=== Acceptance A6-8 Fuzz Test Suite (Seed: 0x${fuzzSeed.toString(16)}) ===`);
+
+  const prng = createMulberry32(fuzzSeed);
+
+  const FUZZ_SEEDS_JSONC = [
+    '{"key": "val // not comment", "#internal": "val # not comment"}',
+    '{\r\n  "a": 1,\r\n  "b": [2, 3,],\r\n}',
+    '\uFEFF{"bom": true}',
+    '{"url": "https://api.devguard.io/v1", "regex": "/*not block*/"}',
+    '{"a": 1, /* comment */ "b": 2,}',
+    '{"a": 1 # bad comment}',
+    '/* unclosed comment',
+    '"unclosed string',
+    '',
+    '   \t\r\n',
+    '{"overflow": "' + 'x'.repeat(MAX_CONFIG_FILE_SIZE + 20) + '"}',
+    '{"nested": {"a": [1, {"b": true,}]}}',
+  ];
+
+  const FUZZ_SEEDS_YAML = [
+    'packages:\n  - "packages/*"\n  - \'apps/**\'\n  - shared/core\n  - "!packages/legacy"',
+    '# comment\npackages:\n  - "packages/#hash"\n  - "url://foo"',
+    'packages: ["flow", "sequence"]',
+    'packages:\n  - &anchor pkg1\n  - *anchor',
+    'packages: |\n  - block\n  - scalar',
+    'packages: >\n  folded',
+    'packages:\n\t- tab_indented',
+    '---\npackages:\n  - multidoc',
+    'other_key:\n  foo: bar',
+    '',
+    '# only comments\n# second comment',
+    'packages:\n  - ' + 'x'.repeat(MAX_CONFIG_FILE_SIZE + 20),
+  ];
+
+  const FUZZ_SEEDS_GLOB = [
+    ['packages/*', 'packages/ui'],
+    ['packages/*', 'packages/ui/deep'],
+    ['apps/**', 'apps/web/admin'],
+    ['!packages/legacy/**', 'packages/legacy/old'],
+    ['**/test/**', 'core/test/runner'],
+    ['*', 'packages'],
+    ['**', 'deep/nested/path'],
+    ['', ''],
+    ['[a-z]+', 'regex-literal'],
+    ['packages/???/*', 'packages/abc/pkg'],
+  ];
+
+  const fuzzSuiteStart = Date.now();
+
+  // 5.1 JSONC Fuzz: 10,000 iterations
+  const jsoncStart = Date.now();
+  for (let i = 0; i < 10000; i++) {
+    let input = FUZZ_SEEDS_JSONC[i % FUZZ_SEEDS_JSONC.length];
+    if (prng() < 0.7) {
+      const chars = '{"}[]:,/*#\\ \t\r\n\uFEFFabc123';
+      const mutLen = Math.floor(prng() * 50);
+      let mutStr = '';
+      for (let j = 0; j < mutLen; j++) mutStr += chars[Math.floor(prng() * chars.length)];
+      input = input + mutStr;
+    }
+    const t0 = Date.now();
+    const res1 = parseJsonc(input);
+    const elapsed = Date.now() - t0;
+    assert.ok(elapsed <= 100, `JSONC input ${i} took ${elapsed}ms > 100ms invariant`);
+
+    const res2 = parseJsonc(input);
+    assert.equal(res1.success, res2.success, `JSONC nondeterministic at iteration ${i}`);
+    if (!res1.success && !res2.success) {
+      assert.equal(res1.reason, res2.reason, `JSONC reason nondeterministic at iteration ${i}`);
+    }
+  }
+  const jsoncDuration = Date.now() - jsoncStart;
+  console.log(`✔ JSONC Parser: 10,000 iterations verified in ${jsoncDuration} ms (max time per input <= 100 ms)`);
+
+  // 5.2 YAML Fuzz: 10,000 iterations
+  const yamlStart = Date.now();
+  for (let i = 0; i < 10000; i++) {
+    let input = FUZZ_SEEDS_YAML[i % FUZZ_SEEDS_YAML.length];
+    if (prng() < 0.7) {
+      const chars = 'packages:- \'\"[]{}|>&*\t\r\n#abc123/!\\';
+      const mutLen = Math.floor(prng() * 50);
+      let mutStr = '';
+      for (let j = 0; j < mutLen; j++) mutStr += chars[Math.floor(prng() * chars.length)];
+      input = input + mutStr;
+    }
+    const t0 = Date.now();
+    const res1 = parsePnpmWorkspaceYaml(input);
+    const elapsed = Date.now() - t0;
+    assert.ok(elapsed <= 100, `YAML input ${i} took ${elapsed}ms > 100ms invariant`);
+
+    const res2 = parsePnpmWorkspaceYaml(input);
+    assert.equal(res1.success, res2.success, `YAML nondeterministic at iteration ${i}`);
+    if (!res1.success && !res2.success) {
+      assert.equal(res1.reason, res2.reason, `YAML reason nondeterministic at iteration ${i}`);
+    }
+  }
+  const yamlDuration = Date.now() - yamlStart;
+  console.log(`✔ Subset YAML Parser: 10,000 iterations verified in ${yamlDuration} ms (max time per input <= 100 ms)`);
+
+  // 5.3 Glob Fuzz: 10,000 iterations
+  const globStart = Date.now();
+  for (let i = 0; i < 10000; i++) {
+    const pair = FUZZ_SEEDS_GLOB[i % FUZZ_SEEDS_GLOB.length];
+    let pat = pair[0];
+    let target = pair[1];
+    if (prng() < 0.7) {
+      const chars = '*/!abc.-_';
+      const len1 = Math.floor(prng() * 10);
+      for (let j = 0; j < len1; j++) pat += chars[Math.floor(prng() * chars.length)];
+      const len2 = Math.floor(prng() * 10);
+      for (let j = 0; j < len2; j++) target += chars[Math.floor(prng() * chars.length)];
+    }
+    const t0 = Date.now();
+    const res1 = matchesWorkspaceGlobList([pat], target);
+    const elapsed = Date.now() - t0;
+    assert.ok(elapsed <= 100, `Glob input ${i} took ${elapsed}ms > 100ms invariant`);
+
+    const res2 = matchesWorkspaceGlobList([pat], target);
+    assert.equal(res1, res2, `Glob nondeterministic at iteration ${i}`);
+  }
+  const globDuration = Date.now() - globStart;
+  console.log(`✔ Workspace Glob Matcher: 10,000 iterations verified in ${globDuration} ms (max time per input <= 100 ms)`);
+
+  const totalFuzzDuration = Date.now() - fuzzSuiteStart;
+  console.log(`✔ Total A6-8 Fuzz Suite: 30,000 iterations completed in ${totalFuzzDuration} ms (seed: 0x${fuzzSeed.toString(16)})`);
+});
+
 
 
 
