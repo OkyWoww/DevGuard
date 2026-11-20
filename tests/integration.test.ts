@@ -8087,3 +8087,138 @@ test('Test 87: SPEC rev 1.3 pnpm v10 Non-Packages Top-Level Safe Skip, Unsupport
 
 
 
+
+test('Test 88: Stage 7.1 Core Extraction Isolation (A7-1) & Byte-for-Byte SARIF Parity (A7-2)', async () => {
+  // === A7-1: src/core/ Isolation Invariant ===
+  const coreRoot = path.join(REPO_ROOT, 'src', 'core');
+  assert.ok(fs.existsSync(coreRoot), 'src/core/ directory must exist');
+
+  const collectTsFiles = (dir: string): string[] => {
+    const out: string[] = [];
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        out.push(...collectTsFiles(full));
+      } else if (entry.isFile() && (entry.name.endsWith('.ts') || entry.name.endsWith('.tsx'))) {
+        out.push(full);
+      }
+    }
+    return out;
+  };
+
+  const coreFiles = collectTsFiles(coreRoot);
+  assert.ok(coreFiles.length >= 9, `Expected >= 9 files under src/core/, found ${coreFiles.length}`);
+
+  const forbiddenPatterns: Array<{ label: string; re: RegExp }> = [
+    { label: '@actions/* import', re: /\bfrom\s+['"]@actions\// },
+    { label: '@octokit/* import', re: /\bfrom\s+['"]@octokit\// },
+    { label: 'src/App or React UI import', re: /\bfrom\s+['"](?:react|lucide-react|\.\.?\/.*App(?:\.tsx?)?)['"]/ },
+    { label: 'githubCommenter import', re: /\bfrom\s+['"][^'"]*githubCommenter/ },
+    { label: 'adapters/ import', re: /\bfrom\s+['"][^'"]*adapters\// },
+    { label: 'process.exit() call', re: /\bprocess\.exit\s*\(/ },
+  ];
+
+  for (const file of coreFiles) {
+    const rel = path.relative(REPO_ROOT, file).replace(/\\/g, '/');
+    const content = fs.readFileSync(file, 'utf-8');
+    for (const { label, re } of forbiddenPatterns) {
+      assert.equal(
+        re.test(content),
+        false,
+        `A7-1 violation: ${rel} must not contain ${label}`
+      );
+    }
+  }
+
+  // === A7-2: Byte-for-Byte SARIF Parity across core/, adapters/action/, and legacy re-exports ===
+  const coreAnalyzer = await import('../src/core/analyzer.js');
+  const coreSarif = await import('../src/core/sarif.js');
+  const actionAdapter = await import('../src/adapters/action/index.js');
+
+  const parityFixtureCode = [
+    "import { nope } from 'totally-phantom-pkg-a72';",
+    'export async function processPayment(account: { balance: number }, amount: number, modName: string) {',
+    '  const apiKey = "' + 'sk_live_' + '51H9xK2L8mN4pQ7rS0tU3vW6yZ9aB2cD4eF";',
+    '  if (account.balance >= amount) {',
+    '    await fetch("https://api.stripe.com/v1/charges");',
+    '    account.balance -= amount;',
+    '  }',
+    '  try {',
+    '    await import(modName);',
+    '  } catch (e) {}',
+    '  return eval(modName + apiKey);',
+    '}',
+  ].join('\n');
+
+  const tmpParityDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-a72-'));
+  try {
+    const buildSummaryFrom = (
+      analyzeFn: typeof analyzeCodeDeterministically,
+      filePath: string
+    ) => {
+      const report = analyzeFn(parityFixtureCode, { filePath });
+      return {
+        filePath,
+        security: report.skor.security,
+        correctness: report.skor.correctness,
+        maintainability: report.skor.maintainability,
+        overall: report.skor.totalScore,
+        passed: report.skor.totalScore >= 85 && !report.temuanUtama.description,
+        fatalFlaws: report.temuanUtama.description ? [report.temuanUtama.description] : [],
+        defenseInDepth: report.temuanLain,
+        inlineFindings: report.inlineFindings,
+        suppressions: report.suppressions,
+        foldLimitExceeded: report.virtualView?.limitExceeded,
+      };
+    };
+
+    const sampleSkipped = [{ filePath: 'cmd/server.go', reason: 'unsupported_language' as const }];
+    const sampleOpts = {
+      partialFiles: ['scripts/helper.py'],
+      hasAnalysisFailure: false,
+      workspaceDiagnostics: [
+        {
+          ruleId: 'DG004-WS-UNPARSED' as const,
+          sourceFile: 'pnpm-workspace.yaml',
+          reason: 'yaml_unsupported_construct' as const,
+          message: 'Unsupported YAML anchor in pnpm-workspace.yaml',
+          scoring: false as const,
+        },
+      ],
+    };
+
+    const corePath = path.join(tmpParityDir, 'core.sarif');
+    const actionPath = path.join(tmpParityDir, 'action.sarif');
+    const legacyPath = path.join(tmpParityDir, 'legacy.sarif');
+
+    const coreSummary = buildSummaryFrom(coreAnalyzer.analyzeCodeDeterministically, 'src/payment.ts');
+    const actionSummary = buildSummaryFrom(actionAdapter.analyzeCodeDeterministically, 'src/payment.ts');
+    const legacySummary = buildSummaryFrom(analyzeCodeDeterministically, 'src/payment.ts');
+
+    assert.deepEqual(coreSummary, legacySummary, 'A7-2: core/analyzer output must match legacy re-export');
+    assert.deepEqual(actionSummary, legacySummary, 'A7-2: adapters/action output must match legacy re-export');
+
+    coreSarif.generateSarifReport([coreSummary], corePath, sampleSkipped, sampleOpts);
+    actionAdapter.generateSarifReport([actionSummary], actionPath, sampleSkipped, sampleOpts);
+    generateSarifReport([legacySummary], legacyPath, sampleSkipped, sampleOpts);
+
+    const coreBytes = fs.readFileSync(corePath);
+    const actionBytes = fs.readFileSync(actionPath);
+    const legacyBytes = fs.readFileSync(legacyPath);
+
+    assert.ok(Buffer.compare(coreBytes, actionBytes) === 0, 'A7-2: core SARIF and adapters/action SARIF must be byte-for-byte identical');
+    assert.ok(Buffer.compare(coreBytes, legacyBytes) === 0, 'A7-2: core SARIF and legacy SARIF must be byte-for-byte identical');
+
+    const parsedSarif = JSON.parse(coreBytes.toString('utf-8')) as {
+      version: string;
+      runs: Array<{ results: Array<{ ruleId: string }> }>;
+    };
+    assert.equal(parsedSarif.version, '2.1.0');
+    const ruleIds = new Set(parsedSarif.runs[0].results.map((r) => r.ruleId));
+    for (const expectedRule of ['DG001', 'DG004', 'DG004-DYN-01', 'DG005', 'DG006', 'DG007', 'DG008']) {
+      assert.ok(ruleIds.has(expectedRule), `A7-2: parity fixture SARIF must include ${expectedRule}`);
+    }
+  } finally {
+    fs.rmSync(tmpParityDir, { recursive: true, force: true });
+  }
+});
