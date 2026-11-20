@@ -210,6 +210,13 @@ function buildDefaultFsWorkspaceContext(filePath: string): {
   if (!fsMod || !pathMod) return null;
 
   try {
+    const readFileSafe = (targetPath: string): string | null => {
+      try {
+        return fsMod.readFileSync(targetPath, 'utf-8');
+      } catch {
+        return null;
+      }
+    };
     let dir = pathMod.dirname(pathMod.resolve(filePath));
     let firstPkgDir: string | null = null;
     let workspaceRootDir: string | null = null;
@@ -226,13 +233,9 @@ function buildDefaultFsWorkspaceContext(filePath: string): {
       if (hasYaml) {
         workspaceRootDir = dir;
       } else if (hasPkg) {
-        try {
-          const raw = fsMod.readFileSync(pkgPath, 'utf-8');
-          if (raw.includes('"workspaces"')) {
-            workspaceRootDir = dir;
-          }
-        } catch {
-          // Unreadable/malformed root handled fail-closed when building context
+        const raw = readFileSafe(pkgPath);
+        if (raw !== null && raw.includes('"workspaces"')) {
+          workspaceRootDir = dir;
         }
       }
 
