@@ -1,13 +1,104 @@
 # 🛡️ DevGuard v1.4.0 — The AI-Slop & Vibe-Coding Security Gatekeeper
 
 [![Zero-Dependency Runtime](https://img.shields.io/badge/Runtime-100%25%20Zero--Dependency-emerald.svg)](#hybrid-dual-layer-architecture)
-[![OASIS SARIF v2.1.0](https://img.shields.io/badge/SARIF-v2.1.0%20Compliant-blue.svg)](#quick-start-fork-safe-ci-setup)
-[![GitHub Action](https://img.shields.io/badge/GitHub%20Action-v1.4.0-black.svg)](#quick-start-fork-safe-ci-setup)
+[![OASIS SARIF v2.1.0](https://img.shields.io/badge/SARIF-v2.1.0%20Compliant-blue.svg)](#quick-start-choose-your-path)
+[![GitHub Action](https://img.shields.io/badge/GitHub%20Action-v1.4.0-black.svg)](#quick-start-choose-your-path)
 [![Tests 88/88 Passing](https://img.shields.io/badge/Tests-88%2F88%20Passing-success.svg)](#local-development--verification)
 
 **DevGuard** is a deterministic CI/CD security gatekeeper engineered to catch silent failures, slopsquatting, leaked API keys, and financial race conditions hidden inside AI-generated (*Cursor, Windsurf, Copilot, Antigravity*) Pull Requests before they reach production.
 
 Unlike generic LLM code reviewers that only leave probabilistic chat comments, DevGuard combines an **offline, low-latency Deterministic Lexical & Heuristic Engine** (`Pass-O` + additive `Pass-V` virtual constant folding) with optional **Gemini Adversarial Reasoning**, posts **One-Click GitHub Suggested Changes** directly on offending diff lines, and uploads **OASIS SARIF v2.1.0** reports to GitHub Code Scanning.
+
+---
+
+## ⚡ Quick Start: Choose Your Path
+
+DevGuard supports two distinct workflows depending on whether you want to test a snippet quickly or protect a repository/monorepo in CI:
+
+| Path | Best For | Monorepo `DG004` Resolver & Base-Branch `.devguard.json`? |
+| :--- | :--- | :---: |
+| **Path A: Local Browser Dashboard** | Testing a single code snippet interactively in the browser | No *(single-file mode)* |
+| **Path B: GitHub Actions CI (Recommended)** | Protecting repositories, Pull Requests, & monorepos with SARIF + inline fixes | **Yes** *(requires `fetch-depth: 0`)* |
+
+### Path A: Try Quickly in the Browser Dashboard (Single-File Snippets)
+
+```bash
+npm install
+npm run dev
+```
+
+Open the local dashboard URL printed in your terminal and paste any JS/TS/Python snippet to inspect deterministic Layer 1 findings immediately.
+> [!NOTE]
+> The browser dashboard audits standalone snippets without repository git history. Importing internal monorepo workspace packages (e.g., `@myorg/ui`) in the browser will trigger `DG004`; use **Path B (GitHub Actions CI)** for full monorepo workspace resolution.
+
+### Path B: Install in GitHub Actions CI (Fork-Safe & Monorepo-Ready)
+
+Pin DevGuard by release tag or **full 40-character commit SHA** (`git rev-parse v1.4.0^{commit}`) in `.github/workflows/devguard.yml`. Always set **`fetch-depth: 0`** on `actions/checkout@v4` so DevGuard can read `origin/<baseRef>` for base-branch `.devguard.json` and monorepo workspace configs (avoiding shallow-clone `DG004-WS-SHALLOW` fallbacks):
+
+```yaml
+name: DevGuard Security Audit
+
+on:
+  pull_request:
+    branches: [ main, master ]
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: read
+  pull-requests: write
+  security-events: write
+
+jobs:
+  audit:
+    name: DevGuard Quality Gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Required so base-branch .devguard.json & workspace configs are readable
+
+      - name: Run DevGuard v1.4.0
+        id: devguard
+        uses: OkyWoww/DevGuard@v1.4.0 # Or pin by 40-char commit SHA (git rev-parse v1.4.0^{commit})
+        with:
+          # Optional: Omit for 100% Free Offline Single-Pass Lexical & Heuristic mode
+          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
+          min_score: '85'
+          target_files: 'modified'
+          fail_on_unanalyzable: 'false'
+
+      - name: Upload DevGuard SARIF Report to GitHub Code Scanning
+        uses: github/codeql-action/upload-sarif@v3
+        if: always() && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo != null && github.event.pull_request.head.repo.full_name == github.repository))
+        with:
+          sarif_file: ${{ steps.devguard.outputs.sarif_file }}
+```
+
+### Action Inputs & Outputs ([action.yml](action.yml))
+
+| Direction | Name | Default / Example | Description |
+| :--- | :--- | :--- | :--- |
+| **Input** | `gemini_api_key` | `""` | Optional Google Gemini API key for Layer 2 reasoning (falls back cleanly to Offline Lexical & Heuristic mode if omitted, forked, or rate-limited). |
+| **Input** | `min_score` | `'85'` | Minimum Overall Guard score (`0`–`100`) required to pass CI (`DEVGUARD_MIN_SCORE`). |
+| **Input** | `target_files` | `'modified'` | Audit scope: `'modified'` (git diff), `'all'` (workspace scan), or a specific file path (`DEVGUARD_TARGET`). |
+| **Input** | `fail_on_unanalyzable` | `'false'` | Strict `'true'` or `'false'` (`DEVGUARD_FAIL_ON_UNANALYZABLE`); when `'true'`, fail (`exit 1`) if any in-scope code file is skipped (`unsupported_language` / `file_too_large`). Invalid values exit `1`. |
+| **Output** | `overall_score` | `96` / `N/A` | Aggregate Overall Guard score across analyzed files (`0`–`100`), or string `N/A` when `0` files were analyzed (numeric consumers must guard against `N/A`). |
+| **Output** | `audit_status` | `PASS` / `FAIL` | Final gate verdict written to `GITHUB_OUTPUT`. |
+| **Output** | `sarif_file` | `devguard-results.sarif` | Path to generated OASIS SARIF v2.1.0 report (`%SRCROOT%` POSIX URIs, GitHub Code Scanning `security-severity` rating `3.5`–`9.5`, and `fold_limit_exceeded` notifications). |
+
+### Quick Reference: Blocking Findings vs. Non-Scoring Notices
+
+Not every message in a DevGuard PR comment fails your build. Use this quick glossary to tell **scoring/blocking findings** apart from **informational fail-closed notices**:
+
+| Code / Category | Fails CI Gate? | What It Means & What To Do |
+| :--- | :---: | :--- |
+| **`DG001`, `DG003`, `DG004`, `DG005` (`error`), `DG006`, `DG007`, `DG008`** | **Yes** *(scoring)* | Security or correctness defect that deducts from the Overall Guard score and fails the gate below `min_score`. Fix the flagged line (or use the inline GitHub suggestion). |
+| **`DG004-WS-SHALLOW`** | **No** *(non-scoring)* | CI ran with a shallow clone (`fetch-depth: 1`) so `origin/<baseRef>` could not be read; workspace resolution failed closed to `0` base packages. Add `fetch-depth: 0` to `actions/checkout@v4`. |
+| **`DG004-WS-NEW`** | **No** *(non-scoring)* | The PR introduces a new workspace package not yet on the base branch. For anti-bypass security, it is not auto-trusted until merged into the base branch. |
+| **`DG004-WS-UNPARSED`** | **No** *(non-scoring)* | A workspace config (`package.json`, `pnpm-workspace.yaml`, or `tsconfig.json`) exceeded `256 KiB` or used unsupported YAML/JSONC constructs; that source failed closed safely without blocking by itself. |
+| **`DG004-DYN-01` / `DG004-DYN-02`** | **No** *(non-scoring)* | Non-literal dynamic `import(...)` / `require(...)` specifier surfaced for supply-chain visibility (`scoring: false`). |
 
 ---
 
@@ -175,65 +266,6 @@ Before transmitting any snippet to the Gemini REST endpoint (`generativelanguage
 > **Never Use `pull_request_target`:** Always run DevGuard under `pull_request` (never `pull_request_target` — DevGuard exits immediately with code `1` if `GITHUB_EVENT_NAME == 'pull_request_target'`), which checks out untrusted fork code in an isolated context without write tokens or repository secrets. Guard `upload-sarif` with `if: always() && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo != null && github.event.pull_request.head.repo.full_name == github.repository))` so fork PRs never fail a job step attempting unauthorized SARIF uploads.
 >
 > **Enable Branch Protection:** Configure GitHub branch protection / rulesets with **Require status checks to pass before merging** for `DevGuard Quality Gate` so Pull Requests cannot bypass or delete `.github/workflows/devguard.yml`.
-
----
-
-## ⚡ Quick Start (Fork-Safe CI Setup)
-
-Pin DevGuard by release tag or **full 40-character commit SHA** (`git rev-parse v1.4.0^{commit}`) in `.github/workflows/devguard.yml`, with `fetch-depth: 0` so commit history and base-branch `.devguard.json` verification are always available:
-
-```yaml
-name: DevGuard Security Audit
-
-on:
-  pull_request:
-    branches: [ main, master ]
-  push:
-    branches: [ main ]
-
-permissions:
-  contents: read
-  pull-requests: write
-  security-events: write
-
-jobs:
-  audit:
-    name: DevGuard Quality Gate
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Run DevGuard v1.4.0
-        id: devguard
-        uses: OkyWoww/DevGuard@v1.4.0 # Or pin by 40-char commit SHA (git rev-parse v1.4.0^{commit})
-        with:
-          # Optional: Omit for 100% Free Offline Single-Pass Lexical & Heuristic mode
-          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
-          min_score: '85'
-          target_files: 'modified'
-          fail_on_unanalyzable: 'false'
-
-      - name: Upload DevGuard SARIF Report to GitHub Code Scanning
-        uses: github/codeql-action/upload-sarif@v3
-        if: always() && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo != null && github.event.pull_request.head.repo.full_name == github.repository))
-        with:
-          sarif_file: ${{ steps.devguard.outputs.sarif_file }}
-```
-
-### Action Inputs & Outputs ([action.yml](action.yml))
-
-| Direction | Name | Default / Example | Description |
-| :--- | :--- | :--- | :--- |
-| **Input** | `gemini_api_key` | `""` | Optional Google Gemini API key for Layer 2 reasoning (falls back cleanly to Offline Lexical & Heuristic mode if omitted, forked, or rate-limited). |
-| **Input** | `min_score` | `'85'` | Minimum Overall Guard score (`0`–`100`) required to pass CI (`DEVGUARD_MIN_SCORE`). |
-| **Input** | `target_files` | `'modified'` | Audit scope: `'modified'` (git diff), `'all'` (workspace scan), or a specific file path (`DEVGUARD_TARGET`). |
-| **Input** | `fail_on_unanalyzable` | `'false'` | Strict `'true'` or `'false'` (`DEVGUARD_FAIL_ON_UNANALYZABLE`); when `'true'`, fail (`exit 1`) if any in-scope code file is skipped (`unsupported_language` / `file_too_large`). Invalid values exit `1`. |
-| **Output** | `overall_score` | `96` / `N/A` | Aggregate Overall Guard score across analyzed files (`0`–`100`), or string `N/A` when `0` files were analyzed (numeric consumers must guard against `N/A`). |
-| **Output** | `audit_status` | `PASS` / `FAIL` | Final gate verdict written to `GITHUB_OUTPUT`. |
-| **Output** | `sarif_file` | `devguard-results.sarif` | Path to generated OASIS SARIF v2.1.0 report (`%SRCROOT%` POSIX URIs, GitHub Code Scanning `security-severity` rating `3.5`–`9.5`, and `fold_limit_exceeded` notifications). |
 
 ---
 
