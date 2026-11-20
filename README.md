@@ -1,9 +1,9 @@
-# 🛡️ DevGuard v1.3.0 — The AI-Slop & Vibe-Coding Security Gatekeeper
+# 🛡️ DevGuard v1.4.0 — The AI-Slop & Vibe-Coding Security Gatekeeper
 
 [![Zero-Dependency Runtime](https://img.shields.io/badge/Runtime-100%25%20Zero--Dependency-emerald.svg)](#hybrid-dual-layer-architecture)
 [![OASIS SARIF v2.1.0](https://img.shields.io/badge/SARIF-v2.1.0%20Compliant-blue.svg)](#quick-start-fork-safe-ci-setup)
-[![GitHub Action](https://img.shields.io/badge/GitHub%20Action-v1.3.0-black.svg)](#quick-start-fork-safe-ci-setup)
-[![Tests 81/81 Passing](https://img.shields.io/badge/Tests-81%2F81%20Passing-success.svg)](#local-development--verification)
+[![GitHub Action](https://img.shields.io/badge/GitHub%20Action-v1.4.0-black.svg)](#quick-start-fork-safe-ci-setup)
+[![Tests 88/88 Passing](https://img.shields.io/badge/Tests-88%2F88%20Passing-success.svg)](#local-development--verification)
 
 **DevGuard** is a deterministic CI/CD security gatekeeper engineered to catch silent failures, slopsquatting, leaked API keys, and financial race conditions hidden inside AI-generated (*Cursor, Windsurf, Copilot, Antigravity*) Pull Requests before they reach production.
 
@@ -180,7 +180,7 @@ Before transmitting any snippet to the Gemini REST endpoint (`generativelanguage
 
 ## ⚡ Quick Start (Fork-Safe CI Setup)
 
-Pin DevGuard by release tag or **full 40-character commit SHA** (`git rev-parse v1.3.0^{commit}`) in `.github/workflows/devguard.yml`, with `fetch-depth: 0` so commit history and base-branch `.devguard.json` verification are always available:
+Pin DevGuard by release tag or **full 40-character commit SHA** (`git rev-parse v1.4.0^{commit}`) in `.github/workflows/devguard.yml`, with `fetch-depth: 0` so commit history and base-branch `.devguard.json` verification are always available:
 
 ```yaml
 name: DevGuard Security Audit
@@ -206,9 +206,9 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Run DevGuard v1.3.0
+      - name: Run DevGuard v1.4.0
         id: devguard
-        uses: OkyWoww/DevGuard@v1.3.0 # Or pin by 40-char commit SHA (git rev-parse v1.3.0^{commit})
+        uses: OkyWoww/DevGuard@v1.4.0 # Or pin by 40-char commit SHA (git rev-parse v1.4.0^{commit})
         with:
           # Optional: Omit for 100% Free Offline Single-Pass Lexical & Heuristic mode
           gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
@@ -319,19 +319,21 @@ See also [docs/benchmarks/realworld-2026-11-16.md](docs/benchmarks/realworld-202
 
 ### Known Limitations (Path Exclusions, CLI Scope, & Monorepo `pnpm strict`)
 * **Path Exclusions by Mode (`modified` vs. `all`):** Dot-prefixed paths (`.github/`, `.husky/`), `node_modules`, `dist`, `build`, `coverage`, `remotion`, `out`, `tests`, all files inside `scripts/`, anchored self-reference files (`src/devguardAnalyzer.ts`, `scripts/devguard_verify.py`, `devguard_verify.py` when `package.json` `"name": "devguard"`), `*.d.ts`, `*.test.*`, and `*.spec.*` are excluded from code auditing. In `modified` (`git diff`) mode, touched excluded paths enter the classifier as `ignored/excluded_path` and appear in PR Coverage as `- Ignored (excluded path): N` when `N > 0` so the coverage invariant covers 100% of `git diff`. In `all` mode, excluded directories are skipped during workspace traversal so `node_modules` is never walked.
-* **Explicit CLI Arguments & `--version`:** Explicit file arguments passed on the CLI follow the coverage classifier (`.py` is analyzed with `partial` coverage; unsupported extensions like `.go` are marked `skipped`). Missing explicit CLI paths and invalid `fail_on_unanalyzable` values write `overall_score=N/A` and `audit_status=FAIL` to `GITHUB_OUTPUT` before exiting `1` rather than counting as `ignored/deleted`. Passing `--version` or `-v` prints the resolved package version (e.g. `1.3.0`) and exits `0`.
+* **Explicit CLI Arguments & `--version`:** Explicit file arguments passed on the CLI follow the coverage classifier (`.py` is analyzed with `partial` coverage; unsupported extensions like `.go` are marked `skipped`). Missing explicit CLI paths and invalid `fail_on_unanalyzable` values write `overall_score=N/A` and `audit_status=FAIL` to `GITHUB_OUTPUT` before exiting `1` rather than counting as `ignored/deleted`. Passing `--version` or `-v` prints the resolved package version (e.g. `1.4.0`) and exits `0`.
 * **Monorepo `pnpm strict` Non-Hoisting Limitation (`SPEC §6.2a`):** On `pnpm` repositories that disable dependency hoisting, importing a dependency declared only in the repository root `package.json` from a nested workspace package will fail at runtime under strict `pnpm`, whereas DevGuard resolves it as `resolvedVia: root` for cross-mode determinism (`DG004` detects fictitious/hallucinated package names, and root-declared packages are real dependencies). Intermediate ancestor manifests and sibling package dependencies are never merged (`A6-9`, `A6-12`).
-* **Shallow Clone (`fetch-depth: 1`) Base-Ref Fallback:** When CI runs with default `fetch-depth: 1` and `origin/<baseRef>` cannot be fetched, DevGuard fails closed to `0` admitted base workspace packages rather than trusting PR working-tree globs; ensure `fetch-depth: 0` is configured on `actions/checkout@v4` so base-branch workspace globs and `.devguard.json` remain readable.
+* **Shallow Clone (`fetch-depth: 1`) Base-Ref Fallback & Notice (`[DG004-WS-SHALLOW]`):** When CI runs with default `fetch-depth: 1` and `origin/<baseRef>` cannot be fetched, DevGuard fails closed to `0` admitted base workspace packages (preventing PR-injected bypasses) and surfaces an explicit non-scoring `[DG004-WS-SHALLOW]` notice in the sticky PR comment reminding developers to configure `fetch-depth: 0` on `actions/checkout@v4`.
 
-### Behavior Changes from `v1.2.1` to `v1.3.0`
-* `.mjs`, `.cjs`, `.mts`, and `.cts` are discovered automatically in workspace and PR diff scans, `.py` files receive explicit `partial` coverage telemetry (`⚠️ PARTIALLY ANALYZED — language-agnostic rules only`), and `analyzed === 0` PRs output `overall_score=N/A` (with fail-closed `parse_error`/`internal_error` gate behavior).
-* Added non-scoring dynamic module visibility (`DG004-DYN-01` / `DG004-DYN-02`), deterministic `Pass-V` constant folding (`FOLD-01`–`FOLD-04`) with `[via-fold]` provenance & `fold_limit_exceeded` SARIF notes, and anti-evasion detectors (`DG008-EV-01` & `DG005-EV-01`).
+### Behavior Changes from `v1.3.0` to `v1.4.0`
+* **DG004 Monorepo Workspace Resolver (`SPEC-v1.4.md` rev 1.3):** Full zero-dependency resolution for monorepos (pnpm workspaces, npm/Yarn workspaces, Bun workspaces, and TypeScript path aliases via `tsconfig.json` `paths` / `baseUrl` and Node `#subpath` imports). Resolves packages via strict precedence (`nearest` → `root` → `workspace` → `tsconfig`/`#imports`), dramatically reducing monorepo false positives across real-world codebases (`nestjs/nest` 481 → 8, `tj/commander.js` 39 → 3, `vitejs/vite` 59 → 55).
+* **Safe Skip of Non-`packages:` Top-Level YAML Keys:** Safely skips top-level pnpm v10+ keys (`hoistPattern:`, `shellEmulator:`, etc.) in `pnpm-workspace.yaml` without breaking package parsing, while keeping unsupported YAML constructs fail-closed (`DG004-WS-UNPARSED`).
+* **Base-Branch Configuration Gate:** `.devguard.json` supports `"workspaces": { "mode": "auto" | "off" }` read strictly from base-branch git history; untrusted PR modifications cannot alter workspace mode.
+* **Shallow Clone Warning:** Emits explicit non-scoring `[DG004-WS-SHALLOW]` sticky comment guidance when `fetch-depth: 1` prevents base-branch resolution.
 
 ---
 
 ## 🧪 Local Development & Verification
 
-DevGuard enforces a strict zero-dependency test harness using Node's built-in assertion & test runner (`node:test` compiled via `tsconfig.test.json` and executed in-process), currently verified at **81/81 passing tests** across [tests/corpus.test.ts](tests/corpus.test.ts) (`Corpus Benchmark`) and [tests/integration.test.ts](tests/integration.test.ts) (`Tests 1–80`):
+DevGuard enforces a strict zero-dependency test harness using Node's built-in assertion & test runner (`node:test` compiled via `tsconfig.test.json` and executed in-process), currently verified at **88 passing test scenarios** across [tests/corpus.test.ts](tests/corpus.test.ts) (`Corpus Benchmark`) and [tests/integration.test.ts](tests/integration.test.ts) (`Tests 1–87`):
 
 ```bash
 # 1. Typecheck application, CLI, & tests
@@ -340,11 +342,11 @@ npm run lint
 # 2. Build standalone web UI bundle
 npm run build
 
-# 3. Run zero-dependency benchmark + integration test suite (81/81 scenarios)
+# 3. Run zero-dependency benchmark + integration test suite (88 passing scenarios)
 npm test
 
 # 4. Print DevGuard CLI version cleanly under Node --experimental-strip-types
-node --experimental-strip-types src/cli.ts --version
+node --experimental-strip-types src/loader.mjs --version
 
 # 5. Regenerate labeled corpus Markdown summary
 npm run corpus:report
