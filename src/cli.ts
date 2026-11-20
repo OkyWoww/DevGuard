@@ -460,8 +460,9 @@ export function createGitRefWorkspaceFileAccessor(
   };
 }
 
-export function createEmptyFailClosedWorkspaceAccessor(): WorkspaceFileAccessor {
+export function createEmptyFailClosedWorkspaceAccessor(unavailableBaseRef?: string): WorkspaceFileAccessor {
   return {
+    unavailableBaseRef,
     listFiles: () => [],
     fileExists: () => false,
     readFile: () => null,
@@ -482,15 +483,16 @@ export function resolveBaseWorkspaceFileAccessor(
   const beforeSha = options?.beforeSha ?? readBeforeShaFromEventFile(process.env.GITHUB_EVENT_PATH);
 
   if (baseRef && eventName !== 'push') {
-    const accessor = createGitRefWorkspaceFileAccessor(cwd, `origin/${baseRef}`);
+    const targetRef = `origin/${baseRef}`;
+    const accessor = createGitRefWorkspaceFileAccessor(cwd, targetRef);
     // If base ref is specified (PR mode) but cannot be resolved from git (shallow clone, missing fetch, etc),
     // we MUST fail closed and NOT fallback to working-tree package.json workspaces.
-    return accessor ?? createEmptyFailClosedWorkspaceAccessor();
+    return accessor ?? createEmptyFailClosedWorkspaceAccessor(targetRef);
   }
 
   if (eventName === 'push' && beforeSha && !/^0+$/.test(beforeSha)) {
     const accessor = createGitRefWorkspaceFileAccessor(cwd, beforeSha);
-    return accessor ?? createEmptyFailClosedWorkspaceAccessor();
+    return accessor ?? createEmptyFailClosedWorkspaceAccessor(beforeSha);
   }
 
   return undefined;
@@ -1580,7 +1582,8 @@ export async function runAction() {
       (workspaceContext.packagesByName.size > 0 ||
         workspaceContext.workspaceGlobs.length > 0 ||
         workspaceContext.undeclaredWorkspaceImportsCount > 0 ||
-        activeWsDiagnostics.length > 0)
+        activeWsDiagnostics.length > 0 ||
+        Boolean(workspaceContext.baseRefUnavailable))
   );
 
   const coverageSummary: PrCoverageSummary = {
@@ -1599,6 +1602,7 @@ export async function runAction() {
           sources: workspaceContext.detectedSources,
           undeclaredWorkspaceImportsCount: workspaceContext.undeclaredWorkspaceImportsCount,
           diagnostics: activeWsDiagnostics,
+          baseRefUnavailable: workspaceContext.baseRefUnavailable,
         }
       : undefined,
   };

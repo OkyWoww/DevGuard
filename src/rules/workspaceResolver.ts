@@ -66,6 +66,7 @@ export interface WorkspaceDiagnosticNotice {
 
 export interface WorkspaceFileAccessor {
   rootDir?: string;
+  unavailableBaseRef?: string;
   readFile(relPath: string): string | null;
   fileExists(relPath: string): boolean;
   readDir?(relDir: string): string[] | null;
@@ -83,6 +84,7 @@ export interface WorkspaceContext {
   workspaceGlobs: string[];
   detectedSources: string[];
   diagnostics: WorkspaceDiagnosticNotice[];
+  baseRefUnavailable?: string;
   tsconfigData?: TsconfigData;
   undeclaredWorkspaceImportsCount: number;
   nearestManifestCache?: Map<
@@ -559,6 +561,7 @@ export function buildWorkspaceContext(
 
   const effectiveBaseNames = options?.baseBranchPackageNames ?? computedBaseNames;
   const detectedSources = Array.from(detectedSourceSet).sort(compareCodePoints);
+  const baseRefUnavailable = options?.baseFileAccessor?.unavailableBaseRef || undefined;
 
   // If no workspace globs defined, return early
   if (workspaceGlobs.length === 0) {
@@ -573,6 +576,7 @@ export function buildWorkspaceContext(
       workspaceGlobs,
       detectedSources,
       diagnostics,
+      baseRefUnavailable,
       tsconfigData,
       undeclaredWorkspaceImportsCount: 0,
       nearestManifestCache: new Map(),
@@ -640,6 +644,7 @@ export function buildWorkspaceContext(
     workspaceGlobs,
     detectedSources,
     diagnostics,
+    baseRefUnavailable,
     tsconfigData,
     undeclaredWorkspaceImportsCount: 0,
     nearestManifestCache: new Map(),

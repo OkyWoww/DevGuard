@@ -7949,6 +7949,138 @@ test('Test 86: Stage 6.1.d Acceptance Quotas A6-3 (>=5 TN x 5 Sources + >=5 Mono
   }
 });
 
+test('Test 87: SPEC rev 1.3 pnpm v10 Non-Packages Top-Level Safe Skip, Unsupported YAML Bail-Out, & Shallow Clone PR Notice', () => {
+  // (i) Safe non-packages top-level keys (hoistPattern, shellEmulator, overrides, packageExtensions, etc.)
+  const pnpmV10Yaml = [
+    'packages:',
+    "  - 'packages/*'",
+    "  - 'playground/**'",
+    "  - '!packages/vite/src/node/server/__tests__/fixtures/pnpm'",
+    '  - docs',
+    '',
+    'hoistPattern:',
+    '  - postcss # trailing comment',
+    '  - pug',
+    'shellEmulator: true',
+    'autoInstallPeers: false',
+    'overrides:',
+    "  vite: 'workspace:*'",
+    "  '@volar/typescript>typescript@>=7': '-'",
+    'packageExtensions:',
+    '  sass-embedded:',
+    '    peerDependencies:',
+    '      source-map-js: "*"',
+    'minimumReleaseAgeExclude:',
+    '  - rolldown',
+    'trustPolicy: no-downgrade',
+    'dedupePeers: true',
+  ].join('\n');
+
+  const resV10 = parsePnpmWorkspaceYaml(pnpmV10Yaml);
+  assert.equal(resV10.success, true, 'pnpm v10 YAML with hoistPattern/overrides/scalars must parse cleanly');
+  if (resV10.success) {
+    assert.deepEqual(resV10.data.packages, [
+      'packages/*',
+      'playground/**',
+      '!packages/vite/src/node/server/__tests__/fixtures/pnpm',
+      'docs',
+    ], 'Skipped sections must NEVER leak list items like postcss or rolldown into packages');
+  }
+
+  // Safe scalar & block keys appearing BEFORE packages: must also parse without state leak
+  const preKeyYaml = [
+    'shellEmulator: true',
+    'hoistPattern:',
+    '  - eslint',
+    'packages:',
+    "  - 'apps/*'",
+  ].join('\n');
+  const resPre = parsePnpmWorkspaceYaml(preKeyYaml);
+  assert.equal(resPre.success, true);
+  if (resPre.success) {
+    assert.deepEqual(resPre.data.packages, ['apps/*']);
+  }
+
+  // (ii) Ambiguous / unsupported YAML constructs MUST remain fail-closed (even inside skipped blocks)
+  const unsupportedInputs: Array<{ name: string; content: string }> = [
+    { name: 'anchor in skipped block', content: "packages:\n  - 'packages/*'\nhoistPattern: &hp\n  - postcss" },
+    { name: 'alias in skipped mapping', content: "packages:\n  - 'packages/*'\noverrides:\n  vite: *hp" },
+    { name: 'flow seq in skipped block', content: "packages:\n  - 'packages/*'\nhoistPattern: [postcss]" },
+    { name: 'flow map in skipped block', content: "packages:\n  - 'packages/*'\noverrides: { vite: '1.0.0' }" },
+    { name: 'block scalar | in skipped block', content: "packages:\n  - 'packages/*'\nnotes: |\n  hello" },
+    { name: 'block scalar > in skipped block', content: "packages:\n  - 'packages/*'\nnotes: >\n  hello" },
+    { name: 'tab indentation', content: "packages:\n  - 'packages/*'\nhoistPattern:\n\t- postcss" },
+    { name: 'multi-document marker ---', content: "---\npackages:\n  - 'packages/*'" },
+    { name: 'inline value on packages key', content: "packages: 'packages/*'" },
+    { name: 'only non-packages key (no packages:)', content: 'hoistPattern:\n  - postcss' },
+    { name: 'indented children under scalar key', content: "packages:\n  - 'packages/*'\nshellEmulator: true\n  - invalid" },
+    { name: 'stray non-YAML text inside skipped block', content: "packages:\n  - 'packages/*'\noverrides:\n  not a valid yaml entry" },
+  ];
+  for (const tc of unsupportedInputs) {
+    const res = parsePnpmWorkspaceYaml(tc.content);
+    assert.equal(res.success, false, `Unsupported YAML (${tc.name}) must fail closed`);
+    assert.equal((res as { reason?: string }).reason, 'yaml_unsupported_construct', `Wrong reason for ${tc.name}`);
+  }
+
+  // (iii) Shallow clone (baseRef unavailable) fail-closed + explicit non-scoring PR comment notice
+  const missingAccessor = createEmptyFailClosedWorkspaceAccessor('origin/main');
+  assert.equal(missingAccessor.unavailableBaseRef, 'origin/main');
+  const workingTreeFiles: Record<string, string> = {
+    'package.json': JSON.stringify({ name: 'shallow-app', workspaces: ['sneaky/*'] }),
+    'sneaky/evil/package.json': JSON.stringify({ name: '@evil/bypass' }),
+  };
+  const workingAccessor: WorkspaceFileAccessor = {
+    readFile: (p) => workingTreeFiles[p.replace(/\\/g, '/')] ?? null,
+    fileExists: (p) => Object.prototype.hasOwnProperty.call(workingTreeFiles, p.replace(/\\/g, '/')),
+    listFiles: () => Object.keys(workingTreeFiles),
+  };
+  const shallowCtx = buildWorkspaceContext(workingAccessor, {
+    mode: 'auto',
+    baseFileAccessor: missingAccessor,
+  });
+  assert.equal(shallowCtx.packagesByName.size, 0, 'Shallow clone fail-closed must admit 0 PR workspace packages');
+  assert.equal(shallowCtx.baseRefUnavailable, 'origin/main');
+
+  // Verify off-mode preserves v1.3.0 parity with zero shallow notice
+  const shallowOffCtx = buildWorkspaceContext(workingAccessor, {
+    mode: 'off',
+    baseFileAccessor: missingAccessor,
+  });
+  assert.equal(shallowOffCtx.baseRefUnavailable, undefined, 'mode=off must never emit baseRefUnavailable');
+
+  const shallowPrMd = buildPullRequestCommentMarkdown(
+    [
+      {
+        filePath: 'apps/web/src/index.ts',
+        security: 55,
+        correctness: 85,
+        maintainability: 90,
+        overall: 77,
+        passed: false,
+        fatalFlaws: ["Phantom dependency '@evil/bypass'"],
+        defenseInDepth: [],
+      },
+    ],
+    85,
+    'OFFLINE_AST',
+    {
+      analyzedCount: 1,
+      skippedFiles: [],
+      ignoredNonCodeCount: 0,
+      workspaceSummary: {
+        packageCount: shallowCtx.packagesByName.size,
+        sources: shallowCtx.detectedSources,
+        undeclaredWorkspaceImportsCount: shallowCtx.undeclaredWorkspaceImportsCount,
+        diagnostics: shallowCtx.diagnostics,
+        baseRefUnavailable: shallowCtx.baseRefUnavailable,
+      },
+    }
+  );
+  assert.ok(shallowPrMd.includes('Workspaces base-ref unavailable (`origin/main`)'), 'Coverage block must surface missing base-ref notice');
+  assert.ok(shallowPrMd.includes('[DG004-WS-SHALLOW]'), 'Non-scoring warnings section must include [DG004-WS-SHALLOW]');
+  assert.ok(shallowPrMd.includes('fetch-depth: 0'), 'PR notice must instruct configuring fetch-depth: 0');
+});
+
 
 
 
