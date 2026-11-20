@@ -516,6 +516,9 @@ export default function App() {
                   <span className="font-mono text-emerald-400">&lt;code_to_review&gt;</span>.
                   Setiap klik audit mengevaluasi string kode aktif secara dinamis (Zero-Leniency Hybrid Auditor).
                 </div>
+                <p className="text-[11px] text-slate-400/90 bg-slate-900/60 border border-slate-800/80 rounded-md px-2.5 py-1.5 mb-2.5">
+                  Mode browser hanya menguji cuplikan/berkas tunggal (<span className="font-mono text-slate-300">single-file</span>); resolusi monorepo (<span className="font-mono text-emerald-400">DG004</span>), base-branch <span className="font-mono text-slate-300">.devguard.json</span>, dan komentar PR berjalan di <span className="text-slate-200 font-medium">GitHub Actions CI</span>.
+                </p>
 
                 {/* Alert when vulnerabilities detected and remediation is ready */}
                 {auditReport?.perbaikan?.code &&
