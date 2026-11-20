@@ -38,7 +38,7 @@
     "id": "custom",
     "title": "✍️ Custom Scratchpad",
     "lang": "Any",
-    "vuln": "Kode Bebas / Kustom",
+    "vuln": "Freeform / Custom",
     "code": "# Tempel kode Anda di sini dalam bahasa apa pun (Python, JS, TS, Go, PHP, dsb).\n# DevGuard akan menganalisis kerentanan secara dinamis berdasarkan Rubrik Baku.\n\ndef audit_target(user_input):\n    # Tulis kode uji coba Anda di sini\n    pass\n"
   }
 ]
