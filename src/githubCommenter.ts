@@ -92,6 +92,7 @@ export interface PrCoverageSummary {
     sources: ReadonlyArray<string>;
     undeclaredWorkspaceImportsCount?: number;
     diagnostics?: ReadonlyArray<WorkspaceDiagnosticNotice>;
+    baseRefUnavailable?: string;
   };
 }
 
@@ -379,6 +380,11 @@ export function buildPullRequestCommentMarkdown(
       const sourcesLabel = wsSummary.sources.length > 0 ? wsSummary.sources.join(', ') : 'none';
       coverageLines.push(`- Workspaces detected: ${wsSummary.packageCount} (sources: ${sourcesLabel})`);
     }
+    if (wsSummary.baseRefUnavailable) {
+      coverageLines.push(
+        `- Workspaces base-ref unavailable (\`${escapeTableCell(sanitizeMarkdownText(wsSummary.baseRefUnavailable))}\`): fail-closed to 0 admitted workspaces (ensure \`actions/checkout\` uses \`fetch-depth: 0\`)`
+      );
+    }
     if ((wsSummary.undeclaredWorkspaceImportsCount ?? 0) > 0) {
       coverageLines.push(`- ${wsSummary.undeclaredWorkspaceImportsCount} impor workspace tanpa deklarasi`);
     }
@@ -462,6 +468,14 @@ export function buildPullRequestCommentMarkdown(
     const existing = nonScoringGroupMap.get(filePath) ?? [];
     existing.push({ line: 1, message: diag.message });
     nonScoringGroupMap.set(filePath, existing);
+  }
+  if (wsSummary?.baseRefUnavailable) {
+    const existing = nonScoringGroupMap.get('package.json') ?? [];
+    existing.push({
+      line: 1,
+      message: `[DG004-WS-SHALLOW] Base ref '${wsSummary.baseRefUnavailable}' unavailable (shallow clone fetch-depth: 1 or missing ref); workspace resolver failed closed with 0 admitted PR workspace packages. Configure fetch-depth: 0 on actions/checkout.`,
+    });
+    nonScoringGroupMap.set('package.json', existing);
   }
   const dynWarningGroups = Array.from(nonScoringGroupMap.entries()).map(([filePath, warnings]) => ({
     filePath,

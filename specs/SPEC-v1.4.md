@@ -1,8 +1,8 @@
-# DevGuard — SPEC rev 1.2 (Blueprint v1.4.0 → v2.0.0)
+# DevGuard — SPEC rev 1.3 (Blueprint v1.4.0 → v2.0.0)
 
 | Field | Value |
 |---|---|
-| Status | **P0 + Stage 6: LOCKED (rev 1.2).** Stage 7–10: DRAFT. Perubahan pada bagian locked wajib menaikkan rev dan dicatat di log revisi |
+| Status | **P0 + Stage 6: LOCKED (rev 1.3).** Stage 7–10: DRAFT. Perubahan pada bagian locked wajib menaikkan rev dan dicatat di log revisi |
 | Baseline | v1.3.0 (**harus diverifikasi di P0, bukan diasumsikan**) |
 | Lokasi | `specs/SPEC-v1.4.md` (file ini); `specs/SPEC.md` milik v1.3.0 tidak ditimpa |
 | Prinsip kerja | Spec-driven, stage-gated, setiap klaim "selesai" wajib berbukti (section 7) |
@@ -14,6 +14,7 @@
 | 1 | Draf awal |
 | 1.1 | Hasil review: (a) P0-5/E2 mengacu ke skrip `test` yang aktif di `package.json`; (b) aturan resolusi ancestor vs sibling dipertegas, penggabungan dependency sibling dilarang (6.2); (c) aturan parser JSONC/YAML + fuzz test (6.1a, A6-8, A6-11); (d) P0-1 memverifikasi tag yang sudah di-push dan commit rilis; (e) D-6.4 diperjelas, D-6.5 dan D-6.6 ditambah; (f) R11 dan R12 |
 | 1.2 | Lock P0 + Stage 6: D-6.1–D-6.6 diputuskan sesuai rekomendasi; definisi "akar" dipertegas (hanya `package.json` di akar repo, ancestor perantara dan sibling tidak pernah dipakai); semantik tanpa-override dijelaskan; `resolvedVia` ditambahkan agar urutan 6.2 dapat diuji (A6-10 ditulis ulang); known limitation pnpm strict + A6-12 |
+| 1.3 | Revisi pasca-evaluasi corpus & CI Stage 6: (a) `§6.1a` & `D-6.2` — entri top-level non-`packages:` yang aman di `pnpm-workspace.yaml` (mis. `hoistPattern:`, `shellEmulator:`, `overrides:` pada pnpm v10) dilewati secara aman tanpa membiarkan state bocor ke daftar `packages:`, sementara file tanpa `packages:` dan konstruksi ambigu/tidak didukung (`&`, `*alias`, `---`, `[...]`, `{...}`, `|`/`>`, tab) tetap *fail-closed* (`DG004-WS-UNPARSED`); (b) `§6.3` & `§6.5` — ketika base ref tidak tersedia/terbaca saat PR (mis. *shallow clone* `fetch-depth: 1`), resolver tetap *fail-closed* (0 paket PR diterima sebagai bypass) sekaligus memancarkan *notice* non-scoring eksplisit pada PR comment (`[DG004-WS-SHALLOW]`). |
 
 ---
 
@@ -142,7 +143,7 @@ Kalau ada P0 yang gagal, **berhenti dan laporkan**; jangan lanjut ke Stage 6.
 **6.1a Aturan parser (edge case parser tulisan sendiri)**
 - Setiap parser (JSONC, subset YAML, glob) dibangun sebagai tokenizer berstatus, **bukan regex berlapis** (hindari backtracking katastrofik). Ukuran input dibatasi; angka batas didokumentasikan.
 - JSONC: `//`, `/* */`, dan `#` di dalam string literal **bukan** komentar; BOM dan CRLF didukung; trailing comma hanya diterima di luar string.
-- Subset YAML pnpm: hanya `packages:` berisi list blok sederhana (`- 'glob'`, kutip tunggal/ganda/tanpa kutip). Konstruk di luar itu (flow sequence `[...]`, anchor/alias, block scalar `|`/`>`, multi-dokumen `---`, tab sebagai indentasi) → **bail-out**.
+- Subset YAML pnpm: mengekstrak `packages:` berisi list blok sederhana (`- 'glob'`, kutip tunggal/ganda/tanpa kutip). Kunci top-level non-`packages:` yang terstruktur aman (seperti `hoistPattern:`, `shellEmulator:`, `overrides:`, `packageExtensions:`, `allowBuilds:`, dll. pada pnpm v10) bersama blok terindentasinya dilewati tanpa mencemari daftar `packages:`, dengan syarat blok `packages:` hadir (atau file hanya berisi komentar/kosong). Konstruk ambigu/tidak didukung di bagian mana pun (flow sequence `[...]`, flow mapping `{...}`, anchor/alias `&`/`*`, block scalar `|`/`>`, multi-dokumen `---`/`...`, tab sebagai indentasi, baris tak beraturan, atau file yang hanya berisi kunci non-`packages:`) → **bail-out** (`yaml_unsupported_construct`).
 - **Bail-out bersifat per sumber dan fail-closed**: sumber yang gagal parse menyumbang **nol** nama (tidak ada hasil parsial), memicu `DG004-WS-UNPARSED` dengan kode alasan (`yaml_unsupported_construct`, `jsonc_syntax`, `extends_external`, `extends_cycle`, `size_limit`), dan sumber lain tetap dipakai.
 - Parser tidak boleh melempar exception tak tertangani maupun hang pada input apa pun; input rusak → bail-out.
 
@@ -166,6 +167,7 @@ Kalau ada P0 yang gagal, **berhenti dan laporkan**; jangan lanjut ke Stage 6.
 
 **6.3 Anti-bypass (hasil analisis SPOF)**
 - Glob workspace dibaca dari **base branch** (konsisten dengan INV-6).
+- **Perilaku Base Ref Tidak Tersedia / Shallow Clone (`fetch-depth: 1`):** Apabila `origin/<baseRef>` (pada PR) atau `beforeSha` (pada push) tidak dapat diverifikasi/dibaca oleh Git (misalnya *shallow clone* `fetch-depth: 1` tanpa riwayat base branch), resolver **wajib gagal tertutup (*fail-closed*)**: 0 paket workspace diterima dari working tree PR sebagai fallback bypass, sekaligus memancarkan notice non-scoring eksplisit pada PR comment (`[DG004-WS-SHALLOW]` & baris Coverage) agar pengguna menyetel `fetch-depth: 0` dan tidak menganggap hasil bersih secara diam-diam (INV-7).
 - Package workspace yang **baru muncul di PR** tetap di-resolve (agar PR sah yang menambah package tidak penuh FP), tetapi menghasilkan notice non-scoring `DG004-WS-NEW` ("workspace baru ditambahkan oleh PR ini: periksa nama paket").
 - Nama workspace yang sama persis dengan paket npm populer tidak diperlakukan khusus; keputusan manusia lewat notice.
 
@@ -179,6 +181,7 @@ Kalau ada P0 yang gagal, **berhenti dan laporkan**; jangan lanjut ke Stage 6.
 
 **6.5 Pelaporan**
 - Config workspace ada tetapi tidak terbaca → notice `DG004-WS-UNPARSED` (non-scoring, masuk hitungan unanalyzable; tunduk pada `fail_on_unanalyzable`).
+- Base ref tidak tersedia / *shallow clone* → notice non-scoring eksplisit pada PR comment (`[DG004-WS-SHALLOW]`, tidak menggagalkan `fail_on_unanalyzable`, tetap menjaga 0 paket PR diizinkan).
 - PR comment menampilkan jumlah workspace yang terdeteksi dan sumbernya.
 
 **6.6 Kriteria penerimaan (harus berbukti, section 7)**
@@ -382,7 +385,7 @@ Aturan agen:
 
 ## 9. Keputusan
 
-**Status rev 1.2:** D-6.1 s.d. D-6.6 **TERKUNCI** sesuai kolom ketiga. D-7.1 s.d. D-10 masih rekomendasi sementara (belum dikunci).
+**Status rev 1.3:** D-6.1 s.d. D-6.6 **TERKUNCI** sesuai kolom ketiga (D-6.2 diperluas di rev 1.3 untuk skip aman entri top-level non-`packages:` saat blok `packages:` hadir). D-7.1 s.d. D-10 masih rekomendasi sementara (belum dikunci).
 
 | ID | Pertanyaan | Keputusan (D-6.x) / rekomendasi sementara (lainnya) |
 |---|---|---|

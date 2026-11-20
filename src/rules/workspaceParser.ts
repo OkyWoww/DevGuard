@@ -308,6 +308,9 @@ export function parsePnpmWorkspaceYaml(raw: string): ParseResult<{ packages: str
   const lines = text.split(/\r?\n/);
   let packagesFound = false;
   let inPackagesList = false;
+  let sawOtherTopLevelKey = false;
+  let inSkippedSection = false;
+  let skippedSectionAllowsIndent = false;
   const packages: string[] = [];
 
   for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
@@ -322,6 +325,7 @@ export function parsePnpmWorkspaceYaml(raw: string): ParseResult<{ packages: str
     let hasFlowMap = false;
     let hasBlockScalar = false;
     let hasAnchor = false;
+    let hasAlias = false;
 
     for (let i = 0; i < line.length; i++) {
       const ch = line[i];
@@ -370,6 +374,12 @@ export function parsePnpmWorkspaceYaml(raw: string): ParseResult<{ packages: str
       if (ch === '{' || ch === '}') hasFlowMap = true;
       if (ch === '|' || ch === '>') hasBlockScalar = true;
       if (ch === '&') hasAnchor = true;
+      if (ch === '*') {
+        const prev = i > 0 ? line[i - 1] : '';
+        if (prev === '' || prev === ' ' || prev === ':' || prev === '-') {
+          hasAlias = true;
+        }
+      }
 
       stripped += ch;
     }
@@ -409,6 +419,13 @@ export function parsePnpmWorkspaceYaml(raw: string): ParseResult<{ packages: str
         error: `YAML anchor (&) is unsupported at line ${lineIdx + 1}`,
       };
     }
+    if (hasAlias) {
+      return {
+        success: false,
+        reason: 'yaml_unsupported_construct',
+        error: `YAML alias (*) is unsupported at line ${lineIdx + 1}`,
+      };
+    }
 
     const trimmed = stripped.trim();
     if (trimmed === '') continue;
@@ -422,17 +439,48 @@ export function parsePnpmWorkspaceYaml(raw: string): ParseResult<{ packages: str
       };
     }
 
-    if (/^packages:\s*$/.test(trimmed)) {
-      if (packagesFound) {
+    const leadingSpaces = stripped.length - stripped.trimStart().length;
+
+    if (leadingSpaces === 0) {
+      if (/^packages:\s*$/.test(trimmed)) {
+        if (packagesFound) {
+          return {
+            success: false,
+            reason: 'yaml_unsupported_construct',
+            error: `Duplicate packages key at line ${lineIdx + 1}`,
+          };
+        }
+        packagesFound = true;
+        inPackagesList = true;
+        inSkippedSection = false;
+        skippedSectionAllowsIndent = false;
+        continue;
+      }
+
+      if (/^packages:/.test(trimmed)) {
         return {
           success: false,
           reason: 'yaml_unsupported_construct',
-          error: `Duplicate packages key at line ${lineIdx + 1}`,
+          error: `Unsupported inline value for packages at line ${lineIdx + 1}: "${trimmed}"`,
         };
       }
-      packagesFound = true;
-      inPackagesList = true;
-      continue;
+
+      if (!(inPackagesList && /^-\s*/.test(trimmed))) {
+        const topLevelKeyMatch = /^[A-Za-z0-9_-]+:(?:\s+(.*))?$/.exec(trimmed);
+        if (topLevelKeyMatch) {
+          inPackagesList = false;
+          sawOtherTopLevelKey = true;
+          inSkippedSection = true;
+          skippedSectionAllowsIndent = !topLevelKeyMatch[1] || topLevelKeyMatch[1].trim() === '';
+          continue;
+        }
+
+        return {
+          success: false,
+          reason: 'yaml_unsupported_construct',
+          error: `Unsupported top-level YAML construct at line ${lineIdx + 1}: "${trimmed}"`,
+        };
+      }
     }
 
     if (inPackagesList) {
@@ -463,7 +511,7 @@ export function parsePnpmWorkspaceYaml(raw: string): ParseResult<{ packages: str
         continue;
       }
 
-      // Any line not starting with '-' is an unsupported construct or unexpected key
+      // Any line inside packages not starting with '-' is an unsupported construct or unexpected key
       return {
         success: false,
         reason: 'yaml_unsupported_construct',
@@ -471,11 +519,31 @@ export function parsePnpmWorkspaceYaml(raw: string): ParseResult<{ packages: str
       };
     }
 
-    // Encountered non-empty line before packages:
+    if (inSkippedSection && skippedSectionAllowsIndent && leadingSpaces > 0) {
+      // Allow only valid indented block list items or mapping entries inside skipped non-packages top-level blocks
+      if (/^(?:-\s+\S.*|(?:[^\s:#]+|'[^']*'|"[^"]*"):\s*(?:.*))$/.test(trimmed)) {
+        continue;
+      }
+      return {
+        success: false,
+        reason: 'yaml_unsupported_construct',
+        error: `Unsupported nested YAML construct at line ${lineIdx + 1}: "${trimmed}"`,
+      };
+    }
+
+    // Encountered indented or invalid line outside valid blocks
     return {
       success: false,
       reason: 'yaml_unsupported_construct',
-      error: `Unsupported YAML construct before packages key at line ${lineIdx + 1}: "${trimmed}"`,
+      error: `Unsupported YAML construct at line ${lineIdx + 1}: "${trimmed}"`,
+    };
+  }
+
+  if (sawOtherTopLevelKey && !packagesFound) {
+    return {
+      success: false,
+      reason: 'yaml_unsupported_construct',
+      error: 'pnpm-workspace.yaml contains top-level keys without a packages: block',
     };
   }
 
