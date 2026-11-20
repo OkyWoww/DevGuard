@@ -7672,6 +7672,283 @@ test('Test 85: Stage 6.1.c Base Ref Unavailable Fail-Closed Isolation (Shallow C
   }
 });
 
+test('Test 86: Stage 6.1.d Acceptance Quotas A6-3 (>=5 TN x 5 Sources + >=5 Monorepo TP), A6-11 (All 5 Bail-Out Codes), & A6-2 Non-Workspace SARIF Parity', () => {
+  const makeAccessor = (files: Record<string, string>): WorkspaceFileAccessor => ({
+    readFile: (p) => files[p.replace(/\\/g, '/')] ?? null,
+    fileExists: (p) => Object.prototype.hasOwnProperty.call(files, p.replace(/\\/g, '/')),
+    listFiles: () => Object.keys(files),
+  });
+
+  // 1. A6-3 Source 1: package.json workspaces (array format) — 5 TN
+  const arrFiles: Record<string, string> = {
+    'package.json': JSON.stringify({ name: 'arr-root', workspaces: ['packages/*'] }),
+    'packages/p1/package.json': JSON.stringify({ name: '@arr/pkg1' }),
+    'packages/p2/package.json': JSON.stringify({ name: '@arr/pkg2' }),
+    'packages/p3/package.json': JSON.stringify({ name: '@arr/pkg3' }),
+    'packages/p4/package.json': JSON.stringify({ name: '@arr/pkg4' }),
+    'packages/p5/package.json': JSON.stringify({ name: '@arr/pkg5' }),
+    'packages/app/package.json': JSON.stringify({ name: '@arr/app', dependencies: {} }),
+  };
+  const arrAcc = makeAccessor(arrFiles);
+  const arrCtx = buildWorkspaceContext(arrAcc, { mode: 'auto' });
+  const arrCode = [
+    "import { a } from '@arr/pkg1';",
+    "import { b } from '@arr/pkg2/sub';",
+    "import { c } from '@arr/pkg3';",
+    "import { d } from '@arr/pkg4';",
+    "import { e } from '@arr/pkg5';",
+    'export const sum = [a, b, c, d, e].length;',
+  ].join('\n');
+  const arrReport = analyzeCodeDeterministically(arrCode, {
+    filePath: 'packages/app/src/index.ts',
+    workspaceContext: arrCtx,
+    workspaceFileAccessor: arrAcc,
+    workspacesMode: 'auto',
+  });
+  assert.equal((arrReport.inlineFindings ?? []).filter((f) => f.ruleId === 'DG004').length, 0, 'A6-3 array workspaces: 5 TN must produce 0 DG004 findings');
+
+  // 2. A6-3 Source 2: package.json workspaces (object { packages: [...] } format) — 5 TN
+  const objFiles: Record<string, string> = {
+    'package.json': JSON.stringify({ name: 'obj-root', workspaces: { packages: ['libs/*'] } }),
+    'libs/l1/package.json': JSON.stringify({ name: '@obj/lib1' }),
+    'libs/l2/package.json': JSON.stringify({ name: '@obj/lib2' }),
+    'libs/l3/package.json': JSON.stringify({ name: '@obj/lib3' }),
+    'libs/l4/package.json': JSON.stringify({ name: '@obj/lib4' }),
+    'libs/l5/package.json': JSON.stringify({ name: '@obj/lib5' }),
+    'libs/app/package.json': JSON.stringify({ name: '@obj/app', dependencies: {} }),
+  };
+  const objAcc = makeAccessor(objFiles);
+  const objCtx = buildWorkspaceContext(objAcc, { mode: 'auto' });
+  const objCode = [
+    "import { a } from '@obj/lib1';",
+    "import { b } from '@obj/lib2';",
+    "import { c } from '@obj/lib3/deep';",
+    "import { d } from '@obj/lib4';",
+    "import { e } from '@obj/lib5';",
+    'export const sum = [a, b, c, d, e].length;',
+  ].join('\n');
+  const objReport = analyzeCodeDeterministically(objCode, {
+    filePath: 'libs/app/src/index.ts',
+    workspaceContext: objCtx,
+    workspaceFileAccessor: objAcc,
+    workspacesMode: 'auto',
+  });
+  assert.equal((objReport.inlineFindings ?? []).filter((f) => f.ruleId === 'DG004').length, 0, 'A6-3 object workspaces: 5 TN must produce 0 DG004 findings');
+
+  // 3. A6-3 Source 3: pnpm-workspace.yaml — 5 TN
+  const pnpmFiles: Record<string, string> = {
+    'package.json': JSON.stringify({ name: 'pnpm-root' }),
+    'pnpm-workspace.yaml': 'packages:\n  - "pkgs/*"\n',
+    'pkgs/k1/package.json': JSON.stringify({ name: '@pnpm/mod1' }),
+    'pkgs/k2/package.json': JSON.stringify({ name: '@pnpm/mod2' }),
+    'pkgs/k3/package.json': JSON.stringify({ name: '@pnpm/mod3' }),
+    'pkgs/k4/package.json': JSON.stringify({ name: '@pnpm/mod4' }),
+    'pkgs/k5/package.json': JSON.stringify({ name: '@pnpm/mod5' }),
+    'pkgs/app/package.json': JSON.stringify({ name: '@pnpm/app', dependencies: {} }),
+  };
+  const pnpmAcc = makeAccessor(pnpmFiles);
+  const pnpmCtx = buildWorkspaceContext(pnpmAcc, { mode: 'auto' });
+  const pnpmCode = [
+    "import { a } from '@pnpm/mod1';",
+    "import { b } from '@pnpm/mod2';",
+    "import { c } from '@pnpm/mod3';",
+    "import { d } from '@pnpm/mod4/util';",
+    "import { e } from '@pnpm/mod5';",
+    'export const sum = [a, b, c, d, e].length;',
+  ].join('\n');
+  const pnpmReport = analyzeCodeDeterministically(pnpmCode, {
+    filePath: 'pkgs/app/src/index.ts',
+    workspaceContext: pnpmCtx,
+    workspaceFileAccessor: pnpmAcc,
+    workspacesMode: 'auto',
+  });
+  assert.equal((pnpmReport.inlineFindings ?? []).filter((f) => f.ruleId === 'DG004').length, 0, 'A6-3 pnpm-workspace.yaml: 5 TN must produce 0 DG004 findings');
+
+  // 4. A6-3 Source 4: tsconfig.json paths & baseUrl — 5 TN
+  const tsFiles: Record<string, string> = {
+    'package.json': JSON.stringify({ name: 'ts-root' }),
+    'tsconfig.json': JSON.stringify({
+      compilerOptions: {
+        baseUrl: '.',
+        paths: {
+          '@ui/*': ['src/ui/*'],
+          '@utils/*': ['src/utils/*'],
+          'exact-mod': ['src/exact.ts'],
+        },
+      },
+    }),
+    'shared/auth.ts': 'export const auth = 1;\n',
+    'shared/db.ts': 'export const db = 2;\n',
+  };
+  const tsAcc = makeAccessor(tsFiles);
+  const tsCtx = buildWorkspaceContext(tsAcc, { mode: 'auto' });
+  const tsCode = [
+    "import { Btn } from '@ui/Button';",
+    "import { fmt } from '@utils/format';",
+    "import { ex } from 'exact-mod';",
+    "import { auth } from 'shared/auth';",
+    "import { db } from 'shared/db';",
+    'export const out = [Btn, fmt, ex, auth, db].length;',
+  ].join('\n');
+  const tsReport = analyzeCodeDeterministically(tsCode, {
+    filePath: 'src/index.ts',
+    workspaceContext: tsCtx,
+    workspaceFileAccessor: tsAcc,
+    workspacesMode: 'auto',
+  });
+  assert.equal((tsReport.inlineFindings ?? []).filter((f) => f.ruleId === 'DG004').length, 0, 'A6-3 tsconfig paths/baseUrl: 5 TN must produce 0 DG004 findings');
+
+  // 5. A6-3 Source 5: package.json imports (#...) — 5 TN
+  const impFiles: Record<string, string> = {
+    'package.json': JSON.stringify({
+      name: 'imp-root',
+      imports: {
+        '#root-a': './src/a.js',
+        '#root-b': './src/b.js',
+        '#internal/*': './src/internal/*.js',
+      },
+    }),
+    'apps/web/package.json': JSON.stringify({
+      name: '@imp/web',
+      imports: {
+        '#pkg-c': './src/c.js',
+        '#pkg-d/*': './src/d/*.js',
+      },
+    }),
+  };
+  const impAcc = makeAccessor(impFiles);
+  const impCtx = buildWorkspaceContext(impAcc, { mode: 'auto' });
+  const impCode = [
+    "import { a } from '#root-a';",
+    "import { b } from '#root-b';",
+    "import { c } from '#pkg-c';",
+    "import { d } from '#pkg-d/sub';",
+    "import { e } from '#internal/helper';",
+    'export const res = [a, b, c, d, e].length;',
+  ].join('\n');
+  const impReport = analyzeCodeDeterministically(impCode, {
+    filePath: 'apps/web/src/index.ts',
+    workspaceContext: impCtx,
+    workspaceFileAccessor: impAcc,
+    workspacesMode: 'auto',
+  });
+  assert.equal((impReport.inlineFindings ?? []).filter((f) => f.ruleId === 'DG004').length, 0, 'A6-3 package.json #imports: 5 TN must produce 0 DG004 findings');
+
+  // 6. A6-3 Monorepo TP: >= 5 hallucinated packages inside active monorepo MUST still be caught by DG004
+  const tpCode = [
+    "import { x1 } from 'ai-hallucinated-one';",
+    "import { x2 } from 'phantom-sdk-two';",
+    "import { x3 } from '@ghost-scope/three';",
+    "import { x4 } from 'nonexistent-lib-four';",
+    "import { x5 } from 'fictitious-pkg-five';",
+    'export const bad = [x1, x2, x3, x4, x5].length;',
+  ].join('\n');
+  const tpReport = analyzeCodeDeterministically(tpCode, {
+    filePath: 'packages/app/src/bad.ts',
+    workspaceContext: arrCtx,
+    workspaceFileAccessor: arrAcc,
+    workspacesMode: 'auto',
+  });
+  const tpDg004 = (tpReport.inlineFindings ?? []).filter((f) => f.ruleId === 'DG004');
+  assert.equal(tpDg004.length, 5, `A6-3 Monorepo TP: expected 5 DG004 findings, got ${tpDg004.length}`);
+
+  // 7. A6-11: All 5 bail-out reason codes emit DG004-WS-UNPARSED (scoring: false) with 0 partial names
+  const bailoutCases: Array<{ reason: WorkspaceBailoutReason; files: Record<string, string>; checkTsconfig?: boolean }> = [
+    {
+      reason: 'yaml_unsupported_construct',
+      files: {
+        'package.json': JSON.stringify({ name: 'b1' }),
+        'pnpm-workspace.yaml': 'packages:\n  - &anchor "packages/*"\n  - *anchor\n',
+        'packages/a/package.json': JSON.stringify({ name: '@b1/a' }),
+      },
+    },
+    {
+      reason: 'jsonc_syntax',
+      files: {
+        'package.json': '{ "name": "b2", "workspaces": ["packages/*" ',
+        'packages/a/package.json': JSON.stringify({ name: '@b2/a' }),
+      },
+    },
+    {
+      reason: 'extends_external',
+      files: {
+        'package.json': JSON.stringify({ name: 'b3' }),
+        'tsconfig.json': JSON.stringify({ extends: '@tsconfig/node22/tsconfig.json', compilerOptions: { paths: { '@x/*': ['src/*'] } } }),
+      },
+      checkTsconfig: true,
+    },
+    {
+      reason: 'extends_cycle',
+      files: {
+        'package.json': JSON.stringify({ name: 'b4' }),
+        'tsconfig.json': JSON.stringify({ extends: './tsconfig.b.json' }),
+        'tsconfig.b.json': JSON.stringify({ extends: './tsconfig.json' }),
+      },
+      checkTsconfig: true,
+    },
+    {
+      reason: 'size_limit',
+      files: {
+        'package.json': JSON.stringify({ name: 'b5' }),
+        'pnpm-workspace.yaml': 'packages:\n  - "packages/*"\n# ' + 'a'.repeat(MAX_CONFIG_FILE_SIZE + 100),
+        'packages/a/package.json': JSON.stringify({ name: '@b5/a' }),
+      },
+    },
+  ];
+  for (const bc of bailoutCases) {
+    const ctx = buildWorkspaceContext(makeAccessor(bc.files), { mode: 'auto' });
+    const notices = ctx.diagnostics.filter((d) => d.ruleId === 'DG004-WS-UNPARSED' && d.reason === bc.reason);
+    assert.equal(notices.length, 1, `A6-11: expected exactly 1 DG004-WS-UNPARSED with reason=${bc.reason}`);
+    assert.equal(notices[0].scoring, false, `A6-11: ${bc.reason} notice must be non-scoring`);
+    if (bc.checkTsconfig) {
+      assert.equal(ctx.tsconfigData, undefined, `A6-11: ${bc.reason} must contribute 0 partial tsconfig paths`);
+    } else {
+      assert.equal(ctx.packagesByName.size, 0, `A6-11: ${bc.reason} must contribute 0 partial workspace packages`);
+    }
+  }
+
+  // 8. A6-2: Non-workspace repo SARIF parity (auto vs off byte-for-byte identical)
+  const plainFiles: Record<string, string> = {
+    'package.json': JSON.stringify({ name: 'plain-app', dependencies: { express: '^4.0.0' } }),
+  };
+  const plainAcc = makeAccessor(plainFiles);
+  const plainCode = "import express from 'express';\nimport fake from 'definitely-phantom-pkg';\nexport const x = [express, fake];\n";
+  const repAuto = analyzeCodeDeterministically(plainCode, {
+    filePath: 'src/app.ts',
+    workspaceContext: buildWorkspaceContext(plainAcc, { mode: 'auto' }),
+    workspaceFileAccessor: plainAcc,
+    workspacesMode: 'auto',
+  });
+  const repOff = analyzeCodeDeterministically(plainCode, {
+    filePath: 'src/app.ts',
+    workspaceContext: buildWorkspaceContext(plainAcc, { mode: 'off' }),
+    workspaceFileAccessor: plainAcc,
+    workspacesMode: 'off',
+  });
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-a62-'));
+  try {
+    const pAuto = path.join(tmpDir, 'auto.sarif');
+    const pOff = path.join(tmpDir, 'off.sarif');
+    const toSummary = (r: ReturnType<typeof analyzeCodeDeterministically>): FileAuditSummary => ({
+      filePath: 'src/app.ts',
+      security: r.skor.security,
+      correctness: r.skor.correctness,
+      maintainability: r.skor.maintainability,
+      overall: r.skor.totalScore,
+      passed: false,
+      fatalFlaws: [r.temuanUtama.description],
+      defenseInDepth: r.residualNotes || [],
+      inlineFindings: r.inlineFindings,
+      layer2Status: 'Skipped: No API Key',
+    });
+    generateSarifReport([toSummary(repAuto)], pAuto);
+    generateSarifReport([toSummary(repOff)], pOff);
+    assert.equal(fs.readFileSync(pAuto, 'utf-8'), fs.readFileSync(pOff, 'utf-8'), 'A6-2: Non-workspace SARIF must be byte-for-byte identical between auto and off');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
 
 
 
