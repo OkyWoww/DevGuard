@@ -65,6 +65,7 @@ export interface WorkspaceDiagnosticNotice {
 }
 
 export interface WorkspaceFileAccessor {
+  rootDir?: string;
   readFile(relPath: string): string | null;
   fileExists(relPath: string): boolean;
   readDir?(relDir: string): string[] | null;
@@ -80,6 +81,7 @@ export interface WorkspaceContext {
   packagesByName: Map<string, WorkspacePackageInfo>;
   packagesByDir: Map<string, WorkspacePackageInfo>;
   workspaceGlobs: string[];
+  detectedSources: string[];
   diagnostics: WorkspaceDiagnosticNotice[];
   tsconfigData?: TsconfigData;
   undeclaredWorkspaceImportsCount: number;
@@ -315,117 +317,10 @@ export function extractPackageManifestData(pkgObj: unknown): {
   return { name, declaredDeps, subpathImports, workspaces };
 }
 
-/**
- * Builds the workspace map and context from pnpm-workspace.yaml and root package.json.
- * Fail-closed per source: errors in one config file never crash the entire run.
- */
-export function buildWorkspaceContext(
+function collectCandidatePackagePaths(
   accessor: WorkspaceFileAccessor,
-  options?: {
-    baseBranchPackageNames?: ReadonlySet<string>;
-    mode?: 'auto' | 'off';
-    rootPkgPath?: string;
-    rootYamlPath?: string;
-    rootTsconfigPath?: string;
-  }
-): WorkspaceContext {
-  const mode = options?.mode ?? 'auto';
-  const rootPkgPath = normalizePosix(options?.rootPkgPath ?? 'package.json');
-  const rootYamlPath = normalizePosix(options?.rootYamlPath ?? 'pnpm-workspace.yaml');
-  const rootTsconfigPath = normalizePosix(options?.rootTsconfigPath ?? 'tsconfig.json');
-
-  const diagnostics: WorkspaceDiagnosticNotice[] = [];
-  const workspaceGlobs: string[] = [];
-  let rootDeclaredDeps = new Set<string>();
-  let rootPackageName: string | undefined;
-  let rootSubpathImports: Record<string, unknown> | undefined;
-
-  // 1. Parse root package.json
-  const rootPkgRaw = accessor.readFile(rootPkgPath);
-  if (rootPkgRaw !== null) {
-    const parseRes = parseJsonc(rootPkgRaw);
-    if (parseRes.success) {
-      const manifest = extractPackageManifestData(parseRes.data);
-      rootDeclaredDeps = manifest.declaredDeps;
-      rootPackageName = manifest.name;
-      rootSubpathImports = manifest.subpathImports;
-      if (manifest.workspaces) {
-        workspaceGlobs.push(...manifest.workspaces);
-      }
-    } else {
-      diagnostics.push({
-        ruleId: 'DG004-WS-UNPARSED',
-        sourceFile: rootPkgPath,
-        reason: parseRes.reason,
-        message: `Failed to parse root package.json: ${parseRes.error}`,
-        scoring: false,
-      });
-    }
-  }
-
-  // 2. Parse pnpm-workspace.yaml if present
-  if (accessor.fileExists(rootYamlPath)) {
-    const yamlRaw = accessor.readFile(rootYamlPath);
-    if (yamlRaw !== null) {
-      const yamlRes = parsePnpmWorkspaceYaml(yamlRaw);
-      if (yamlRes.success) {
-        workspaceGlobs.push(...yamlRes.data.packages);
-      } else {
-        diagnostics.push({
-          ruleId: 'DG004-WS-UNPARSED',
-          sourceFile: rootYamlPath,
-          reason: yamlRes.reason,
-          message: `Failed to parse pnpm-workspace.yaml: ${yamlRes.error}`,
-          scoring: false,
-        });
-      }
-    }
-  }
-
-  // 3. Parse root tsconfig.json if present
-  let tsconfigData: TsconfigData | undefined;
-  if (accessor.fileExists(rootTsconfigPath)) {
-    const tsconfigRaw = accessor.readFile(rootTsconfigPath);
-    if (tsconfigRaw !== null) {
-      const tsAccessor: TsconfigFileAccessor = (p) => accessor.readFile(p);
-      const tsRes = parseTsconfig(tsconfigRaw, rootTsconfigPath, tsAccessor);
-      if (tsRes.success) {
-        tsconfigData = tsRes.data;
-      } else {
-        diagnostics.push({
-          ruleId: 'DG004-WS-UNPARSED',
-          sourceFile: rootTsconfigPath,
-          reason: tsRes.reason,
-          message: `Failed to parse tsconfig.json: ${tsRes.error}`,
-          scoring: false,
-        });
-      }
-    }
-  }
-
-  const packagesByName = new Map<string, WorkspacePackageInfo>();
-  const packagesByDir = new Map<string, WorkspacePackageInfo>();
-
-  // If workspaces mode is off or no globs defined, return early
-  if (mode === 'off' || workspaceGlobs.length === 0) {
-    return {
-      mode,
-      rootPkgPath,
-      rootDeclaredDeps,
-      rootPackageName,
-      rootSubpathImports,
-      packagesByName,
-      packagesByDir,
-      workspaceGlobs,
-      diagnostics,
-      tsconfigData,
-      undeclaredWorkspaceImportsCount: 0,
-      nearestManifestCache: new Map(),
-      resolutionCache: new Map(),
-    };
-  }
-
-  // 4. Discover workspace package.json files
+  rootPkgPath: string
+): string[] {
   const candidatePkgPaths: string[] = [];
 
   if (typeof accessor.listFiles === 'function') {
@@ -461,6 +356,232 @@ export function buildWorkspaceContext(
 
   // Sort candidate paths lexicographically for determinism (SPEC §6.2 butir 7)
   candidatePkgPaths.sort(compareCodePoints);
+  return candidatePkgPaths;
+}
+
+function pushUnparsedNotice(
+  diagnostics: WorkspaceDiagnosticNotice[],
+  sourceFile: string,
+  reason: WorkspaceBailoutReason,
+  error: string
+): void {
+  if (diagnostics.some((d) => d.ruleId === 'DG004-WS-UNPARSED' && d.sourceFile === sourceFile && d.reason === reason)) {
+    return;
+  }
+  diagnostics.push({
+    ruleId: 'DG004-WS-UNPARSED',
+    sourceFile,
+    reason,
+    message: `[DG004-WS-UNPARSED] (${reason}) Failed to parse ${sourceFile}: ${error}`,
+    scoring: false,
+  });
+}
+
+function extractRootWorkspaceGlobs(
+  accessor: WorkspaceFileAccessor,
+  rootPkgPath: string,
+  rootYamlPath: string,
+  diagnostics?: WorkspaceDiagnosticNotice[]
+): { globs: string[]; sources: string[] } {
+  const globs: string[] = [];
+  const sources: string[] = [];
+
+  const rootPkgRaw = accessor.readFile(rootPkgPath);
+  if (rootPkgRaw !== null) {
+    const parseRes = parseJsonc(rootPkgRaw);
+    if (parseRes.success) {
+      const manifest = extractPackageManifestData(parseRes.data);
+      if (manifest.workspaces && manifest.workspaces.length > 0) {
+        globs.push(...manifest.workspaces);
+        sources.push('package.json');
+      }
+    } else if (diagnostics) {
+      pushUnparsedNotice(diagnostics, rootPkgPath, parseRes.reason, parseRes.error);
+    }
+  }
+
+  if (accessor.fileExists(rootYamlPath)) {
+    const yamlRaw = accessor.readFile(rootYamlPath);
+    if (yamlRaw !== null) {
+      const yamlRes = parsePnpmWorkspaceYaml(yamlRaw);
+      if (yamlRes.success) {
+        if (yamlRes.data.packages.length > 0) {
+          globs.push(...yamlRes.data.packages);
+          sources.push('pnpm-workspace.yaml');
+        }
+      } else if (diagnostics) {
+        pushUnparsedNotice(diagnostics, rootYamlPath, yamlRes.reason, yamlRes.error);
+      }
+    }
+  }
+
+  return { globs, sources };
+}
+
+/**
+ * Builds the workspace map and context from pnpm-workspace.yaml and root package.json.
+ * Fail-closed per source: errors in one config file never crash the entire run.
+ */
+export function buildWorkspaceContext(
+  accessor: WorkspaceFileAccessor,
+  options?: {
+    baseBranchPackageNames?: ReadonlySet<string>;
+    baseFileAccessor?: WorkspaceFileAccessor;
+    mode?: 'auto' | 'off';
+    rootPkgPath?: string;
+    rootYamlPath?: string;
+    rootTsconfigPath?: string;
+  }
+): WorkspaceContext {
+  const mode = options?.mode ?? 'auto';
+  const rootPkgPath = normalizePosix(options?.rootPkgPath ?? 'package.json');
+  const rootYamlPath = normalizePosix(options?.rootYamlPath ?? 'pnpm-workspace.yaml');
+  const rootTsconfigPath = normalizePosix(options?.rootTsconfigPath ?? 'tsconfig.json');
+
+  const diagnostics: WorkspaceDiagnosticNotice[] = [];
+  const packagesByName = new Map<string, WorkspacePackageInfo>();
+  const packagesByDir = new Map<string, WorkspacePackageInfo>();
+  let rootDeclaredDeps = new Set<string>();
+  let rootPackageName: string | undefined;
+  let rootSubpathImports: Record<string, unknown> | undefined;
+
+  // 1. Parse root package.json
+  const rootPkgRaw = accessor.readFile(rootPkgPath);
+  let workingGlobs: string[] = [];
+  const detectedSourceSet = new Set<string>();
+
+  if (rootPkgRaw !== null) {
+    const parseRes = parseJsonc(rootPkgRaw);
+    if (parseRes.success) {
+      const manifest = extractPackageManifestData(parseRes.data);
+      rootDeclaredDeps = manifest.declaredDeps;
+      rootPackageName = manifest.name;
+      rootSubpathImports = manifest.subpathImports;
+      if (mode !== 'off' && manifest.workspaces && manifest.workspaces.length > 0) {
+        workingGlobs.push(...manifest.workspaces);
+        detectedSourceSet.add('package.json');
+      }
+    } else if (mode !== 'off') {
+      pushUnparsedNotice(diagnostics, rootPkgPath, parseRes.reason, parseRes.error);
+    }
+  }
+
+  // When mode === 'off' (SPEC §6.4, A6-6), preserve exact v1.3.0 baseline behavior without workspace/tsconfig/YAML diagnostics.
+  if (mode === 'off') {
+    return {
+      mode: 'off',
+      rootPkgPath,
+      rootDeclaredDeps,
+      rootPackageName,
+      rootSubpathImports,
+      packagesByName,
+      packagesByDir,
+      workspaceGlobs: [],
+      detectedSources: [],
+      diagnostics: [],
+      tsconfigData: undefined,
+      undeclaredWorkspaceImportsCount: 0,
+      nearestManifestCache: new Map(),
+      resolutionCache: new Map(),
+    };
+  }
+
+  // 2. Parse pnpm-workspace.yaml if present
+  if (accessor.fileExists(rootYamlPath)) {
+    const yamlRaw = accessor.readFile(rootYamlPath);
+    if (yamlRaw !== null) {
+      const yamlRes = parsePnpmWorkspaceYaml(yamlRaw);
+      if (yamlRes.success) {
+        if (yamlRes.data.packages.length > 0) {
+          workingGlobs.push(...yamlRes.data.packages);
+          detectedSourceSet.add('pnpm-workspace.yaml');
+        }
+      } else {
+        pushUnparsedNotice(diagnostics, rootYamlPath, yamlRes.reason, yamlRes.error);
+      }
+    }
+  }
+
+  // 3. Parse root tsconfig.json if present
+  let tsconfigData: TsconfigData | undefined;
+  if (accessor.fileExists(rootTsconfigPath)) {
+    const tsconfigRaw = accessor.readFile(rootTsconfigPath);
+    if (tsconfigRaw !== null) {
+      const tsAccessor: TsconfigFileAccessor = (p) => accessor.readFile(p);
+      const tsRes = parseTsconfig(tsconfigRaw, rootTsconfigPath, tsAccessor);
+      if (tsRes.success) {
+        tsconfigData = tsRes.data;
+        if ((tsRes.data.paths && Object.keys(tsRes.data.paths).length > 0) || Boolean(tsRes.data.baseUrl)) {
+          detectedSourceSet.add('tsconfig.json');
+        }
+      } else {
+        pushUnparsedNotice(diagnostics, rootTsconfigPath, tsRes.reason, tsRes.error);
+      }
+    }
+  }
+
+  // Anti-bypass (§6.3, A6-5): read workspace globs from base branch when available
+  let workspaceGlobs = workingGlobs;
+  let computedBaseNames: Set<string> | undefined;
+
+  if (options?.baseFileAccessor) {
+    const baseGlobInfo = extractRootWorkspaceGlobs(
+      options.baseFileAccessor,
+      rootPkgPath,
+      rootYamlPath,
+      diagnostics
+    );
+    workspaceGlobs = baseGlobInfo.globs;
+    detectedSourceSet.delete('package.json');
+    detectedSourceSet.delete('pnpm-workspace.yaml');
+    for (const src of baseGlobInfo.sources) {
+      detectedSourceSet.add(src);
+    }
+
+    computedBaseNames = new Set<string>();
+    if (workspaceGlobs.length > 0) {
+      const baseCandidatePaths = collectCandidatePackagePaths(options.baseFileAccessor, rootPkgPath);
+      for (const pkgJsonPath of baseCandidatePaths) {
+        const relDir = getDirname(pkgJsonPath);
+        if (!matchesWorkspaceGlobList(workspaceGlobs, relDir)) continue;
+        const raw = options.baseFileAccessor.readFile(pkgJsonPath);
+        if (raw === null) continue;
+        const parseRes = parseJsonc(raw);
+        if (parseRes.success) {
+          const manifest = extractPackageManifestData(parseRes.data);
+          if (manifest.name) {
+            computedBaseNames.add(manifest.name);
+          }
+        }
+      }
+    }
+  }
+
+  const effectiveBaseNames = options?.baseBranchPackageNames ?? computedBaseNames;
+  const detectedSources = Array.from(detectedSourceSet).sort(compareCodePoints);
+
+  // If no workspace globs defined, return early
+  if (workspaceGlobs.length === 0) {
+    return {
+      mode,
+      rootPkgPath,
+      rootDeclaredDeps,
+      rootPackageName,
+      rootSubpathImports,
+      packagesByName,
+      packagesByDir,
+      workspaceGlobs,
+      detectedSources,
+      diagnostics,
+      tsconfigData,
+      undeclaredWorkspaceImportsCount: 0,
+      nearestManifestCache: new Map(),
+      resolutionCache: new Map(),
+    };
+  }
+
+  // 4. Discover workspace package.json files
+  const candidatePkgPaths = collectCandidatePackagePaths(accessor, rootPkgPath);
 
   for (const pkgJsonPath of candidatePkgPaths) {
     const relDir = getDirname(pkgJsonPath);
@@ -473,13 +594,7 @@ export function buildWorkspaceContext(
 
     const parseRes = parseJsonc(raw);
     if (!parseRes.success) {
-      diagnostics.push({
-        ruleId: 'DG004-WS-UNPARSED',
-        sourceFile: pkgJsonPath,
-        reason: parseRes.reason,
-        message: `Failed to parse workspace package.json at ${pkgJsonPath}: ${parseRes.error}`,
-        scoring: false,
-      });
+      pushUnparsedNotice(diagnostics, pkgJsonPath, parseRes.reason, parseRes.error);
       continue;
     }
 
@@ -489,14 +604,14 @@ export function buildWorkspaceContext(
     }
 
     const isNewInPr = Boolean(
-      options?.baseBranchPackageNames && !options.baseBranchPackageNames.has(manifest.name)
+      effectiveBaseNames && !effectiveBaseNames.has(manifest.name)
     );
 
     if (isNewInPr) {
       diagnostics.push({
         ruleId: 'DG004-WS-NEW',
         sourceFile: pkgJsonPath,
-        message: `New workspace package '${manifest.name}' added in this PR: verify package name integrity.`,
+        message: `[DG004-WS-NEW] New workspace package '${manifest.name}' added in this PR: verify package name integrity.`,
         scoring: false,
       });
     }
@@ -523,6 +638,7 @@ export function buildWorkspaceContext(
     packagesByName,
     packagesByDir,
     workspaceGlobs,
+    detectedSources,
     diagnostics,
     tsconfigData,
     undeclaredWorkspaceImportsCount: 0,
@@ -574,19 +690,8 @@ export function findNearestPackageManifest(
             manifestData: extractPackageManifestData(parsed.data),
           };
         } else {
-          if (
-            context &&
-            !context.diagnostics.some(
-              (d) => d.ruleId === 'DG004-WS-UNPARSED' && d.sourceFile === candPath
-            )
-          ) {
-            context.diagnostics.push({
-              ruleId: 'DG004-WS-UNPARSED',
-              sourceFile: candPath,
-              reason: parsed.reason,
-              message: `Failed to parse nearest package.json at ${candPath}: ${parsed.error}`,
-              scoring: false,
-            });
+          if (context && context.mode !== 'off') {
+            pushUnparsedNotice(context.diagnostics, candPath, parsed.reason, parsed.error);
           }
           found = {
             relDir: curDir,
@@ -595,19 +700,8 @@ export function findNearestPackageManifest(
           };
         }
       } else {
-        if (
-          context &&
-          !context.diagnostics.some(
-            (d) => d.ruleId === 'DG004-WS-UNPARSED' && d.sourceFile === candPath
-          )
-        ) {
-          context.diagnostics.push({
-            ruleId: 'DG004-WS-UNPARSED',
-            sourceFile: candPath,
-            reason: 'jsonc_syntax',
-            message: `Unreadable nearest package.json at ${candPath}`,
-            scoring: false,
-          });
+        if (context && context.mode !== 'off') {
+          pushUnparsedNotice(context.diagnostics, candPath, 'jsonc_syntax', `Unreadable ${candPath}`);
         }
         found = {
           relDir: curDir,

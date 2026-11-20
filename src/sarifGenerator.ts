@@ -1,6 +1,9 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { redactSecretsPreservingLayout } from './devguardAnalyzer.ts';
+import {
+  redactSecretsPreservingLayout,
+  type WorkspaceDiagnosticNotice,
+} from './devguardAnalyzer.ts';
 import {
   INVARIANT_MISMATCH_SENTINEL,
   PARTIAL_COVERAGE_REASON_TEXT,
@@ -83,6 +86,7 @@ function createSarifResult(
 export interface GenerateSarifOptions {
   partialFiles?: ReadonlyArray<string>;
   hasAnalysisFailure?: boolean;
+  workspaceDiagnostics?: ReadonlyArray<WorkspaceDiagnosticNotice>;
 }
 
 export function generateSarifReport(
@@ -240,7 +244,7 @@ export function generateSarifReport(
   });
 
   const dynRuleDescriptors: Record<
-    'DG004-DYN-01' | 'DG004-DYN-02',
+    'DG004-DYN-01' | 'DG004-DYN-02' | 'DG004-WS-NEW' | 'DG004-WS-UNPARSED',
     {
       id: string;
       name: string;
@@ -273,6 +277,36 @@ export function generateSarifReport(
       },
       fullDescription: {
         text: 'Non-scoring informational warning emitted when CommonJS require() uses a non-literal specifier that cannot be statically checked against package.json or known typosquatting targets. Does not penalize repository scores.',
+      },
+      defaultConfiguration: { level: 'warning' },
+      properties: {
+        tags: ['security', 'supply-chain', 'non-scoring', 'external/cwe/cwe-829'],
+        'security-severity': '3.5',
+      },
+    },
+    'DG004-WS-NEW': {
+      id: 'DG004-WS-NEW',
+      name: 'NewWorkspacePackageInPullRequest',
+      shortDescription: {
+        text: 'Non-scoring notice: new workspace package added in pull request.',
+      },
+      fullDescription: {
+        text: 'Non-scoring informational notice emitted when a pull request adds a new workspace package not present on the base branch. Verify that the package name is intentional and not a slopsquatting bypass.',
+      },
+      defaultConfiguration: { level: 'warning' },
+      properties: {
+        tags: ['security', 'supply-chain', 'non-scoring', 'external/cwe/cwe-829'],
+        'security-severity': '3.5',
+      },
+    },
+    'DG004-WS-UNPARSED': {
+      id: 'DG004-WS-UNPARSED',
+      name: 'UnparseableWorkspaceConfiguration',
+      shortDescription: {
+        text: 'Non-scoring notice: workspace configuration could not be parsed (fail-closed per source).',
+      },
+      fullDescription: {
+        text: 'Non-scoring informational notice emitted when a workspace configuration file (package.json, pnpm-workspace.yaml, or tsconfig.json) fails to parse, exceeds the 256 KiB size limit, or uses unsupported constructs. The failed source contributes zero package names.',
       },
       defaultConfiguration: { level: 'warning' },
       properties: {
@@ -374,6 +408,34 @@ export function generateSarifReport(
         },
       ];
       results.push(suppressedResult);
+    }
+  }
+
+  // 6. Stage 6.1.c: Emit deduplicated non-scoring DG004-WS-NEW / DG004-WS-UNPARSED notices
+  if (options?.workspaceDiagnostics && options.workspaceDiagnostics.length > 0) {
+    const seenWsKeys = new Set<string>();
+    for (const diag of options.workspaceDiagnostics) {
+      const normDiagUri = normalizeSarifUri(diag.sourceFile);
+      const dedupKey = `${diag.ruleId}:${normDiagUri}:${diag.reason ?? ''}`;
+      if (seenWsKeys.has(dedupKey)) continue;
+      seenWsKeys.add(dedupKey);
+
+      if (!rulesMap.has(diag.ruleId)) {
+        rulesMap.set(diag.ruleId, dynRuleDescriptors[diag.ruleId]);
+      }
+      const wsResult = createSarifResult(
+        diag.ruleId,
+        'warning',
+        diag.message,
+        normDiagUri,
+        1,
+        undefined,
+        false
+      );
+      if (diag.reason) {
+        wsResult.properties = { scoring: false, reason: diag.reason };
+      }
+      results.push(wsResult);
     }
   }
 

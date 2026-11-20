@@ -26,6 +26,10 @@ import {
   classifyInScopeFiles,
   collectAnalysisFailures,
   computeOverallGateVerdict,
+  createFsWorkspaceFileAccessor,
+  createEmptyFailClosedWorkspaceAccessor,
+  createGitRefWorkspaceFileAccessor,
+  resolveBaseWorkspaceFileAccessor,
   discoverInScopeFiles,
   discoverWorkspaceFiles,
   evaluateCodeHybrid,
@@ -7059,6 +7063,613 @@ test('Test 83: Stage 6.1.b Workspace Resolver, Resolution Order, Anti-Sibling Sp
   const resOffImports = resolveWorkspaceImportSpecifier('#root-util', targetFile, offContext, fileAccessor);
   assert.equal(resOffImports.resolved, true, 'In mode off, subpath #imports still resolve');
   assert.equal(resOffImports.resolvedVia, 'imports');
+});
+
+test('Test 84: Stage 6.1.c Integration (DG004 Resolver, Base-Branch .devguard.json, A6-4, A6-5, A6-6 & PR Summary)', async () => {
+  // 1. Base-branch .devguard.json workspaces.mode validation (SPEC §6.4)
+  assert.equal(
+    loadVerifiedAllowlist({ isCi: false, readWorkingFile: () => null }).workspacesMode,
+    'auto',
+    'Missing .devguard.json must default workspacesMode to auto'
+  );
+
+  const offOnlyCfg = loadVerifiedAllowlist({
+    baseRef: 'main',
+    eventName: 'pull_request',
+    isCi: true,
+    readBaseFile: () => JSON.stringify({ workspaces: { mode: 'off' } }),
+    readWorkingFile: () => JSON.stringify({ workspaces: { mode: 'auto' } }),
+  });
+  assert.equal(offOnlyCfg.workspacesMode, 'off', 'Base-branch workspaces.mode=off must be honored');
+  assert.equal(offOnlyCfg.invalidAllowlistEntries.length, 0, 'Valid workspaces-only .devguard.json must not record schema errors');
+  assert.equal(offOnlyCfg.allowlistModifiedInPr, true);
+
+  const invalidWsCfg = loadVerifiedAllowlist({
+    baseRef: 'main',
+    eventName: 'pull_request',
+    isCi: true,
+    readBaseFile: () => JSON.stringify({ workspaces: { mode: 'invalid-mode', extraProp: 1 }, ignoreRulesByPath: {} }),
+    readWorkingFile: () => null,
+  });
+  assert.equal(invalidWsCfg.workspacesMode, 'off', 'Invalid workspaces.mode must fail closed to off');
+  assert.equal(invalidWsCfg.invalidAllowlistEntries.length, 2, 'Invalid mode and unsupported key must be reported');
+
+  // 2. Acceptance A6-4: Unparseable / out-of-subset workspace config emits DG004-WS-UNPARSED, never crashes, honors fail_on_unanalyzable
+  const tempA64 = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-a64-'));
+  try {
+    fs.mkdirSync(path.join(tempA64, 'apps', 'web', 'src'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tempA64, 'package.json'),
+      JSON.stringify({ name: 'a64-root', workspaces: ['apps/*'] }),
+      'utf-8'
+    );
+    fs.writeFileSync(path.join(tempA64, 'pnpm-workspace.yaml'), 'packages: ["apps/*"]\n', 'utf-8');
+    fs.writeFileSync(path.join(tempA64, 'tsconfig.json'), JSON.stringify({ extends: '@external/tsconfig' }), 'utf-8');
+    fs.writeFileSync(
+      path.join(tempA64, 'apps', 'web', 'package.json'),
+      JSON.stringify({ name: '@a64/web', dependencies: { express: '^4.0.0' } }),
+      'utf-8'
+    );
+    const cleanWebFile = path.join(tempA64, 'apps', 'web', 'src', 'index.ts');
+    fs.writeFileSync(
+      cleanWebFile,
+      [
+        "import express from 'express';",
+        'export function getHealth(req: { id: string }): string {',
+        '  if (!req || typeof req.id !== "string") throw new TypeError("invalid");',
+        '  try { return express ? req.id : ""; } catch (err) { throw err; }',
+        '}',
+      ].join('\n'),
+      'utf-8'
+    );
+
+    const compiledCliPath = path.join(BUILD_ROOT, 'src', 'cli.js');
+    const sarifPassPath = path.join(tempA64, 'a64-pass.sarif');
+    const passRun = spawnSync(process.execPath, [compiledCliPath, 'apps/web/src/index.ts'], {
+      cwd: tempA64,
+      encoding: 'utf-8',
+      env: {
+        ...process.env,
+        GEMINI_API_KEY: '',
+        GITHUB_TOKEN: '',
+        GITHUB_EVENT_PATH: '',
+        DEVGUARD_FAIL_ON_UNANALYZABLE: 'false',
+        DEVGUARD_SARIF_OUTPUT: sarifPassPath,
+      },
+    });
+    assert.equal(passRun.status, 0, `A6-4 fail_on_unanalyzable=false must exit 0, stderr: ${passRun.stderr}`);
+    const sarifPass = JSON.parse(fs.readFileSync(sarifPassPath, 'utf-8'));
+    const sarifPassStr = JSON.stringify(sarifPass);
+    assert.equal(sarifPassStr.includes('resolvedVia'), false, 'resolvedVia must never appear in SARIF (SPEC §6.2.9)');
+    const unparsedResults = (sarifPass.runs[0].results as Array<{
+      ruleId: string;
+      level: string;
+      properties?: { scoring?: boolean; reason?: string };
+      locations: Array<{ physicalLocation: { artifactLocation: { uri: string } } }>;
+    }>).filter((r) => r.ruleId === 'DG004-WS-UNPARSED');
+    assert.equal(unparsedResults.length, 2, 'Both unsupported YAML and external tsconfig extends must emit DG004-WS-UNPARSED');
+    assert.ok(unparsedResults.every((r) => r.level === 'warning' && r.properties?.scoring === false));
+    assert.ok(unparsedResults.some((r) => r.properties?.reason === 'yaml_unsupported_construct'));
+    assert.ok(unparsedResults.some((r) => r.properties?.reason === 'extends_external'));
+
+    const sarifFailPath = path.join(tempA64, 'a64-fail.sarif');
+    const failRun = spawnSync(process.execPath, [compiledCliPath, 'apps/web/src/index.ts'], {
+      cwd: tempA64,
+      encoding: 'utf-8',
+      env: {
+        ...process.env,
+        GEMINI_API_KEY: '',
+        GITHUB_TOKEN: '',
+        GITHUB_EVENT_PATH: '',
+        DEVGUARD_FAIL_ON_UNANALYZABLE: 'true',
+        DEVGUARD_SARIF_OUTPUT: sarifFailPath,
+      },
+    });
+    assert.equal(failRun.status, 1, 'A6-4 fail_on_unanalyzable=true must reject with exit code 1 when DG004-WS-UNPARSED exists');
+
+    // Verify PR comment + verdict gating on unparsedWorkspaceCount
+    const passVerdict = computeOverallGateVerdict(1, 95, 0, false, false, 0, 2);
+    assert.equal(passVerdict.auditStatus, 'PASS');
+    assert.equal(passVerdict.unanalyzableFailed, false);
+    const failVerdict = computeOverallGateVerdict(1, 95, 0, false, true, 0, 2);
+    assert.equal(failVerdict.auditStatus, 'FAIL');
+    assert.equal(failVerdict.unanalyzableFailed, true);
+
+    const a64CommentFail = buildPullRequestCommentMarkdown(
+      [
+        {
+          filePath: 'apps/web/src/index.ts',
+          security: 100,
+          correctness: 95,
+          maintainability: 90,
+          overall: 95,
+          passed: true,
+          fatalFlaws: [],
+          defenseInDepth: [],
+        },
+      ],
+      85,
+      'OFFLINE_AST',
+      {
+        analyzedCount: 1,
+        skippedFiles: [],
+        ignoredNonCodeCount: 0,
+        failOnUnanalyzable: true,
+        workspaceSummary: {
+          packageCount: 1,
+          sources: ['package.json'],
+          diagnostics: [
+            {
+              ruleId: 'DG004-WS-UNPARSED',
+              sourceFile: 'pnpm-workspace.yaml',
+              reason: 'yaml_unsupported_construct',
+              message: '[DG004-WS-UNPARSED] (yaml_unsupported_construct) Failed to parse pnpm-workspace.yaml',
+              scoring: false,
+            },
+          ],
+        },
+      }
+    );
+    assert.ok(a64CommentFail.includes('🚫 REJECTED (UNANALYZED FILES)'));
+    assert.ok(a64CommentFail.includes('### ⚠️ Warnings (non-scoring)'));
+    assert.ok(a64CommentFail.includes('DG004-WS-UNPARSED'));
+  } finally {
+    fs.rmSync(tempA64, { recursive: true, force: true });
+  }
+
+  // 3. Acceptance A6-5 + PR Summary: Base-branch globs enforcement, DG004-WS-NEW non-scoring, and undeclared workspace imports summary
+  const tempA65 = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-a65-'));
+  try {
+    const repoDir = path.join(tempA65, 'repo');
+    fs.mkdirSync(path.join(repoDir, 'packages', 'existing', 'src'), { recursive: true });
+    fs.mkdirSync(path.join(repoDir, 'packages', 'shared', 'src'), { recursive: true });
+    fs.writeFileSync(
+      path.join(repoDir, 'package.json'),
+      JSON.stringify({ name: 'a65-root', workspaces: ['packages/*'] }),
+      'utf-8'
+    );
+    fs.writeFileSync(
+      path.join(repoDir, 'pnpm-workspace.yaml'),
+      'packages:\n  - "packages/*"\n',
+      'utf-8'
+    );
+    fs.writeFileSync(
+      path.join(repoDir, 'tsconfig.json'),
+      JSON.stringify({ compilerOptions: { paths: { '@ui/*': ['packages/shared/src/*'] } } }),
+      'utf-8'
+    );
+    fs.writeFileSync(
+      path.join(repoDir, 'packages', 'existing', 'package.json'),
+      JSON.stringify({ name: '@corp/existing', dependencies: {} }),
+      'utf-8'
+    );
+    fs.writeFileSync(
+      path.join(repoDir, 'packages', 'shared', 'package.json'),
+      JSON.stringify({ name: '@corp/shared', dependencies: {} }),
+      'utf-8'
+    );
+    fs.writeFileSync(
+      path.join(repoDir, 'packages', 'existing', 'src', 'index.ts'),
+      'export const baseOk = 1;\n',
+      'utf-8'
+    );
+
+    const git = (args: string[]) => spawnSync('git', args, { cwd: repoDir, encoding: 'utf-8' });
+    assert.equal(git(['init', '-b', 'main']).status, 0);
+    git(['config', 'user.email', 'ci@devguard.local']);
+    git(['config', 'user.name', 'DevGuard Test']);
+    git(['add', '.']);
+    assert.equal(git(['commit', '-m', 'base commit']).status, 0);
+
+    // Simulate PR changes on working tree:
+    // (a) Add new package under base glob: packages/new-pkg ("@corp/new-ai-pkg")
+    fs.mkdirSync(path.join(repoDir, 'packages', 'new-pkg'), { recursive: true });
+    fs.writeFileSync(
+      path.join(repoDir, 'packages', 'new-pkg', 'package.json'),
+      JSON.stringify({ name: '@corp/new-ai-pkg', dependencies: {} }),
+      'utf-8'
+    );
+    // (b) Attempted PR bypass: modify package.json workspaces to add "sneaky/*" with sneaky/bypass package
+    fs.writeFileSync(
+      path.join(repoDir, 'package.json'),
+      JSON.stringify({ name: 'a65-root', workspaces: ['packages/*', 'sneaky/*'] }),
+      'utf-8'
+    );
+    fs.mkdirSync(path.join(repoDir, 'sneaky', 'bypass'), { recursive: true });
+    fs.writeFileSync(
+      path.join(repoDir, 'sneaky', 'bypass', 'package.json'),
+      JSON.stringify({ name: 'sneaky-bypass-pkg' }),
+      'utf-8'
+    );
+
+    // (c) Clean PR file importing undeclared base workspace (@corp/shared) + PR new workspace (@corp/new-ai-pkg)
+    const cleanPrRel = 'packages/existing/src/clean.ts';
+    fs.writeFileSync(
+      path.join(repoDir, cleanPrRel),
+      [
+        "import { a } from '@corp/shared';",
+        "import { b } from '@corp/new-ai-pkg';",
+        'export function combine(x: unknown): boolean {',
+        '  if (x === null) throw new Error("missing");',
+        '  try { return Boolean(a) && Boolean(b) && Boolean(x); } catch (err) { throw err; }',
+        '}',
+      ].join('\n'),
+      'utf-8'
+    );
+
+    // (d) Bypass PR file trying to import unauthorized sneaky-bypass-pkg
+    const bypassPrRel = 'packages/existing/src/bypass.ts';
+    fs.writeFileSync(
+      path.join(repoDir, bypassPrRel),
+      [
+        "import { hack } from 'sneaky-bypass-pkg';",
+        'export const run = () => hack();',
+      ].join('\n'),
+      'utf-8'
+    );
+
+    const baseAccessor = createGitRefWorkspaceFileAccessor(repoDir, 'main');
+    assert.ok(baseAccessor, 'Git base ref accessor must initialize cleanly on main');
+
+    const cleanClassif = classifyInScopeFiles([cleanPrRel], { cwd: repoDir, sourceMode: 'explicit' });
+    const cleanExec = await auditClassifiedFiles(cleanClassif, {
+      apiKey: '',
+      minScore: 85,
+      isFork: false,
+      verifiedAllowlist: {
+        rulesByPath: new Map(),
+        invalidAllowlistEntries: [],
+        allowlistModifiedInPr: false,
+        sourceMode: 'empty',
+        workspacesMode: 'auto',
+      },
+      cwd: repoDir,
+      baseFileAccessor: baseAccessor,
+    });
+
+    assert.equal(cleanExec.hasFindingFailure, false, 'Undeclared workspace and new PR workspace imports must not cause false positive DG004 errors');
+    assert.equal(cleanExec.summaries[0].passed, true);
+    assert.ok(cleanExec.workspaceContext);
+    assert.equal(cleanExec.workspaceContext.packagesByName.has('@corp/new-ai-pkg'), true);
+    assert.equal(cleanExec.workspaceContext.packagesByName.has('sneaky-bypass-pkg'), false, 'Unauthorized PR glob sneaky/* must be blocked by base-branch glob');
+    assert.equal(cleanExec.workspaceContext.undeclaredWorkspaceImportsCount, 2, 'Both @corp/shared and @corp/new-ai-pkg are undeclared workspace imports');
+
+    const newNotices = cleanExec.workspaceContext.diagnostics.filter((d) => d.ruleId === 'DG004-WS-NEW');
+    assert.equal(newNotices.length, 1, 'New PR workspace @corp/new-ai-pkg must emit DG004-WS-NEW');
+    assert.equal(newNotices[0].scoring, false);
+    assert.ok(newNotices[0].message.includes('@corp/new-ai-pkg'));
+
+    const prComment = buildPullRequestCommentMarkdown(cleanExec.summaries, 85, 'OFFLINE_AST', {
+      analyzedCount: 1,
+      skippedFiles: [],
+      ignoredNonCodeCount: 0,
+      workspaceSummary: {
+        packageCount: cleanExec.workspaceContext.packagesByName.size,
+        sources: cleanExec.workspaceContext.detectedSources,
+        undeclaredWorkspaceImportsCount: cleanExec.workspaceContext.undeclaredWorkspaceImportsCount,
+        diagnostics: cleanExec.workspaceContext.diagnostics,
+      },
+    });
+    assert.ok(
+      prComment.includes('- Workspaces detected: 3 (sources: package.json, pnpm-workspace.yaml, tsconfig.json)'),
+      `Expected workspaces summary line in PR comment:\n${prComment}`
+    );
+    assert.ok(
+      prComment.includes('- 2 impor workspace tanpa deklarasi'),
+      `Expected undeclared workspace imports line in PR comment:\n${prComment}`
+    );
+    assert.ok(prComment.includes('DG004-WS-NEW'));
+    assert.ok(prComment.includes('✅ PASSED (READY TO MERGE)'));
+
+    const sarifNewPath = path.join(tempA65, 'a65-new.sarif');
+    generateSarifReport(cleanExec.summaries, sarifNewPath, [], {
+      workspaceDiagnostics: cleanExec.workspaceContext.diagnostics,
+    });
+    const sarifNew = JSON.parse(fs.readFileSync(sarifNewPath, 'utf-8'));
+    assert.equal(JSON.stringify(sarifNew).includes('resolvedVia'), false);
+    const sarifWsNew = (sarifNew.runs[0].results as Array<{
+      ruleId: string;
+      properties?: { scoring?: boolean };
+    }>).filter((r) => r.ruleId === 'DG004-WS-NEW');
+    assert.equal(sarifWsNew.length, 1);
+    assert.equal(sarifWsNew[0].properties?.scoring, false);
+
+    // Check bypass attempt triggers real DG004 phantom dependency finding
+    const bypassClassif = classifyInScopeFiles([bypassPrRel], { cwd: repoDir, sourceMode: 'explicit' });
+    const bypassExec = await auditClassifiedFiles(bypassClassif, {
+      apiKey: '',
+      minScore: 85,
+      isFork: false,
+      verifiedAllowlist: {
+        rulesByPath: new Map(),
+        invalidAllowlistEntries: [],
+        allowlistModifiedInPr: false,
+        sourceMode: 'empty',
+        workspacesMode: 'auto',
+      },
+      cwd: repoDir,
+      baseFileAccessor: baseAccessor,
+    });
+    assert.equal(bypassExec.hasFindingFailure, true, 'Importing package from sneaky/* added only in PR must be caught by DG004');
+    assert.ok(
+      (bypassExec.summaries[0].inlineFindings ?? []).some(
+        (f) => f.ruleId === 'DG004' && f.message.includes('sneaky-bypass-pkg')
+      )
+    );
+  } finally {
+    fs.rmSync(tempA65, { recursive: true, force: true });
+  }
+
+  // 4. Acceptance A6-6: workspaces.mode: "off" preserves identical v1.3.0 behavior and SARIF byte parity
+  const tempA66 = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-a66-'));
+  try {
+    fs.mkdirSync(path.join(tempA66, 'packages', 'ui'), { recursive: true });
+    fs.mkdirSync(path.join(tempA66, 'apps', 'web', 'src'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tempA66, 'package.json'),
+      JSON.stringify({ name: 'a66-root', workspaces: ['packages/*', 'apps/*'] }),
+      'utf-8'
+    );
+    fs.writeFileSync(
+      path.join(tempA66, 'packages', 'ui', 'package.json'),
+      JSON.stringify({ name: '@a66/ui' }),
+      'utf-8'
+    );
+    fs.writeFileSync(
+      path.join(tempA66, 'apps', 'web', 'package.json'),
+      JSON.stringify({ name: '@a66/web', dependencies: {} }),
+      'utf-8'
+    );
+    const webFileAbs = path.join(tempA66, 'apps', 'web', 'src', 'index.ts');
+    const codeImportingWs = "import { Button } from '@a66/ui';\nexport const ui = Button;\n";
+    fs.writeFileSync(webFileAbs, codeImportingWs, 'utf-8');
+
+    const autoExec = await auditClassifiedFiles(
+      classifyInScopeFiles(['apps/web/src/index.ts'], { cwd: tempA66, sourceMode: 'explicit' }),
+      {
+        apiKey: '',
+        minScore: 85,
+        isFork: false,
+        verifiedAllowlist: {
+          rulesByPath: new Map(),
+          invalidAllowlistEntries: [],
+          allowlistModifiedInPr: false,
+          sourceMode: 'empty',
+          workspacesMode: 'auto',
+        },
+        cwd: tempA66,
+      }
+    );
+    assert.equal(autoExec.hasFindingFailure, false, 'mode=auto must resolve @a66/ui without DG004 failure');
+
+    const offExec = await auditClassifiedFiles(
+      classifyInScopeFiles(['apps/web/src/index.ts'], { cwd: tempA66, sourceMode: 'explicit' }),
+      {
+        apiKey: '',
+        minScore: 85,
+        isFork: false,
+        verifiedAllowlist: {
+          rulesByPath: new Map(),
+          invalidAllowlistEntries: [],
+          allowlistModifiedInPr: false,
+          sourceMode: 'empty',
+          workspacesMode: 'off',
+        },
+        cwd: tempA66,
+      }
+    );
+    assert.equal(offExec.hasFindingFailure, true, 'mode=off must flag @a66/ui identically to v1.3.0');
+    assert.equal(offExec.workspaceContext?.diagnostics.length, 0, 'mode=off must emit zero DG004-WS notices');
+
+    // Byte-for-byte SARIF parity check against v1.3.0 baseline (explicit empty declaredDependencies)
+    const sarifOffPath = path.join(tempA66, 'off.sarif');
+    const sarifV13Path = path.join(tempA66, 'v13.sarif');
+    generateSarifReport(offExec.summaries, sarifOffPath, [], {
+      workspaceDiagnostics: offExec.workspaceContext?.diagnostics,
+    });
+
+    const v13Report = analyzeCodeDeterministically(codeImportingWs, {
+      filePath: 'apps/web/src/index.ts',
+      declaredDependencies: [],
+      workspacesMode: 'off',
+    });
+    const v13Summary: FileAuditSummary = {
+      filePath: 'apps/web/src/index.ts',
+      security: v13Report.skor.security,
+      correctness: v13Report.skor.correctness,
+      maintainability: v13Report.skor.maintainability,
+      overall: v13Report.skor.totalScore,
+      passed: false,
+      fatalFlaws: [v13Report.temuanUtama.description],
+      defenseInDepth: v13Report.residualNotes || [],
+      inlineFindings: v13Report.inlineFindings,
+      layer2Status: 'Skipped: No API Key',
+    };
+    generateSarifReport([v13Summary], sarifV13Path);
+
+    assert.equal(
+      fs.readFileSync(sarifOffPath, 'utf-8'),
+      fs.readFileSync(sarifV13Path, 'utf-8'),
+      'A6-6: workspaces.mode=off SARIF must be byte-for-byte identical to v1.3.0 behavior'
+    );
+  } finally {
+    fs.rmSync(tempA66, { recursive: true, force: true });
+  }
+});
+
+test('Test 85: Stage 6.1.c Base Ref Unavailable Fail-Closed Isolation (Shallow Clone, Bad Ref, Fail-Safe No-Fallback to PR Workspaces)', async () => {
+  // Scenario (a): Base ref salah / tidak ada -> fail-closed accessor
+  const failClosedAccessor = resolveBaseWorkspaceFileAccessor(process.cwd(), {
+    baseRef: 'non-existent-base-branch-dg-test-404',
+    eventName: 'pull_request',
+  });
+  assert.ok(failClosedAccessor, 'Scenario (a): resolveBaseWorkspaceFileAccessor must return fail-closed accessor, not undefined');
+  assert.deepEqual(failClosedAccessor.listFiles?.(), []);
+  assert.equal(failClosedAccessor.fileExists('package.json'), false);
+  assert.equal(failClosedAccessor.readFile('package.json'), null);
+
+  const tempRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-test85-'));
+  try {
+    // Prepare PR working tree with malicious / newly declared workspace
+    fs.mkdirSync(path.join(tempRepo, 'sneaky-lib', 'src'), { recursive: true });
+    fs.mkdirSync(path.join(tempRepo, 'apps', 'web', 'src'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tempRepo, 'package.json'),
+      JSON.stringify({ name: 'test85-root', workspaces: ['sneaky-lib', 'apps/*'] }),
+      'utf-8'
+    );
+    fs.writeFileSync(
+      path.join(tempRepo, 'sneaky-lib', 'package.json'),
+      JSON.stringify({ name: '@sneaky/injected-pkg', version: '1.0.0', dependencies: {} }),
+      'utf-8'
+    );
+    fs.writeFileSync(
+      path.join(tempRepo, 'apps', 'web', 'src', 'main.ts'),
+      "import { foo } from '@sneaky/injected-pkg';\nexport const run = foo;\n",
+      'utf-8'
+    );
+
+    const baseAccessorA = resolveBaseWorkspaceFileAccessor(tempRepo, {
+      baseRef: 'non-existent-base-ref-404',
+      eventName: 'pull_request',
+    });
+    const classificationA = classifyInScopeFiles(['apps/web/src/main.ts'], { cwd: tempRepo, sourceMode: 'explicit' });
+    const auditResA = await auditClassifiedFiles(classificationA, {
+      apiKey: '',
+      minScore: 85,
+      isFork: false,
+      verifiedAllowlist: {
+        rulesByPath: new Map(),
+        invalidAllowlistEntries: [],
+        allowlistModifiedInPr: false,
+        sourceMode: 'empty',
+        workspacesMode: 'auto',
+      },
+      cwd: tempRepo,
+      baseFileAccessor: baseAccessorA,
+    });
+    assert.equal(auditResA.hasFindingFailure, true, 'Scenario (a): Importing PR workspace package must fail closed when base ref is missing');
+    assert.equal(auditResA.workspaceContext?.packagesByName.size, 0, 'Scenario (a): Workspace map must have 0 packages');
+    const dg004FindingsA = (auditResA.summaries[0].inlineFindings ?? []).filter((f) => f.ruleId === 'DG004');
+    assert.ok(dg004FindingsA.some((f) => f.message.includes('@sneaky/injected-pkg')), 'Scenario (a): DG004 must flag @sneaky/injected-pkg');
+    console.log('✔ Test 85(a): Missing/invalid base ref verified fail-closed (DG004 triggered, 0 packages admitted)');
+
+    // Scenario (b): Real shallow clone (git clone --depth=1 on PR branch without fetching origin/main)
+    const originDir = path.join(tempRepo, 'origin-repo');
+    const shallowDir = path.join(tempRepo, 'shallow-pr-clone');
+    fs.mkdirSync(path.join(originDir, 'apps', 'web', 'src'), { recursive: true });
+    fs.mkdirSync(path.join(originDir, 'sneaky-lib'), { recursive: true });
+    fs.writeFileSync(path.join(originDir, 'package.json'), JSON.stringify({ name: 'shallow-root' }), 'utf-8');
+    fs.writeFileSync(path.join(originDir, 'apps', 'web', 'src', 'index.ts'), 'export const ok = 1;\n', 'utf-8');
+    const runGitOrigin = (args: string[]) => spawnSync('git', args, { cwd: originDir, encoding: 'utf-8' });
+    assert.equal(runGitOrigin(['init', '-b', 'main']).status, 0);
+    runGitOrigin(['config', 'user.email', 'ci@devguard.local']);
+    runGitOrigin(['config', 'user.name', 'DevGuard Test']);
+    runGitOrigin(['add', '.']);
+    assert.equal(runGitOrigin(['commit', '-m', 'base main commit']).status, 0);
+
+    // Create PR branch on origin adding sneaky workspace & importing it
+    assert.equal(runGitOrigin(['checkout', '-b', 'pr-feature']).status, 0);
+    fs.writeFileSync(path.join(originDir, 'package.json'), JSON.stringify({ name: 'shallow-root', workspaces: ['sneaky-lib'] }), 'utf-8');
+    fs.writeFileSync(path.join(originDir, 'sneaky-lib', 'package.json'), JSON.stringify({ name: '@shallow/sneaky' }), 'utf-8');
+    fs.writeFileSync(path.join(originDir, 'apps', 'web', 'src', 'pr.ts'), "import { x } from '@shallow/sneaky';\nexport const v = x;\n", 'utf-8');
+    runGitOrigin(['add', '.']);
+    assert.equal(runGitOrigin(['commit', '-m', 'pr commit']).status, 0);
+
+    // Clone shallow (--depth=1 --single-branch -b pr-feature): origin/main is NOT present locally
+    const cloneRes = spawnSync(
+      'git',
+      ['clone', '--depth=1', '--single-branch', '-b', 'pr-feature', `file://${originDir.replace(/\\/g, '/')}`, shallowDir],
+      { encoding: 'utf-8' }
+    );
+    assert.equal(cloneRes.status, 0, `Shallow clone failed: ${cloneRes.stderr}`);
+    const checkOriginMain = spawnSync('git', ['rev-parse', '--verify', 'origin/main'], { cwd: shallowDir, encoding: 'utf-8' });
+    assert.notEqual(checkOriginMain.status, 0, 'Scenario (b): origin/main must NOT exist in single-branch depth-1 shallow clone');
+
+    const baseAccessorB = resolveBaseWorkspaceFileAccessor(shallowDir, {
+      baseRef: 'main',
+      eventName: 'pull_request',
+    });
+    assert.ok(baseAccessorB, 'Scenario (b): Must return fail-closed accessor rather than undefined');
+    const classifB = classifyInScopeFiles(['apps/web/src/pr.ts'], { cwd: shallowDir, sourceMode: 'explicit' });
+    const auditResB = await auditClassifiedFiles(classifB, {
+      apiKey: '',
+      minScore: 85,
+      isFork: false,
+      verifiedAllowlist: {
+        rulesByPath: new Map(),
+        invalidAllowlistEntries: [],
+        allowlistModifiedInPr: false,
+        sourceMode: 'empty',
+        workspacesMode: 'auto',
+      },
+      cwd: shallowDir,
+      baseFileAccessor: baseAccessorB,
+    });
+    assert.equal(auditResB.hasFindingFailure, true, 'Scenario (b): Shallow clone missing origin/main must fail closed with DG004');
+    assert.equal(auditResB.workspaceContext?.packagesByName.size, 0, 'Scenario (b): Shallow clone must admit 0 PR workspace packages');
+    assert.ok((auditResB.summaries[0].inlineFindings ?? []).some((f) => f.ruleId === 'DG004' && f.message.includes('@shallow/sneaky')));
+    console.log('✔ Test 85(b): Shallow clone (--depth=1) without origin/main verified fail-closed (DG004 triggered)');
+
+    // Scenario (c): Base branch exists (origin/main present), but base branch has NO workspace config at all
+    const noWsBaseDir = path.join(tempRepo, 'no-ws-base-repo');
+    fs.mkdirSync(path.join(noWsBaseDir, 'apps', 'web', 'src'), { recursive: true });
+    fs.writeFileSync(path.join(noWsBaseDir, 'package.json'), JSON.stringify({ name: 'plain-repo', dependencies: { express: '^4.0.0' } }), 'utf-8');
+    fs.writeFileSync(path.join(noWsBaseDir, 'apps', 'web', 'src', 'index.ts'), 'export const a = 1;\n', 'utf-8');
+    const runGitNoWs = (args: string[]) => spawnSync('git', args, { cwd: noWsBaseDir, encoding: 'utf-8' });
+    assert.equal(runGitNoWs(['init', '-b', 'main']).status, 0);
+    runGitNoWs(['config', 'user.email', 'ci@devguard.local']);
+    runGitNoWs(['config', 'user.name', 'DevGuard Test']);
+    runGitNoWs(['add', '.']);
+    assert.equal(runGitNoWs(['commit', '-m', 'base commit without workspaces']).status, 0);
+    assert.equal(runGitNoWs(['update-ref', 'refs/remotes/origin/main', 'HEAD']).status, 0);
+
+    // PR working tree attempts to introduce workspaces & pnpm-workspace.yaml
+    fs.writeFileSync(path.join(noWsBaseDir, 'package.json'), JSON.stringify({ name: 'plain-repo', workspaces: ['packages/*'] }), 'utf-8');
+    fs.writeFileSync(path.join(noWsBaseDir, 'pnpm-workspace.yaml'), 'packages:\n  - "packages/*"\n', 'utf-8');
+    fs.mkdirSync(path.join(noWsBaseDir, 'packages', 'pr-ws'), { recursive: true });
+    fs.writeFileSync(path.join(noWsBaseDir, 'packages', 'pr-ws', 'package.json'), JSON.stringify({ name: '@pr/added-ws' }), 'utf-8');
+    fs.writeFileSync(path.join(noWsBaseDir, 'apps', 'web', 'src', 'use-pr-ws.ts'), "import { p } from '@pr/added-ws';\nexport const u = p;\n", 'utf-8');
+
+    const baseAccessorC = resolveBaseWorkspaceFileAccessor(noWsBaseDir, {
+      baseRef: 'main',
+      eventName: 'pull_request',
+    });
+    assert.ok(baseAccessorC);
+    const classifC = classifyInScopeFiles(['apps/web/src/use-pr-ws.ts'], { cwd: noWsBaseDir, sourceMode: 'explicit' });
+    const auditResC = await auditClassifiedFiles(classifC, {
+      apiKey: '',
+      minScore: 85,
+      isFork: false,
+      verifiedAllowlist: {
+        rulesByPath: new Map(),
+        invalidAllowlistEntries: [],
+        allowlistModifiedInPr: false,
+        sourceMode: 'empty',
+        workspacesMode: 'auto',
+      },
+      cwd: noWsBaseDir,
+      baseFileAccessor: baseAccessorC,
+    });
+    assert.equal(auditResC.hasFindingFailure, true, 'Scenario (c): Base branch with 0 workspace globs must block PR-introduced workspaces');
+    assert.equal(auditResC.workspaceContext?.packagesByName.size, 0);
+    assert.ok((auditResC.summaries[0].inlineFindings ?? []).some((f) => f.ruleId === 'DG004' && f.message.includes('@pr/added-ws')));
+    console.log('✔ Test 85(c): Base branch without workspace config verified fail-closed against PR-added workspaces');
+
+    // Allowlist PR modification fail-closed check
+    const allowlistMissingBase = loadVerifiedAllowlist({
+      baseRef: 'missing-base-branch',
+      eventName: 'pull_request',
+      isCi: true,
+      readBaseFile: () => null,
+      readWorkingFile: () => JSON.stringify({ ignoreRulesByPath: { 'apps/*': ['DG004'] } }),
+    });
+    assert.equal(allowlistMissingBase.allowlistModifiedInPr, true);
+    assert.equal(allowlistMissingBase.sourceMode, 'base-pr');
+    assert.equal(allowlistMissingBase.rulesByPath.size, 0, 'Missing base ref allowlist must fail-closed to 0 active rules');
+  } finally {
+    fs.rmSync(tempRepo, { recursive: true, force: true });
+  }
 });
 
 

@@ -37,11 +37,20 @@ import {
 import {
   CRITICAL_FLOW_IDENTIFIERS,
   POPULAR_NPM_PACKAGES,
+  buildWorkspaceContext,
   detectDynamicModuleSpecifiers,
   detectHallucinatedPackages,
   detectNonAtomicBalanceMutations,
   detectSwallowedExceptions,
+  extractPackageManifestData,
+  findNearestPackageManifest,
   matchesCriticalFlow,
+  resolveWorkspaceImportSpecifier,
+  type ResolutionSource,
+  type WorkspaceContext,
+  type WorkspaceDiagnosticNotice,
+  type WorkspaceFileAccessor,
+  type WorkspaceResolutionResult,
 } from './rules/packageAndExceptionRules.ts';
 import {
   DG007_PROVIDER_PATTERNS,
@@ -64,9 +73,14 @@ export type {
   LineFinding,
   ParsedSuppression,
   PrepareLlmOptions,
+  ResolutionSource,
   SpanMap,
   SpanMapSeg,
   VirtualViewResult,
+  WorkspaceContext,
+  WorkspaceDiagnosticNotice,
+  WorkspaceFileAccessor,
+  WorkspaceResolutionResult,
 };
 export {
   CRITICAL_FLOW_IDENTIFIERS,
@@ -82,6 +96,7 @@ export {
   analyzeLexicalStructure,
   applyTextEditsWithSpanMap,
   buildVirtualView,
+  buildWorkspaceContext,
   calculateShannonEntropy,
   composeSpanMaps,
   createIdentitySpanMap,
@@ -92,6 +107,8 @@ export {
   detectMissingTimeoutsAndLoops,
   detectNonAtomicBalanceMutations,
   detectSwallowedExceptions,
+  extractPackageManifestData,
+  findNearestPackageManifest,
   findResidualSecretLikeTokens,
   isHighPriorityFoldEdit,
   isRangeStrictlyInCodeRegion,
@@ -100,6 +117,7 @@ export {
   matchesCriticalFlow,
   prepareRedactedCodeForLlm,
   redactSecretsPreservingLayout,
+  resolveWorkspaceImportSpecifier,
   toOrigLineAndCol,
   toOrigSpan,
   verifySpanMapInvariants,
@@ -175,6 +193,8 @@ export interface ParsedDevGuardReport {
   suppressions?: ParsedSuppression[];
   dynScopeUncertain?: number;
   virtualView?: VirtualViewResult;
+  workspaceDiagnostics?: WorkspaceDiagnosticNotice[];
+  undeclaredWorkspaceImportsCount?: number;
 }
 
 export type AuditReport = ParsedDevGuardReport;
@@ -1431,8 +1451,11 @@ export function analyzeCodeDeterministically(
 
   // 3. v1.2.0 Deterministic AI-Slop & Vibe-Coding Detectors (DG004, DG004-DYN-01/02, DG005, DG006, DG008)
   let dynScopeUncertain = 0;
+  let activeWsContext: WorkspaceContext | undefined = options?.workspaceContext;
   if (!isPython) {
-    detectHallucinatedPackages(execLines, maskedLines, options, findings, inlineFindings);
+    activeWsContext =
+      detectHallucinatedPackages(execLines, maskedLines, options, findings, inlineFindings, false) ??
+      activeWsContext;
     if (virtualView.editsApplied === 0) {
       ({ dynScopeUncertain } = detectDynamicModuleSpecifiers(
         lexical.maskedCode,
@@ -1555,7 +1578,7 @@ export function analyzeCodeDeterministically(
       const vMaskedLines = vLex.maskedCode.split('\n');
 
       if (/\b(?:import|require|from)\b/.test(vLex.maskedCode)) {
-        detectHallucinatedPackages(vExecLines, vMaskedLines, options, vFindings, vInlineFindings);
+        detectHallucinatedPackages(vExecLines, vMaskedLines, options, vFindings, vInlineFindings, true);
       }
       if (/\b(?:try|catch)\b/.test(vLex.maskedCode)) {
         detectSwallowedExceptions(virtualView.virtualCode, vFindings, vInlineFindings, vLex.maskedCode);
@@ -1960,5 +1983,13 @@ ${tesMarkdown}`;
     suppressions: activeSuppressions.length > 0 ? activeSuppressions : undefined,
     dynScopeUncertain: dynScopeUncertain > 0 ? dynScopeUncertain : undefined,
     virtualView,
+    workspaceDiagnostics:
+      activeWsContext?.mode !== 'off' && activeWsContext?.diagnostics?.length
+        ? [...activeWsContext.diagnostics]
+        : undefined,
+    undeclaredWorkspaceImportsCount:
+      activeWsContext && activeWsContext.mode !== 'off' && activeWsContext.undeclaredWorkspaceImportsCount > 0
+        ? activeWsContext.undeclaredWorkspaceImportsCount
+        : undefined,
   };
 }
