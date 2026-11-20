@@ -26,6 +26,10 @@ import {
   classifyInScopeFiles,
   collectAnalysisFailures,
   computeOverallGateVerdict,
+  createFsWorkspaceFileAccessor,
+  createEmptyFailClosedWorkspaceAccessor,
+  createGitRefWorkspaceFileAccessor,
+  resolveBaseWorkspaceFileAccessor,
   discoverInScopeFiles,
   discoverWorkspaceFiles,
   evaluateCodeHybrid,
@@ -81,6 +85,28 @@ import {
 } from '../src/devguardAnalyzer.js';
 import { CORPUS_CASES } from './corpus/cases.js';
 import { MAX_FOLD_EDITS } from '../src/devguardAnalyzer.js';
+import {
+  MAX_CONFIG_FILE_SIZE,
+  createMulberry32,
+  matchGlobPattern,
+  matchesWorkspaceGlobList,
+  parseJsonc,
+  parsePnpmWorkspaceYaml,
+  parseTsconfig,
+  type ParseResult,
+  type TsconfigData,
+  type WorkspaceBailoutReason,
+} from '../src/rules/workspaceParser.js';
+import {
+  buildWorkspaceContext,
+  findNearestPackageManifest,
+  resolveWorkspaceImportSpecifier,
+  extractPackageManifestData,
+  getBasePackageName as getWorkspaceBasePackageName,
+  type WorkspaceContext,
+  type WorkspaceFileAccessor,
+  type WorkspaceResolutionResult,
+} from '../src/rules/workspaceResolver.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -6258,6 +6284,1673 @@ test('Test 81: Audit C1-C4 Regression Suite (Bracket Priority, Unmutated Retry C
     'Benign async exec(cmd: string): Promise<void> { and public exec() {} declarations must not trigger DG001'
   );
 });
+
+test('Test 82: Stage 6.1.a Workspace Tokenizer, Subset YAML, Glob, tsconfig, & Fuzz Suite (A6-8, A6-11)', () => {
+  // 1. JSONC Parser
+  const validJsonc = [
+    '{',
+    '  // Top-level comment',
+    '  "paths": {',
+    '    "#internal/*": ["src/internal/*"],',
+    '    "utils/*": ["src/utils/*"],',
+    '  },',
+    '  /* Multi-line comment */',
+    '  "url": "https://api.domain.com/v1/*not-comment*/",',
+    '  "items": [1, 2, 3,],',
+    '}',
+  ].join('\r\n');
+  const resJsonc = parseJsonc(validJsonc);
+  assert.equal(resJsonc.success, true);
+  if (resJsonc.success) {
+    const data = resJsonc.data as any;
+    assert.deepEqual(data.paths['#internal/*'], ['src/internal/*']);
+    assert.equal(data.url, 'https://api.domain.com/v1/*not-comment*/');
+    assert.deepEqual(data.items, [1, 2, 3]);
+  }
+
+  // BOM support
+  const bomJsonc = parseJsonc('\uFEFF{"bom": true}');
+  assert.equal(bomJsonc.success, true);
+
+  // Rejects unclosed block comment (jsonc_syntax)
+  assert.equal(parseJsonc('{"a": 1 /* unclosed').success, false);
+  assert.equal((parseJsonc('{"a": 1 /* unclosed') as any).reason, 'jsonc_syntax');
+
+  // Rejects unclosed string literal (jsonc_syntax)
+  assert.equal(parseJsonc('{"a": "unclosed').success, false);
+  assert.equal((parseJsonc('{"a": "unclosed') as any).reason, 'jsonc_syntax');
+
+  // Rejects # outside string (jsonc_syntax)
+  assert.equal(parseJsonc('{"a": 1 # comment\n}').success, false);
+  assert.equal((parseJsonc('{"a": 1 # comment\n}') as any).reason, 'jsonc_syntax');
+
+  // Rejects oversized input (size_limit)
+  const oversizedJsonc = '{"data": "' + 'x'.repeat(MAX_CONFIG_FILE_SIZE + 10) + '"}';
+  const resOver = parseJsonc(oversizedJsonc);
+  assert.equal(resOver.success, false);
+  assert.equal((resOver as any).reason, 'size_limit');
+
+  // 2. Subset YAML Parser (pnpm-workspace.yaml)
+  const validYaml = [
+    '# Top-level comment',
+    'packages:',
+    '  - "packages/*"',
+    '  - \'apps/**\'',
+    '  - shared/core',
+    '  - "!packages/legacy"',
+    '  - "packages/#hash"',
+  ].join('\n');
+  const resYaml = parsePnpmWorkspaceYaml(validYaml);
+  assert.equal(resYaml.success, true);
+  if (resYaml.success) {
+    assert.deepEqual(resYaml.data.packages, [
+      'packages/*',
+      'apps/**',
+      'shared/core',
+      '!packages/legacy',
+      'packages/#hash',
+    ]);
+  }
+
+  // Empty or comment-only YAML returns empty array
+  const emptyYaml = parsePnpmWorkspaceYaml('# only comment\n\n');
+  assert.equal(emptyYaml.success, true);
+  if (emptyYaml.success) assert.deepEqual(emptyYaml.data.packages, []);
+
+  // Rejects flow sequence (yaml_unsupported_construct)
+  const flowYaml = parsePnpmWorkspaceYaml('packages: ["pkg-a", "pkg-b"]');
+  assert.equal(flowYaml.success, false);
+  assert.equal((flowYaml as any).reason, 'yaml_unsupported_construct');
+
+  // Rejects flow mapping (yaml_unsupported_construct)
+  const flowMapYaml = parsePnpmWorkspaceYaml('packages:\n  - { name: "pkg" }');
+  assert.equal(flowMapYaml.success, false);
+  assert.equal((flowMapYaml as any).reason, 'yaml_unsupported_construct');
+
+  // Rejects tabs in indentation or content (yaml_unsupported_construct)
+  const tabYaml = parsePnpmWorkspaceYaml('packages:\n\t- packages/*');
+  assert.equal(tabYaml.success, false);
+  assert.equal((tabYaml as any).reason, 'yaml_unsupported_construct');
+
+  // Rejects multi-document (yaml_unsupported_construct)
+  const multiDocYaml = parsePnpmWorkspaceYaml('---\npackages:\n  - packages/*');
+  assert.equal(multiDocYaml.success, false);
+  assert.equal((multiDocYaml as any).reason, 'yaml_unsupported_construct');
+
+  // Rejects block scalars (yaml_unsupported_construct)
+  const blockScalarYaml = parsePnpmWorkspaceYaml('packages: |\n  - packages/*');
+  assert.equal(blockScalarYaml.success, false);
+  assert.equal((blockScalarYaml as any).reason, 'yaml_unsupported_construct');
+
+  // Rejects anchors and aliases (yaml_unsupported_construct)
+  const anchorYaml = parsePnpmWorkspaceYaml('packages: &pkgs\n  - packages/*');
+  assert.equal(anchorYaml.success, false);
+  assert.equal((anchorYaml as any).reason, 'yaml_unsupported_construct');
+
+  const aliasYaml = parsePnpmWorkspaceYaml('packages:\n  - *pkgs');
+  assert.equal(aliasYaml.success, false);
+  assert.equal((aliasYaml as any).reason, 'yaml_unsupported_construct');
+
+  // Rejects unexpected top-level keys (yaml_unsupported_construct)
+  const otherKeyYaml = parsePnpmWorkspaceYaml('catalog:\n  react: 18.0.0');
+  assert.equal(otherKeyYaml.success, false);
+  assert.equal((otherKeyYaml as any).reason, 'yaml_unsupported_construct');
+
+  // Rejects oversized YAML (size_limit)
+  const oversizedYaml = 'packages:\n  - ' + 'x'.repeat(MAX_CONFIG_FILE_SIZE + 10);
+  const resOverYaml = parsePnpmWorkspaceYaml(oversizedYaml);
+  assert.equal(resOverYaml.success, false);
+  assert.equal((resOverYaml as any).reason, 'size_limit');
+
+  // 3. Glob Matcher (matchGlobPattern & matchesWorkspaceGlobList)
+  assert.equal(matchGlobPattern('packages/*', 'packages/ui'), true);
+  assert.equal(matchGlobPattern('packages/*', 'packages/ui/deep'), false);
+  assert.equal(matchGlobPattern('apps/**', 'apps/web'), true);
+  assert.equal(matchGlobPattern('apps/**', 'apps/web/admin'), true);
+  assert.equal(matchGlobPattern('tools/cli', 'tools/cli'), true);
+  assert.equal(matchGlobPattern('tools/cli', 'tools/ui'), false);
+  assert.equal(matchGlobPattern('*', 'packages'), true);
+  assert.equal(matchGlobPattern('*', 'packages/ui'), false);
+  assert.equal(matchGlobPattern('**', 'any/deep/path'), true);
+
+  const globList = ['packages/*', 'apps/**', '!packages/legacy'];
+  assert.equal(matchesWorkspaceGlobList(globList, 'packages/ui'), true);
+  assert.equal(matchesWorkspaceGlobList(globList, 'apps/web/admin'), true);
+  assert.equal(matchesWorkspaceGlobList(globList, 'packages/legacy'), false);
+  assert.equal(matchesWorkspaceGlobList(globList, 'other/dir'), false);
+
+  // 4. tsconfig Parser (parseTsconfig)
+  const directTsconfig = parseTsconfig(
+    '{"compilerOptions": {"baseUrl": ".", "paths": {"@/*": ["src/*"]}}}',
+    '/repo/tsconfig.json'
+  );
+  assert.equal(directTsconfig.success, true);
+  if (directTsconfig.success) {
+    assert.equal(directTsconfig.data.baseUrl, '.');
+    assert.deepEqual(directTsconfig.data.paths?.['@/*'], ['src/*']);
+  }
+
+  // Rejects external npm package extends (extends_external)
+  const extExternal = parseTsconfig(
+    '{"extends": "@tsconfig/node18/tsconfig.json"}',
+    '/repo/tsconfig.json'
+  );
+  assert.equal(extExternal.success, false);
+  assert.equal((extExternal as any).reason, 'extends_external');
+
+  const extExternalBare = parseTsconfig(
+    '{"extends": "base-config"}',
+    '/repo/tsconfig.json'
+  );
+  assert.equal(extExternalBare.success, false);
+  assert.equal((extExternalBare as any).reason, 'extends_external');
+
+  // Extends resolution with relative path & property merging
+  const mockFiles: Record<string, string> = {
+    [path.resolve('/repo/base.json')]: JSON.stringify({
+      compilerOptions: { baseUrl: './src', paths: { 'common/*': ['shared/*'], '@/*': ['base/*'] } },
+    }),
+    [path.resolve('/repo/cycle-a.json')]: JSON.stringify({ extends: './cycle-b.json' }),
+    [path.resolve('/repo/cycle-b.json')]: JSON.stringify({ extends: './cycle-a.json' }),
+    [path.resolve('/repo/depth-1.json')]: JSON.stringify({ extends: './depth-2.json' }),
+    [path.resolve('/repo/depth-2.json')]: JSON.stringify({ extends: './depth-3.json' }),
+    [path.resolve('/repo/depth-3.json')]: JSON.stringify({ extends: './depth-4.json' }),
+    [path.resolve('/repo/depth-4.json')]: JSON.stringify({ compilerOptions: {} }),
+  };
+  const mockAccessor = (p: string) => mockFiles[path.resolve(p)] ?? null;
+
+  const childTsconfig = parseTsconfig(
+    '{"extends": "./base.json", "compilerOptions": {"paths": {"@/*": ["override/*"]}}}',
+    path.resolve('/repo/tsconfig.json'),
+    mockAccessor
+  );
+  assert.equal(childTsconfig.success, true);
+  if (childTsconfig.success) {
+    assert.equal(childTsconfig.data.baseUrl, './src');
+    assert.deepEqual(childTsconfig.data.paths?.['common/*'], ['shared/*']);
+    assert.deepEqual(childTsconfig.data.paths?.['@/*'], ['override/*']);
+  }
+
+  // Circular extends detection (extends_cycle)
+  const cycleTsconfig = parseTsconfig(
+    '{"extends": "./cycle-b.json"}',
+    path.resolve('/repo/cycle-a.json'),
+    mockAccessor
+  );
+  assert.equal(cycleTsconfig.success, false);
+  assert.equal((cycleTsconfig as any).reason, 'extends_cycle');
+  assert.ok((cycleTsconfig as any).error.includes('Circular'));
+
+  // Self-cycle detection
+  const selfCycleTsconfig = parseTsconfig(
+    '{"extends": "./self.json"}',
+    path.resolve('/repo/self.json'),
+    mockAccessor
+  );
+  assert.equal(selfCycleTsconfig.success, false);
+  assert.equal((selfCycleTsconfig as any).reason, 'extends_cycle');
+  assert.ok((selfCycleTsconfig as any).error.includes('Circular'));
+
+  // Excessive depth > 3 detection (extends_cycle)
+  const deepTsconfig = parseTsconfig(
+    '{"extends": "./depth-1.json"}',
+    path.resolve('/repo/root-deep.json'),
+    mockAccessor
+  );
+  assert.equal(deepTsconfig.success, false);
+  assert.equal((deepTsconfig as any).reason, 'extends_cycle');
+  assert.ok((deepTsconfig as any).error.includes('exceeded maximum'));
+
+  // Valid chain up to depth 3 succeeds without being falsely flagged as cycle
+  const mockChainFiles: Record<string, string> = {
+    [path.resolve('/repo/chain-0.json')]: JSON.stringify({ extends: './chain-1.json', compilerOptions: { paths: { 'a/*': ['a/*'] } } }),
+    [path.resolve('/repo/chain-1.json')]: JSON.stringify({ extends: './chain-2.json', compilerOptions: { paths: { 'b/*': ['b/*'] } } }),
+    [path.resolve('/repo/chain-2.json')]: JSON.stringify({ extends: './chain-3.json', compilerOptions: { paths: { 'c/*': ['c/*'] } } }),
+    [path.resolve('/repo/chain-3.json')]: JSON.stringify({ compilerOptions: { baseUrl: './src', paths: { 'd/*': ['d/*'] } } }),
+  };
+  const mockChainAccessor = (p: string) => mockChainFiles[path.resolve(p)] ?? null;
+  const validChain = parseTsconfig(
+    mockChainFiles[path.resolve('/repo/chain-0.json')],
+    path.resolve('/repo/chain-0.json'),
+    mockChainAccessor
+  );
+  assert.equal(validChain.success, true);
+  if (validChain.success) {
+    assert.equal(validChain.data.baseUrl, './src');
+    assert.deepEqual(validChain.data.paths?.['a/*'], ['a/*']);
+    assert.deepEqual(validChain.data.paths?.['b/*'], ['b/*']);
+    assert.deepEqual(validChain.data.paths?.['c/*'], ['c/*']);
+    assert.deepEqual(validChain.data.paths?.['d/*'], ['d/*']);
+  }
+
+  // 5. Acceptance A6-8 Fuzz Suite: 10,000 Iterations per Parser
+  const fuzzSeed = process.env.DEVGUARD_FUZZ_SEED
+    ? parseInt(process.env.DEVGUARD_FUZZ_SEED, 10)
+    : 0x1337beef;
+  console.log(`\n=== Acceptance A6-8 Fuzz Test Suite (Seed: 0x${fuzzSeed.toString(16)}) ===`);
+
+  const prng = createMulberry32(fuzzSeed);
+
+  const FUZZ_SEEDS_JSONC = [
+    '{"key": "val // not comment", "#internal": "val # not comment"}',
+    '{\r\n  "a": 1,\r\n  "b": [2, 3,],\r\n}',
+    '\uFEFF{"bom": true}',
+    '{"url": "https://api.devguard.io/v1", "regex": "/*not block*/"}',
+    '{"a": 1, /* comment */ "b": 2,}',
+    '{"a": 1 # bad comment}',
+    '/* unclosed comment',
+    '"unclosed string',
+    '',
+    '   \t\r\n',
+    '{"overflow": "' + 'x'.repeat(MAX_CONFIG_FILE_SIZE + 20) + '"}',
+    '{"nested": {"a": [1, {"b": true,}]}}',
+  ];
+
+  const FUZZ_SEEDS_YAML = [
+    'packages:\n  - "packages/*"\n  - \'apps/**\'\n  - shared/core\n  - "!packages/legacy"',
+    '# comment\npackages:\n  - "packages/#hash"\n  - "url://foo"',
+    'packages: ["flow", "sequence"]',
+    'packages:\n  - &anchor pkg1\n  - *anchor',
+    'packages: |\n  - block\n  - scalar',
+    'packages: >\n  folded',
+    'packages:\n\t- tab_indented',
+    '---\npackages:\n  - multidoc',
+    'other_key:\n  foo: bar',
+    '',
+    '# only comments\n# second comment',
+    'packages:\n  - ' + 'x'.repeat(MAX_CONFIG_FILE_SIZE + 20),
+  ];
+
+  const FUZZ_SEEDS_GLOB = [
+    ['packages/*', 'packages/ui'],
+    ['packages/*', 'packages/ui/deep'],
+    ['apps/**', 'apps/web/admin'],
+    ['!packages/legacy/**', 'packages/legacy/old'],
+    ['**/test/**', 'core/test/runner'],
+    ['*', 'packages'],
+    ['**', 'deep/nested/path'],
+    ['', ''],
+    ['[a-z]+', 'regex-literal'],
+    ['packages/???/*', 'packages/abc/pkg'],
+  ];
+
+  const fuzzSuiteStart = Date.now();
+
+  // 5.1 JSONC Fuzz: 10,000 iterations
+  const jsoncStart = Date.now();
+  for (let i = 0; i < 10000; i++) {
+    let input = FUZZ_SEEDS_JSONC[i % FUZZ_SEEDS_JSONC.length];
+    if (prng() < 0.7) {
+      const chars = '{"}[]:,/*#\\ \t\r\n\uFEFFabc123';
+      const mutLen = Math.floor(prng() * 50);
+      let mutStr = '';
+      for (let j = 0; j < mutLen; j++) mutStr += chars[Math.floor(prng() * chars.length)];
+      input = input + mutStr;
+    }
+    const t0 = Date.now();
+    const res1 = parseJsonc(input);
+    const elapsed = Date.now() - t0;
+    assert.ok(elapsed <= 100, `JSONC input ${i} took ${elapsed}ms > 100ms invariant`);
+
+    const res2 = parseJsonc(input);
+    assert.equal(res1.success, res2.success, `JSONC nondeterministic at iteration ${i}`);
+    if (!res1.success && !res2.success) {
+      assert.equal(res1.reason, res2.reason, `JSONC reason nondeterministic at iteration ${i}`);
+    }
+  }
+  const jsoncDuration = Date.now() - jsoncStart;
+  console.log(`✔ JSONC Parser: 10,000 iterations verified in ${jsoncDuration} ms (max time per input <= 100 ms)`);
+
+  // 5.2 YAML Fuzz: 10,000 iterations
+  const yamlStart = Date.now();
+  for (let i = 0; i < 10000; i++) {
+    let input = FUZZ_SEEDS_YAML[i % FUZZ_SEEDS_YAML.length];
+    if (prng() < 0.7) {
+      const chars = 'packages:- \'\"[]{}|>&*\t\r\n#abc123/!\\';
+      const mutLen = Math.floor(prng() * 50);
+      let mutStr = '';
+      for (let j = 0; j < mutLen; j++) mutStr += chars[Math.floor(prng() * chars.length)];
+      input = input + mutStr;
+    }
+    const t0 = Date.now();
+    const res1 = parsePnpmWorkspaceYaml(input);
+    const elapsed = Date.now() - t0;
+    assert.ok(elapsed <= 100, `YAML input ${i} took ${elapsed}ms > 100ms invariant`);
+
+    const res2 = parsePnpmWorkspaceYaml(input);
+    assert.equal(res1.success, res2.success, `YAML nondeterministic at iteration ${i}`);
+    if (!res1.success && !res2.success) {
+      assert.equal(res1.reason, res2.reason, `YAML reason nondeterministic at iteration ${i}`);
+    }
+  }
+  const yamlDuration = Date.now() - yamlStart;
+  console.log(`✔ Subset YAML Parser: 10,000 iterations verified in ${yamlDuration} ms (max time per input <= 100 ms)`);
+
+  // 5.3 Glob Fuzz: 10,000 iterations
+  const globStart = Date.now();
+  for (let i = 0; i < 10000; i++) {
+    const pair = FUZZ_SEEDS_GLOB[i % FUZZ_SEEDS_GLOB.length];
+    let pat = pair[0];
+    let target = pair[1];
+    if (prng() < 0.7) {
+      const chars = '*/!abc.-_';
+      const len1 = Math.floor(prng() * 10);
+      for (let j = 0; j < len1; j++) pat += chars[Math.floor(prng() * chars.length)];
+      const len2 = Math.floor(prng() * 10);
+      for (let j = 0; j < len2; j++) target += chars[Math.floor(prng() * chars.length)];
+    }
+    const t0 = Date.now();
+    const res1 = matchesWorkspaceGlobList([pat], target);
+    const elapsed = Date.now() - t0;
+    assert.ok(elapsed <= 100, `Glob input ${i} took ${elapsed}ms > 100ms invariant`);
+
+    const res2 = matchesWorkspaceGlobList([pat], target);
+    assert.equal(res1, res2, `Glob nondeterministic at iteration ${i}`);
+  }
+  const globDuration = Date.now() - globStart;
+  console.log(`✔ Workspace Glob Matcher: 10,000 iterations verified in ${globDuration} ms (max time per input <= 100 ms)`);
+
+  const totalFuzzDuration = Date.now() - fuzzSuiteStart;
+  console.log(`✔ Total A6-8 Fuzz Suite: 30,000 iterations completed in ${totalFuzzDuration} ms (seed: 0x${fuzzSeed.toString(16)})`);
+});
+
+test('Test 83: Stage 6.1.b Workspace Resolver, Resolution Order, Anti-Sibling Splicing & Fail-Closed (SPEC §6.2, A6-9, A6-10, A6-12)', () => {
+  // Mock file accessor simulating a realistic monorepo
+  const mockRepoFiles: Record<string, string> = {
+    'package.json': JSON.stringify({
+      name: 'monorepo-root',
+      workspaces: ['packages/*', 'apps/*', '!apps/standalone'],
+      dependencies: {
+        react: '^18.2.0',
+        'react-dom': '^18.2.0',
+        shared: 'npm:real-shared-pkg@^1.0.0',
+        'scoped-alias': 'npm:@scope/real-scoped@^2.0.0',
+      },
+      imports: {
+        '#root-util': './src/util.js',
+        '#internal/*': './src/internal/*.js',
+      },
+    }),
+    'tsconfig.json': JSON.stringify({
+      compilerOptions: {
+        baseUrl: '.',
+        paths: {
+          '@alias/*': ['shared/alias/*'],
+          'exact-alias': ['shared/exact.js'],
+          '*': ['./types/*'],
+        },
+      },
+    }),
+    'internal-lib/baseUtil.ts': 'export const baseUtil = 1;\n',
+    'packages/package.json': JSON.stringify({
+      name: 'intermediate-ancestor',
+      dependencies: {
+        'intermediate-dep': '^1.0.0',
+      },
+    }),
+    'packages/ui/package.json': JSON.stringify({
+      name: '@monorepo/ui',
+      dependencies: {
+        react: '^18.0.0', // also in root
+        lodash: '^4.17.21',
+        chalk: '^5.0.0',
+      },
+      imports: {
+        '#ui-sub': './src/sub.js',
+      },
+    }),
+    'packages/core/package.json': JSON.stringify({
+      name: '@monorepo/core',
+      dependencies: {
+        axios: '^1.4.0',
+      },
+    }),
+    'packages/nameless/package.json': JSON.stringify({
+      version: '0.0.0',
+      dependencies: {
+        'nameless-dep': '^1.0.0',
+      },
+    }),
+    'apps/web/package.json': JSON.stringify({
+      name: '@monorepo/web',
+      dependencies: {
+        next: '^14.0.0',
+        'ws-alias': 'workspace:@monorepo/core@*',
+      },
+    }),
+    'apps/standalone/package.json': JSON.stringify({
+      name: 'standalone-pkg',
+      dependencies: {},
+    }),
+  };
+
+  const fileAccessor: WorkspaceFileAccessor = {
+    readFile(relPath: string) {
+      const norm = relPath.replace(/\\/g, '/');
+      return mockRepoFiles[norm] ?? null;
+    },
+    fileExists(relPath: string) {
+      const norm = relPath.replace(/\\/g, '/');
+      return Boolean(mockRepoFiles[norm]);
+    },
+    listFiles() {
+      return Object.keys(mockRepoFiles);
+    },
+  };
+
+  // 1. Build workspace context
+  const basePackages = new Set(['@monorepo/ui', '@monorepo/core', '@monorepo/web']);
+  const context = buildWorkspaceContext(fileAccessor, {
+    baseBranchPackageNames: basePackages,
+    mode: 'auto',
+  });
+
+  assert.equal(context.mode, 'auto');
+  assert.equal(context.packagesByName.size, 3); // @monorepo/ui, @monorepo/core, @monorepo/web (nameless + !apps/standalone excluded)
+  assert.ok(context.packagesByName.has('@monorepo/ui'));
+  assert.ok(context.packagesByName.has('@monorepo/core'));
+  assert.ok(context.packagesByName.has('@monorepo/web'));
+  assert.equal(context.packagesByDir.has('packages/nameless'), false, 'Nameless workspace package must be safely ignored');
+  assert.equal(context.packagesByDir.has('apps/standalone'), false, 'Negated glob !apps/standalone must be excluded');
+
+  // 2. Acceptance A6-10: Strict Fixed Resolution Order & resolvedVia Verification
+  const targetFile = 'apps/web/src/index.ts';
+  const uiTargetFile = 'packages/ui/src/Button.tsx';
+
+  // 2.1 nearest package.json
+  const resNearest = resolveWorkspaceImportSpecifier('next', targetFile, context, fileAccessor);
+  assert.equal(resNearest.resolved, true);
+  assert.equal(resNearest.resolvedVia, 'nearest', 'Dependency in nearest package.json must resolve via nearest');
+
+  // Precedence: dependency declared in BOTH nearest and root must resolve via nearest
+  const resBoth = resolveWorkspaceImportSpecifier('react', uiTargetFile, context, fileAccessor);
+  assert.equal(resBoth.resolved, true);
+  assert.equal(resBoth.resolvedVia, 'nearest', 'Dependency in both nearest and root must resolve via nearest');
+
+  // workspace: alias in nearest package.json resolves aliased workspace dep via nearest
+  const resWsAliasDeclared = resolveWorkspaceImportSpecifier('@monorepo/core', targetFile, context, fileAccessor);
+  assert.equal(resWsAliasDeclared.resolved, true);
+  assert.equal(resWsAliasDeclared.resolvedVia, 'nearest', 'workspace:@monorepo/core@* alias target in nearest resolves via nearest');
+
+  // 2.2 root repo package.json ONLY
+  const resRoot = resolveWorkspaceImportSpecifier('react', targetFile, context, fileAccessor);
+  assert.equal(resRoot.resolved, true);
+  assert.equal(resRoot.resolvedVia, 'root', 'Dependency only in root package.json must resolve via root');
+
+  const resNpmAlias = resolveWorkspaceImportSpecifier('shared', targetFile, context, fileAccessor);
+  assert.equal(resNpmAlias.resolved, true);
+  assert.equal(resNpmAlias.resolvedVia, 'root', 'npm: alias key in root must resolve via root');
+
+  const resNpmTarget = resolveWorkspaceImportSpecifier('real-shared-pkg', targetFile, context, fileAccessor);
+  assert.equal(resNpmTarget.resolved, true);
+  assert.equal(resNpmTarget.resolvedVia, 'root', 'Unscoped npm: alias target in root must resolve via root');
+
+  const resNpmSpecifier = resolveWorkspaceImportSpecifier('npm:real-shared-pkg@^1.0.0', targetFile, context, fileAccessor);
+  assert.equal(resNpmSpecifier.resolved, true);
+  assert.equal(resNpmSpecifier.resolvedVia, 'root', 'Direct npm: specifier targeting root dep resolves via root');
+
+  const resScopedAliasKey = resolveWorkspaceImportSpecifier('scoped-alias', targetFile, context, fileAccessor);
+  assert.equal(resScopedAliasKey.resolved, true);
+  assert.equal(resScopedAliasKey.resolvedVia, 'root', 'Scoped npm: alias key in root resolves via root');
+
+  const resScopedAliasTarget = resolveWorkspaceImportSpecifier('@scope/real-scoped', targetFile, context, fileAccessor);
+  assert.equal(resScopedAliasTarget.resolved, true);
+  assert.equal(resScopedAliasTarget.resolvedVia, 'root', 'Scoped npm:@scope/pkg alias target in root resolves via root');
+
+  const resScopedNpmSpec = resolveWorkspaceImportSpecifier('npm:@scope/real-scoped@^2.0.0', targetFile, context, fileAccessor);
+  assert.equal(resScopedNpmSpec.resolved, true);
+  assert.equal(resScopedNpmSpec.resolvedVia, 'root', 'Direct scoped npm: specifier targeting root dep resolves via root');
+
+  const resNpmPhantom = resolveWorkspaceImportSpecifier('npm:phantom-uninstalled@^1.0.0', targetFile, context, fileAccessor);
+  assert.equal(resNpmPhantom.resolved, false);
+  assert.equal(resNpmPhantom.resolvedVia, 'unresolved', 'npm: specifier pointing to undeclared phantom pkg must fail');
+
+  // 2.3 workspace package name map (ordered strictly BEFORE Step 4 self-reference/tsconfig)
+  const countBefore = context.undeclaredWorkspaceImportsCount;
+  const resWs = resolveWorkspaceImportSpecifier('@monorepo/ui', targetFile, context, fileAccessor);
+  assert.equal(resWs.resolved, true);
+  assert.equal(resWs.resolvedVia, 'workspace', 'Workspace package name must resolve via workspace');
+  assert.equal(resWs.isUndeclaredWorkspaceImport, true, 'Undeclared cross-workspace import must be flagged');
+  assert.equal(context.undeclaredWorkspaceImportsCount, countBefore + 1);
+
+  // Repeat call tests per-run resolutionCache + consistent counter increment
+  const resWsCached = resolveWorkspaceImportSpecifier('@monorepo/ui', targetFile, context, fileAccessor);
+  assert.equal(resWsCached.resolved, true);
+  assert.equal(resWsCached.resolvedVia, 'workspace');
+  assert.equal(resWsCached.isUndeclaredWorkspaceImport, true);
+  assert.equal(context.undeclaredWorkspaceImportsCount, countBefore + 2, 'Cached undeclared workspace import must still increment count');
+
+  // Subpath package import
+  const resWsSub = resolveWorkspaceImportSpecifier('@monorepo/ui/components', targetFile, context, fileAccessor);
+  assert.equal(resWsSub.resolved, true);
+  assert.equal(resWsSub.resolvedVia, 'workspace', 'Workspace subpath import must resolve to base package');
+
+  // Workspace package importing itself: resolves at Step 3 ('workspace'), NOT marked undeclared
+  const countBeforeSelf = context.undeclaredWorkspaceImportsCount;
+  const resWsSelf = resolveWorkspaceImportSpecifier('@monorepo/web', targetFile, context, fileAccessor);
+  assert.equal(resWsSelf.resolved, true);
+  assert.equal(resWsSelf.resolvedVia, 'workspace', 'Workspace package importing own name resolves via Step 3 workspace map');
+  assert.equal(resWsSelf.isUndeclaredWorkspaceImport, false, 'Self-import must NOT be counted as undeclared workspace import');
+  assert.equal(context.undeclaredWorkspaceImportsCount, countBeforeSelf);
+
+  // 2.4 tsconfig paths & baseUrl, and package imports / self-reference
+  const resTsconfig = resolveWorkspaceImportSpecifier('@alias/button', targetFile, context, fileAccessor);
+  assert.equal(resTsconfig.resolved, true);
+  assert.equal(resTsconfig.resolvedVia, 'tsconfig', 'tsconfig path alias must resolve via tsconfig');
+
+  const resTsconfigExact = resolveWorkspaceImportSpecifier('exact-alias', targetFile, context, fileAccessor);
+  assert.equal(resTsconfigExact.resolved, true);
+  assert.equal(resTsconfigExact.resolvedVia, 'tsconfig', 'tsconfig exact alias must resolve via tsconfig');
+
+  const resBaseUrl = resolveWorkspaceImportSpecifier('internal-lib/baseUtil', targetFile, context, fileAccessor);
+  assert.equal(resBaseUrl.resolved, true);
+  assert.equal(resBaseUrl.resolvedVia, 'tsconfig', 'Existing module under tsconfig baseUrl must resolve via tsconfig');
+
+  // Node builtins & internal protocols
+  for (const builtinOrProto of ['node:fs', 'fs/promises', 'workspace:./local', 'file:../local', 'link:../local']) {
+    const resProto = resolveWorkspaceImportSpecifier(builtinOrProto, targetFile, context, fileAccessor);
+    assert.equal(resProto.resolved, true, `${builtinOrProto} must be treated as resolved/ignored`);
+    assert.equal(resProto.resolvedVia, 'unresolved', `${builtinOrProto} must return resolvedVia: 'unresolved'`);
+  }
+
+  // Self-reference by package name when NOT in workspace map (root or standalone package) -> Step 4 'imports'
+  const resRootSelf = resolveWorkspaceImportSpecifier('monorepo-root', 'src/index.ts', context, fileAccessor);
+  assert.equal(resRootSelf.resolved, true);
+  assert.equal(resRootSelf.resolvedVia, 'imports', 'Root self-reference by package name resolves via Step 4 imports');
+
+  const resStandaloneSelf = resolveWorkspaceImportSpecifier('standalone-pkg', 'apps/standalone/src/index.ts', context, fileAccessor);
+  assert.equal(resStandaloneSelf.resolved, true);
+  assert.equal(resStandaloneSelf.resolvedVia, 'imports', 'Standalone self-reference not in workspace map resolves via Step 4 imports');
+
+  // Subpath imports (#...) exact and wildcard
+  const resSubpath = resolveWorkspaceImportSpecifier('#ui-sub', uiTargetFile, context, fileAccessor);
+  assert.equal(resSubpath.resolved, true);
+  assert.equal(resSubpath.resolvedVia, 'imports', 'Exact subpath import #... must resolve via imports');
+
+  const resRootSubpath = resolveWorkspaceImportSpecifier('#root-util', targetFile, context, fileAccessor);
+  assert.equal(resRootSubpath.resolved, true);
+  assert.equal(resRootSubpath.resolvedVia, 'imports', 'Root subpath import #... must resolve via imports');
+
+  const resWildcardSubpath = resolveWorkspaceImportSpecifier('#internal/deep/helper', targetFile, context, fileAccessor);
+  assert.equal(resWildcardSubpath.resolved, true);
+  assert.equal(resWildcardSubpath.resolvedVia, 'imports', 'Wildcard subpath import #internal/* must resolve via imports');
+
+  // 3. Acceptance A6-9: Anti-Phantom & Hard Sibling / Intermediate Ancestor Prohibition
+  const resSiblingLodash = resolveWorkspaceImportSpecifier('lodash', targetFile, context, fileAccessor);
+  assert.equal(resSiblingLodash.resolved, false);
+  assert.equal(resSiblingLodash.resolvedVia, 'unresolved', 'Sibling dependency lodash MUST NOT resolve in apps/web');
+
+  const resSiblingChalk = resolveWorkspaceImportSpecifier('chalk', targetFile, context, fileAccessor);
+  assert.equal(resSiblingChalk.resolved, false);
+  assert.equal(resSiblingChalk.resolvedVia, 'unresolved', 'Sibling dependency chalk MUST NOT resolve in apps/web');
+
+  const resSiblingAxios = resolveWorkspaceImportSpecifier('axios', targetFile, context, fileAccessor);
+  assert.equal(resSiblingAxios.resolved, false);
+  assert.equal(resSiblingAxios.resolvedVia, 'unresolved', 'Sibling dependency axios MUST NOT resolve in apps/web');
+
+  const resIntermediateFromWeb = resolveWorkspaceImportSpecifier('intermediate-dep', targetFile, context, fileAccessor);
+  assert.equal(resIntermediateFromWeb.resolved, false);
+  assert.equal(resIntermediateFromWeb.resolvedVia, 'unresolved', 'Intermediate ancestor dependency MUST NOT resolve in apps/web');
+
+  // True ancestor path check: packages/ui/src/Button.tsx has parent packages/package.json declaring intermediate-dep
+  const resIntermediateFromUi = resolveWorkspaceImportSpecifier('intermediate-dep', uiTargetFile, context, fileAccessor);
+  assert.equal(resIntermediateFromUi.resolved, false);
+  assert.equal(resIntermediateFromUi.resolvedVia, 'unresolved', 'Intermediate ancestor packages/package.json MUST NOT resolve in packages/ui/src/Button.tsx');
+
+  // Phantom package (must also NOT match catch-all tsconfig path "*")
+  const resPhantom = resolveWorkspaceImportSpecifier('phantom-pkg', targetFile, context, fileAccessor);
+  assert.equal(resPhantom.resolved, false);
+  assert.equal(resPhantom.resolvedVia, 'unresolved', 'Non-existent phantom package must remain unresolved');
+
+  // 4. Acceptance A6-12: pnpm Strict Known Limitation + object workspaces format
+  const pnpmRepoFiles: Record<string, string> = {
+    'package.json': JSON.stringify({
+      name: 'pnpm-root',
+      dependencies: {
+        typescript: '^5.0.0',
+      },
+    }),
+    'pnpm-workspace.yaml': 'packages:\n  - "packages/*"',
+    'packages/pkg-a/package.json': JSON.stringify({
+      name: 'pkg-a',
+      dependencies: {},
+    }),
+  };
+  const pnpmAccessor: WorkspaceFileAccessor = {
+    readFile: (p) => pnpmRepoFiles[p.replace(/\\/g, '/')] ?? null,
+    fileExists: (p) => Boolean(pnpmRepoFiles[p.replace(/\\/g, '/')]),
+    listFiles: () => Object.keys(pnpmRepoFiles),
+  };
+  const pnpmContext = buildWorkspaceContext(pnpmAccessor);
+  assert.ok(pnpmContext.packagesByName.has('pkg-a'));
+  const pnpmRes = resolveWorkspaceImportSpecifier('typescript', 'packages/pkg-a/src/index.ts', pnpmContext, pnpmAccessor);
+  assert.equal(pnpmRes.resolved, true);
+  assert.equal(pnpmRes.resolvedVia, 'root', 'pnpm strict known limitation: root dependency resolves via root');
+
+  const objWorkspaceFiles: Record<string, string> = {
+    'package.json': JSON.stringify({
+      name: 'obj-root',
+      workspaces: { packages: ['packages/*'] },
+    }),
+    'packages/pkg-obj/package.json': JSON.stringify({
+      name: '@obj/pkg-a',
+    }),
+    'packages/web/package.json': JSON.stringify({
+      name: '@obj/web',
+    }),
+  };
+  const objAccessor: WorkspaceFileAccessor = {
+    readFile: (p) => objWorkspaceFiles[p.replace(/\\/g, '/')] ?? null,
+    fileExists: (p) => Boolean(objWorkspaceFiles[p.replace(/\\/g, '/')]),
+    listFiles: () => Object.keys(objWorkspaceFiles),
+  };
+  const objContext = buildWorkspaceContext(objAccessor);
+  assert.ok(objContext.packagesByName.has('@obj/pkg-a'), 'workspaces object form { packages: [...] } must be supported');
+  const resObjWs = resolveWorkspaceImportSpecifier('@obj/pkg-a', 'packages/web/src/index.ts', objContext, objAccessor);
+  assert.equal(resObjWs.resolved, true);
+  assert.equal(resObjWs.resolvedVia, 'workspace');
+
+  // 5. Anti-Bypass DG004-WS-NEW (SPEC §6.3)
+  const prNewFiles: Record<string, string> = {
+    'package.json': JSON.stringify({
+      name: 'root',
+      workspaces: ['packages/*'],
+    }),
+    'packages/existing/package.json': JSON.stringify({ name: '@corp/existing' }),
+    'packages/brand-new/package.json': JSON.stringify({ name: '@corp/brand-new' }),
+  };
+  const prAccessor: WorkspaceFileAccessor = {
+    readFile: (p) => prNewFiles[p.replace(/\\/g, '/')] ?? null,
+    fileExists: (p) => Boolean(prNewFiles[p.replace(/\\/g, '/')]),
+    listFiles: () => Object.keys(prNewFiles),
+  };
+  const prContext = buildWorkspaceContext(prAccessor, {
+    baseBranchPackageNames: new Set(['@corp/existing']),
+  });
+  const newNotices = prContext.diagnostics.filter((d) => d.ruleId === 'DG004-WS-NEW');
+  assert.equal(newNotices.length, 1);
+  assert.equal(newNotices[0].ruleId, 'DG004-WS-NEW');
+  assert.equal(newNotices[0].scoring, false, 'DG004-WS-NEW must be non-scoring');
+  assert.ok(newNotices[0].message.includes('@corp/brand-new'), 'DG004-WS-NEW must identify new package name');
+
+  // 6. Fail-Closed per Source & Size Limits (DG004-WS-UNPARSED)
+  // 6.1 pnpm-workspace.yaml with unsupported flow sequence
+  const badYamlFiles: Record<string, string> = {
+    'package.json': JSON.stringify({ name: 'root' }),
+    'pnpm-workspace.yaml': 'packages: ["packages/*"]',
+  };
+  const badYamlAccessor: WorkspaceFileAccessor = {
+    readFile: (p) => badYamlFiles[p.replace(/\\/g, '/')] ?? null,
+    fileExists: (p) => Boolean(badYamlFiles[p.replace(/\\/g, '/')]),
+  };
+  const badYamlContext = buildWorkspaceContext(badYamlAccessor);
+  const yamlNotices = badYamlContext.diagnostics.filter((d) => d.ruleId === 'DG004-WS-UNPARSED');
+  assert.equal(yamlNotices.length, 1);
+  assert.equal(yamlNotices[0].reason, 'yaml_unsupported_construct');
+  assert.equal(yamlNotices[0].scoring, false);
+  assert.equal(badYamlContext.packagesByName.size, 0, 'Fail-closed: 0 packages contributed from unsupported YAML');
+
+  // 6.2 pnpm-workspace.yaml exceeding 256 KiB size limit
+  const overYamlFiles: Record<string, string> = {
+    'package.json': JSON.stringify({ name: 'root' }),
+    'pnpm-workspace.yaml': 'packages:\n  - ' + 'x'.repeat(MAX_CONFIG_FILE_SIZE + 50),
+  };
+  const overYamlAccessor: WorkspaceFileAccessor = {
+    readFile: (p) => overYamlFiles[p.replace(/\\/g, '/')] ?? null,
+    fileExists: (p) => Boolean(overYamlFiles[p.replace(/\\/g, '/')]),
+  };
+  const overYamlContext = buildWorkspaceContext(overYamlAccessor);
+  const overNotices = overYamlContext.diagnostics.filter((d) => d.ruleId === 'DG004-WS-UNPARSED');
+  assert.equal(overNotices.length, 1);
+  assert.equal(overNotices[0].reason, 'size_limit');
+
+  // 6.3 tsconfig with circular extends
+  const cycleTsFiles: Record<string, string> = {
+    'package.json': JSON.stringify({ name: 'root' }),
+    'tsconfig.json': JSON.stringify({ extends: './tsconfig.json' }),
+  };
+  const cycleAccessor: WorkspaceFileAccessor = {
+    readFile: (p) => cycleTsFiles[p.replace(/\\/g, '/')] ?? null,
+    fileExists: (p) => Boolean(cycleTsFiles[p.replace(/\\/g, '/')]),
+  };
+  const cycleContext = buildWorkspaceContext(cycleAccessor);
+  const cycleNotices = cycleContext.diagnostics.filter((d) => d.ruleId === 'DG004-WS-UNPARSED');
+  assert.equal(cycleNotices.length, 1);
+  assert.equal(cycleNotices[0].reason, 'extends_cycle');
+
+  // 6.4 corrupt nearest package.json MUST fail closed and MUST NOT walk past into intermediate ancestor
+  const corruptNearestFiles: Record<string, string> = {
+    'package.json': JSON.stringify({ name: 'root', workspaces: ['packages/ok'] }),
+    'packages/package.json': JSON.stringify({ name: 'intermediate', dependencies: { 'intermediate-dep': '^1.0.0' } }),
+    'packages/broken/package.json': '{ invalid jsonc',
+  };
+  const corruptNearestAccessor: WorkspaceFileAccessor = {
+    readFile: (p) => corruptNearestFiles[p.replace(/\\/g, '/')] ?? null,
+    fileExists: (p) => Boolean(corruptNearestFiles[p.replace(/\\/g, '/')]),
+    listFiles: () => Object.keys(corruptNearestFiles),
+  };
+  const corruptNearestCtx = buildWorkspaceContext(corruptNearestAccessor);
+  const resBrokenIntermediate = resolveWorkspaceImportSpecifier(
+    'intermediate-dep',
+    'packages/broken/src/index.ts',
+    corruptNearestCtx,
+    corruptNearestAccessor
+  );
+  assert.equal(resBrokenIntermediate.resolved, false, 'Corrupt nearest package.json must fail closed and never walk past to intermediate ancestor');
+  assert.equal(resBrokenIntermediate.resolvedVia, 'unresolved');
+  const nearestNotices = corruptNearestCtx.diagnostics.filter(
+    (d) => d.ruleId === 'DG004-WS-UNPARSED' && d.sourceFile === 'packages/broken/package.json'
+  );
+  assert.equal(nearestNotices.length, 1);
+  assert.equal(nearestNotices[0].reason, 'jsonc_syntax');
+  assert.equal(nearestNotices[0].scoring, false);
+
+  // 7. Workspaces Mode 'off' (SPEC §6.4)
+  const offContext = buildWorkspaceContext(fileAccessor, { mode: 'off' });
+  assert.equal(offContext.mode, 'off');
+  const resOffWs = resolveWorkspaceImportSpecifier('@monorepo/ui', targetFile, offContext, fileAccessor);
+  assert.equal(resOffWs.resolved, false, 'In mode off, workspace package name map must not resolve');
+  assert.equal(resOffWs.resolvedVia, 'unresolved');
+  const resOffTsconfig = resolveWorkspaceImportSpecifier('@alias/button', targetFile, offContext, fileAccessor);
+  assert.equal(resOffTsconfig.resolved, false, 'In mode off, tsconfig paths must not resolve');
+  assert.equal(resOffTsconfig.resolvedVia, 'unresolved');
+  const resOffNearest = resolveWorkspaceImportSpecifier('next', targetFile, offContext, fileAccessor);
+  assert.equal(resOffNearest.resolved, true, 'In mode off, nearest declared dependencies still resolve');
+  assert.equal(resOffNearest.resolvedVia, 'nearest');
+  const resOffRoot = resolveWorkspaceImportSpecifier('react', targetFile, offContext, fileAccessor);
+  assert.equal(resOffRoot.resolved, true, 'In mode off, root declared dependencies still resolve');
+  assert.equal(resOffRoot.resolvedVia, 'root');
+  const resOffImports = resolveWorkspaceImportSpecifier('#root-util', targetFile, offContext, fileAccessor);
+  assert.equal(resOffImports.resolved, true, 'In mode off, subpath #imports still resolve');
+  assert.equal(resOffImports.resolvedVia, 'imports');
+});
+
+test('Test 84: Stage 6.1.c Integration (DG004 Resolver, Base-Branch .devguard.json, A6-4, A6-5, A6-6 & PR Summary)', async () => {
+  // 1. Base-branch .devguard.json workspaces.mode validation (SPEC §6.4)
+  assert.equal(
+    loadVerifiedAllowlist({ isCi: false, readWorkingFile: () => null }).workspacesMode,
+    'auto',
+    'Missing .devguard.json must default workspacesMode to auto'
+  );
+
+  const offOnlyCfg = loadVerifiedAllowlist({
+    baseRef: 'main',
+    eventName: 'pull_request',
+    isCi: true,
+    readBaseFile: () => JSON.stringify({ workspaces: { mode: 'off' } }),
+    readWorkingFile: () => JSON.stringify({ workspaces: { mode: 'auto' } }),
+  });
+  assert.equal(offOnlyCfg.workspacesMode, 'off', 'Base-branch workspaces.mode=off must be honored');
+  assert.equal(offOnlyCfg.invalidAllowlistEntries.length, 0, 'Valid workspaces-only .devguard.json must not record schema errors');
+  assert.equal(offOnlyCfg.allowlistModifiedInPr, true);
+
+  const invalidWsCfg = loadVerifiedAllowlist({
+    baseRef: 'main',
+    eventName: 'pull_request',
+    isCi: true,
+    readBaseFile: () => JSON.stringify({ workspaces: { mode: 'invalid-mode', extraProp: 1 }, ignoreRulesByPath: {} }),
+    readWorkingFile: () => null,
+  });
+  assert.equal(invalidWsCfg.workspacesMode, 'off', 'Invalid workspaces.mode must fail closed to off');
+  assert.equal(invalidWsCfg.invalidAllowlistEntries.length, 2, 'Invalid mode and unsupported key must be reported');
+
+  // 2. Acceptance A6-4: Unparseable / out-of-subset workspace config emits DG004-WS-UNPARSED, never crashes, honors fail_on_unanalyzable
+  const tempA64 = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-a64-'));
+  try {
+    fs.mkdirSync(path.join(tempA64, 'apps', 'web', 'src'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tempA64, 'package.json'),
+      JSON.stringify({ name: 'a64-root', workspaces: ['apps/*'] }),
+      'utf-8'
+    );
+    fs.writeFileSync(path.join(tempA64, 'pnpm-workspace.yaml'), 'packages: ["apps/*"]\n', 'utf-8');
+    fs.writeFileSync(path.join(tempA64, 'tsconfig.json'), JSON.stringify({ extends: '@external/tsconfig' }), 'utf-8');
+    fs.writeFileSync(
+      path.join(tempA64, 'apps', 'web', 'package.json'),
+      JSON.stringify({ name: '@a64/web', dependencies: { express: '^4.0.0' } }),
+      'utf-8'
+    );
+    const cleanWebFile = path.join(tempA64, 'apps', 'web', 'src', 'index.ts');
+    fs.writeFileSync(
+      cleanWebFile,
+      [
+        "import express from 'express';",
+        'export function getHealth(req: { id: string }): string {',
+        '  if (!req || typeof req.id !== "string") throw new TypeError("invalid");',
+        '  try { return express ? req.id : ""; } catch (err) { throw err; }',
+        '}',
+      ].join('\n'),
+      'utf-8'
+    );
+
+    const compiledCliPath = path.join(BUILD_ROOT, 'src', 'cli.js');
+    const sarifPassPath = path.join(tempA64, 'a64-pass.sarif');
+    const passRun = spawnSync(process.execPath, [compiledCliPath, 'apps/web/src/index.ts'], {
+      cwd: tempA64,
+      encoding: 'utf-8',
+      env: {
+        ...process.env,
+        GEMINI_API_KEY: '',
+        GITHUB_TOKEN: '',
+        GITHUB_EVENT_PATH: '',
+        DEVGUARD_FAIL_ON_UNANALYZABLE: 'false',
+        DEVGUARD_SARIF_OUTPUT: sarifPassPath,
+      },
+    });
+    assert.equal(passRun.status, 0, `A6-4 fail_on_unanalyzable=false must exit 0, stderr: ${passRun.stderr}`);
+    const sarifPass = JSON.parse(fs.readFileSync(sarifPassPath, 'utf-8'));
+    const sarifPassStr = JSON.stringify(sarifPass);
+    assert.equal(sarifPassStr.includes('resolvedVia'), false, 'resolvedVia must never appear in SARIF (SPEC §6.2.9)');
+    const unparsedResults = (sarifPass.runs[0].results as Array<{
+      ruleId: string;
+      level: string;
+      properties?: { scoring?: boolean; reason?: string };
+      locations: Array<{ physicalLocation: { artifactLocation: { uri: string } } }>;
+    }>).filter((r) => r.ruleId === 'DG004-WS-UNPARSED');
+    assert.equal(unparsedResults.length, 2, 'Both unsupported YAML and external tsconfig extends must emit DG004-WS-UNPARSED');
+    assert.ok(unparsedResults.every((r) => r.level === 'warning' && r.properties?.scoring === false));
+    assert.ok(unparsedResults.some((r) => r.properties?.reason === 'yaml_unsupported_construct'));
+    assert.ok(unparsedResults.some((r) => r.properties?.reason === 'extends_external'));
+
+    const sarifFailPath = path.join(tempA64, 'a64-fail.sarif');
+    const failRun = spawnSync(process.execPath, [compiledCliPath, 'apps/web/src/index.ts'], {
+      cwd: tempA64,
+      encoding: 'utf-8',
+      env: {
+        ...process.env,
+        GEMINI_API_KEY: '',
+        GITHUB_TOKEN: '',
+        GITHUB_EVENT_PATH: '',
+        DEVGUARD_FAIL_ON_UNANALYZABLE: 'true',
+        DEVGUARD_SARIF_OUTPUT: sarifFailPath,
+      },
+    });
+    assert.equal(failRun.status, 1, 'A6-4 fail_on_unanalyzable=true must reject with exit code 1 when DG004-WS-UNPARSED exists');
+
+    // Verify PR comment + verdict gating on unparsedWorkspaceCount
+    const passVerdict = computeOverallGateVerdict(1, 95, 0, false, false, 0, 2);
+    assert.equal(passVerdict.auditStatus, 'PASS');
+    assert.equal(passVerdict.unanalyzableFailed, false);
+    const failVerdict = computeOverallGateVerdict(1, 95, 0, false, true, 0, 2);
+    assert.equal(failVerdict.auditStatus, 'FAIL');
+    assert.equal(failVerdict.unanalyzableFailed, true);
+
+    const a64CommentFail = buildPullRequestCommentMarkdown(
+      [
+        {
+          filePath: 'apps/web/src/index.ts',
+          security: 100,
+          correctness: 95,
+          maintainability: 90,
+          overall: 95,
+          passed: true,
+          fatalFlaws: [],
+          defenseInDepth: [],
+        },
+      ],
+      85,
+      'OFFLINE_AST',
+      {
+        analyzedCount: 1,
+        skippedFiles: [],
+        ignoredNonCodeCount: 0,
+        failOnUnanalyzable: true,
+        workspaceSummary: {
+          packageCount: 1,
+          sources: ['package.json'],
+          diagnostics: [
+            {
+              ruleId: 'DG004-WS-UNPARSED',
+              sourceFile: 'pnpm-workspace.yaml',
+              reason: 'yaml_unsupported_construct',
+              message: '[DG004-WS-UNPARSED] (yaml_unsupported_construct) Failed to parse pnpm-workspace.yaml',
+              scoring: false,
+            },
+          ],
+        },
+      }
+    );
+    assert.ok(a64CommentFail.includes('🚫 REJECTED (UNANALYZED FILES)'));
+    assert.ok(a64CommentFail.includes('### ⚠️ Warnings (non-scoring)'));
+    assert.ok(a64CommentFail.includes('DG004-WS-UNPARSED'));
+  } finally {
+    fs.rmSync(tempA64, { recursive: true, force: true });
+  }
+
+  // 3. Acceptance A6-5 + PR Summary: Base-branch globs enforcement, DG004-WS-NEW non-scoring, and undeclared workspace imports summary
+  const tempA65 = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-a65-'));
+  try {
+    const repoDir = path.join(tempA65, 'repo');
+    fs.mkdirSync(path.join(repoDir, 'packages', 'existing', 'src'), { recursive: true });
+    fs.mkdirSync(path.join(repoDir, 'packages', 'shared', 'src'), { recursive: true });
+    fs.writeFileSync(
+      path.join(repoDir, 'package.json'),
+      JSON.stringify({ name: 'a65-root', workspaces: ['packages/*'] }),
+      'utf-8'
+    );
+    fs.writeFileSync(
+      path.join(repoDir, 'pnpm-workspace.yaml'),
+      'packages:\n  - "packages/*"\n',
+      'utf-8'
+    );
+    fs.writeFileSync(
+      path.join(repoDir, 'tsconfig.json'),
+      JSON.stringify({ compilerOptions: { paths: { '@ui/*': ['packages/shared/src/*'] } } }),
+      'utf-8'
+    );
+    fs.writeFileSync(
+      path.join(repoDir, 'packages', 'existing', 'package.json'),
+      JSON.stringify({ name: '@corp/existing', dependencies: {} }),
+      'utf-8'
+    );
+    fs.writeFileSync(
+      path.join(repoDir, 'packages', 'shared', 'package.json'),
+      JSON.stringify({ name: '@corp/shared', dependencies: {} }),
+      'utf-8'
+    );
+    fs.writeFileSync(
+      path.join(repoDir, 'packages', 'existing', 'src', 'index.ts'),
+      'export const baseOk = 1;\n',
+      'utf-8'
+    );
+
+    const git = (args: string[]) => spawnSync('git', args, { cwd: repoDir, encoding: 'utf-8' });
+    assert.equal(git(['init', '-b', 'main']).status, 0);
+    git(['config', 'user.email', 'ci@devguard.local']);
+    git(['config', 'user.name', 'DevGuard Test']);
+    git(['add', '.']);
+    assert.equal(git(['commit', '-m', 'base commit']).status, 0);
+
+    // Simulate PR changes on working tree:
+    // (a) Add new package under base glob: packages/new-pkg ("@corp/new-ai-pkg")
+    fs.mkdirSync(path.join(repoDir, 'packages', 'new-pkg'), { recursive: true });
+    fs.writeFileSync(
+      path.join(repoDir, 'packages', 'new-pkg', 'package.json'),
+      JSON.stringify({ name: '@corp/new-ai-pkg', dependencies: {} }),
+      'utf-8'
+    );
+    // (b) Attempted PR bypass: modify package.json workspaces to add "sneaky/*" with sneaky/bypass package
+    fs.writeFileSync(
+      path.join(repoDir, 'package.json'),
+      JSON.stringify({ name: 'a65-root', workspaces: ['packages/*', 'sneaky/*'] }),
+      'utf-8'
+    );
+    fs.mkdirSync(path.join(repoDir, 'sneaky', 'bypass'), { recursive: true });
+    fs.writeFileSync(
+      path.join(repoDir, 'sneaky', 'bypass', 'package.json'),
+      JSON.stringify({ name: 'sneaky-bypass-pkg' }),
+      'utf-8'
+    );
+
+    // (c) Clean PR file importing undeclared base workspace (@corp/shared) + PR new workspace (@corp/new-ai-pkg)
+    const cleanPrRel = 'packages/existing/src/clean.ts';
+    fs.writeFileSync(
+      path.join(repoDir, cleanPrRel),
+      [
+        "import { a } from '@corp/shared';",
+        "import { b } from '@corp/new-ai-pkg';",
+        'export function combine(x: unknown): boolean {',
+        '  if (x === null) throw new Error("missing");',
+        '  try { return Boolean(a) && Boolean(b) && Boolean(x); } catch (err) { throw err; }',
+        '}',
+      ].join('\n'),
+      'utf-8'
+    );
+
+    // (d) Bypass PR file trying to import unauthorized sneaky-bypass-pkg
+    const bypassPrRel = 'packages/existing/src/bypass.ts';
+    fs.writeFileSync(
+      path.join(repoDir, bypassPrRel),
+      [
+        "import { hack } from 'sneaky-bypass-pkg';",
+        'export const run = () => hack();',
+      ].join('\n'),
+      'utf-8'
+    );
+
+    const baseAccessor = createGitRefWorkspaceFileAccessor(repoDir, 'main');
+    assert.ok(baseAccessor, 'Git base ref accessor must initialize cleanly on main');
+
+    const cleanClassif = classifyInScopeFiles([cleanPrRel], { cwd: repoDir, sourceMode: 'explicit' });
+    const cleanExec = await auditClassifiedFiles(cleanClassif, {
+      apiKey: '',
+      minScore: 85,
+      isFork: false,
+      verifiedAllowlist: {
+        rulesByPath: new Map(),
+        invalidAllowlistEntries: [],
+        allowlistModifiedInPr: false,
+        sourceMode: 'empty',
+        workspacesMode: 'auto',
+      },
+      cwd: repoDir,
+      baseFileAccessor: baseAccessor,
+    });
+
+    assert.equal(cleanExec.hasFindingFailure, false, 'Undeclared workspace and new PR workspace imports must not cause false positive DG004 errors');
+    assert.equal(cleanExec.summaries[0].passed, true);
+    assert.ok(cleanExec.workspaceContext);
+    assert.equal(cleanExec.workspaceContext.packagesByName.has('@corp/new-ai-pkg'), true);
+    assert.equal(cleanExec.workspaceContext.packagesByName.has('sneaky-bypass-pkg'), false, 'Unauthorized PR glob sneaky/* must be blocked by base-branch glob');
+    assert.equal(cleanExec.workspaceContext.undeclaredWorkspaceImportsCount, 2, 'Both @corp/shared and @corp/new-ai-pkg are undeclared workspace imports');
+
+    const newNotices = cleanExec.workspaceContext.diagnostics.filter((d) => d.ruleId === 'DG004-WS-NEW');
+    assert.equal(newNotices.length, 1, 'New PR workspace @corp/new-ai-pkg must emit DG004-WS-NEW');
+    assert.equal(newNotices[0].scoring, false);
+    assert.ok(newNotices[0].message.includes('@corp/new-ai-pkg'));
+
+    const prComment = buildPullRequestCommentMarkdown(cleanExec.summaries, 85, 'OFFLINE_AST', {
+      analyzedCount: 1,
+      skippedFiles: [],
+      ignoredNonCodeCount: 0,
+      workspaceSummary: {
+        packageCount: cleanExec.workspaceContext.packagesByName.size,
+        sources: cleanExec.workspaceContext.detectedSources,
+        undeclaredWorkspaceImportsCount: cleanExec.workspaceContext.undeclaredWorkspaceImportsCount,
+        diagnostics: cleanExec.workspaceContext.diagnostics,
+      },
+    });
+    assert.ok(
+      prComment.includes('- Workspaces detected: 3 (sources: package.json, pnpm-workspace.yaml, tsconfig.json)'),
+      `Expected workspaces summary line in PR comment:\n${prComment}`
+    );
+    assert.ok(
+      prComment.includes('- 2 impor workspace tanpa deklarasi'),
+      `Expected undeclared workspace imports line in PR comment:\n${prComment}`
+    );
+    assert.ok(prComment.includes('DG004-WS-NEW'));
+    assert.ok(prComment.includes('✅ PASSED (READY TO MERGE)'));
+
+    const sarifNewPath = path.join(tempA65, 'a65-new.sarif');
+    generateSarifReport(cleanExec.summaries, sarifNewPath, [], {
+      workspaceDiagnostics: cleanExec.workspaceContext.diagnostics,
+    });
+    const sarifNew = JSON.parse(fs.readFileSync(sarifNewPath, 'utf-8'));
+    assert.equal(JSON.stringify(sarifNew).includes('resolvedVia'), false);
+    const sarifWsNew = (sarifNew.runs[0].results as Array<{
+      ruleId: string;
+      properties?: { scoring?: boolean };
+    }>).filter((r) => r.ruleId === 'DG004-WS-NEW');
+    assert.equal(sarifWsNew.length, 1);
+    assert.equal(sarifWsNew[0].properties?.scoring, false);
+
+    // Check bypass attempt triggers real DG004 phantom dependency finding
+    const bypassClassif = classifyInScopeFiles([bypassPrRel], { cwd: repoDir, sourceMode: 'explicit' });
+    const bypassExec = await auditClassifiedFiles(bypassClassif, {
+      apiKey: '',
+      minScore: 85,
+      isFork: false,
+      verifiedAllowlist: {
+        rulesByPath: new Map(),
+        invalidAllowlistEntries: [],
+        allowlistModifiedInPr: false,
+        sourceMode: 'empty',
+        workspacesMode: 'auto',
+      },
+      cwd: repoDir,
+      baseFileAccessor: baseAccessor,
+    });
+    assert.equal(bypassExec.hasFindingFailure, true, 'Importing package from sneaky/* added only in PR must be caught by DG004');
+    assert.ok(
+      (bypassExec.summaries[0].inlineFindings ?? []).some(
+        (f) => f.ruleId === 'DG004' && f.message.includes('sneaky-bypass-pkg')
+      )
+    );
+  } finally {
+    fs.rmSync(tempA65, { recursive: true, force: true });
+  }
+
+  // 4. Acceptance A6-6: workspaces.mode: "off" preserves identical v1.3.0 behavior and SARIF byte parity
+  const tempA66 = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-a66-'));
+  try {
+    fs.mkdirSync(path.join(tempA66, 'packages', 'ui'), { recursive: true });
+    fs.mkdirSync(path.join(tempA66, 'apps', 'web', 'src'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tempA66, 'package.json'),
+      JSON.stringify({ name: 'a66-root', workspaces: ['packages/*', 'apps/*'] }),
+      'utf-8'
+    );
+    fs.writeFileSync(
+      path.join(tempA66, 'packages', 'ui', 'package.json'),
+      JSON.stringify({ name: '@a66/ui' }),
+      'utf-8'
+    );
+    fs.writeFileSync(
+      path.join(tempA66, 'apps', 'web', 'package.json'),
+      JSON.stringify({ name: '@a66/web', dependencies: {} }),
+      'utf-8'
+    );
+    const webFileAbs = path.join(tempA66, 'apps', 'web', 'src', 'index.ts');
+    const codeImportingWs = "import { Button } from '@a66/ui';\nexport const ui = Button;\n";
+    fs.writeFileSync(webFileAbs, codeImportingWs, 'utf-8');
+
+    const autoExec = await auditClassifiedFiles(
+      classifyInScopeFiles(['apps/web/src/index.ts'], { cwd: tempA66, sourceMode: 'explicit' }),
+      {
+        apiKey: '',
+        minScore: 85,
+        isFork: false,
+        verifiedAllowlist: {
+          rulesByPath: new Map(),
+          invalidAllowlistEntries: [],
+          allowlistModifiedInPr: false,
+          sourceMode: 'empty',
+          workspacesMode: 'auto',
+        },
+        cwd: tempA66,
+      }
+    );
+    assert.equal(autoExec.hasFindingFailure, false, 'mode=auto must resolve @a66/ui without DG004 failure');
+
+    const offExec = await auditClassifiedFiles(
+      classifyInScopeFiles(['apps/web/src/index.ts'], { cwd: tempA66, sourceMode: 'explicit' }),
+      {
+        apiKey: '',
+        minScore: 85,
+        isFork: false,
+        verifiedAllowlist: {
+          rulesByPath: new Map(),
+          invalidAllowlistEntries: [],
+          allowlistModifiedInPr: false,
+          sourceMode: 'empty',
+          workspacesMode: 'off',
+        },
+        cwd: tempA66,
+      }
+    );
+    assert.equal(offExec.hasFindingFailure, true, 'mode=off must flag @a66/ui identically to v1.3.0');
+    assert.equal(offExec.workspaceContext?.diagnostics.length, 0, 'mode=off must emit zero DG004-WS notices');
+
+    // Byte-for-byte SARIF parity check against v1.3.0 baseline (explicit empty declaredDependencies)
+    const sarifOffPath = path.join(tempA66, 'off.sarif');
+    const sarifV13Path = path.join(tempA66, 'v13.sarif');
+    generateSarifReport(offExec.summaries, sarifOffPath, [], {
+      workspaceDiagnostics: offExec.workspaceContext?.diagnostics,
+    });
+
+    const v13Report = analyzeCodeDeterministically(codeImportingWs, {
+      filePath: 'apps/web/src/index.ts',
+      declaredDependencies: [],
+      workspacesMode: 'off',
+    });
+    const v13Summary: FileAuditSummary = {
+      filePath: 'apps/web/src/index.ts',
+      security: v13Report.skor.security,
+      correctness: v13Report.skor.correctness,
+      maintainability: v13Report.skor.maintainability,
+      overall: v13Report.skor.totalScore,
+      passed: false,
+      fatalFlaws: [v13Report.temuanUtama.description],
+      defenseInDepth: v13Report.residualNotes || [],
+      inlineFindings: v13Report.inlineFindings,
+      layer2Status: 'Skipped: No API Key',
+    };
+    generateSarifReport([v13Summary], sarifV13Path);
+
+    assert.equal(
+      fs.readFileSync(sarifOffPath, 'utf-8'),
+      fs.readFileSync(sarifV13Path, 'utf-8'),
+      'A6-6: workspaces.mode=off SARIF must be byte-for-byte identical to v1.3.0 behavior'
+    );
+  } finally {
+    fs.rmSync(tempA66, { recursive: true, force: true });
+  }
+});
+
+test('Test 85: Stage 6.1.c Base Ref Unavailable Fail-Closed Isolation (Shallow Clone, Bad Ref, Fail-Safe No-Fallback to PR Workspaces)', async () => {
+  // Scenario (a): Base ref salah / tidak ada -> fail-closed accessor
+  const failClosedAccessor = resolveBaseWorkspaceFileAccessor(process.cwd(), {
+    baseRef: 'non-existent-base-branch-dg-test-404',
+    eventName: 'pull_request',
+  });
+  assert.ok(failClosedAccessor, 'Scenario (a): resolveBaseWorkspaceFileAccessor must return fail-closed accessor, not undefined');
+  assert.deepEqual(failClosedAccessor.listFiles?.(), []);
+  assert.equal(failClosedAccessor.fileExists('package.json'), false);
+  assert.equal(failClosedAccessor.readFile('package.json'), null);
+
+  const tempRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-test85-'));
+  try {
+    // Prepare PR working tree with malicious / newly declared workspace
+    fs.mkdirSync(path.join(tempRepo, 'sneaky-lib', 'src'), { recursive: true });
+    fs.mkdirSync(path.join(tempRepo, 'apps', 'web', 'src'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tempRepo, 'package.json'),
+      JSON.stringify({ name: 'test85-root', workspaces: ['sneaky-lib', 'apps/*'] }),
+      'utf-8'
+    );
+    fs.writeFileSync(
+      path.join(tempRepo, 'sneaky-lib', 'package.json'),
+      JSON.stringify({ name: '@sneaky/injected-pkg', version: '1.0.0', dependencies: {} }),
+      'utf-8'
+    );
+    fs.writeFileSync(
+      path.join(tempRepo, 'apps', 'web', 'src', 'main.ts'),
+      "import { foo } from '@sneaky/injected-pkg';\nexport const run = foo;\n",
+      'utf-8'
+    );
+
+    const baseAccessorA = resolveBaseWorkspaceFileAccessor(tempRepo, {
+      baseRef: 'non-existent-base-ref-404',
+      eventName: 'pull_request',
+    });
+    const classificationA = classifyInScopeFiles(['apps/web/src/main.ts'], { cwd: tempRepo, sourceMode: 'explicit' });
+    const auditResA = await auditClassifiedFiles(classificationA, {
+      apiKey: '',
+      minScore: 85,
+      isFork: false,
+      verifiedAllowlist: {
+        rulesByPath: new Map(),
+        invalidAllowlistEntries: [],
+        allowlistModifiedInPr: false,
+        sourceMode: 'empty',
+        workspacesMode: 'auto',
+      },
+      cwd: tempRepo,
+      baseFileAccessor: baseAccessorA,
+    });
+    assert.equal(auditResA.hasFindingFailure, true, 'Scenario (a): Importing PR workspace package must fail closed when base ref is missing');
+    assert.equal(auditResA.workspaceContext?.packagesByName.size, 0, 'Scenario (a): Workspace map must have 0 packages');
+    const dg004FindingsA = (auditResA.summaries[0].inlineFindings ?? []).filter((f) => f.ruleId === 'DG004');
+    assert.ok(dg004FindingsA.some((f) => f.message.includes('@sneaky/injected-pkg')), 'Scenario (a): DG004 must flag @sneaky/injected-pkg');
+    console.log('✔ Test 85(a): Missing/invalid base ref verified fail-closed (DG004 triggered, 0 packages admitted)');
+
+    // Scenario (b): Real shallow clone (git clone --depth=1 on PR branch without fetching origin/main)
+    const originDir = path.join(tempRepo, 'origin-repo');
+    const shallowDir = path.join(tempRepo, 'shallow-pr-clone');
+    fs.mkdirSync(path.join(originDir, 'apps', 'web', 'src'), { recursive: true });
+    fs.mkdirSync(path.join(originDir, 'sneaky-lib'), { recursive: true });
+    fs.writeFileSync(path.join(originDir, 'package.json'), JSON.stringify({ name: 'shallow-root' }), 'utf-8');
+    fs.writeFileSync(path.join(originDir, 'apps', 'web', 'src', 'index.ts'), 'export const ok = 1;\n', 'utf-8');
+    const runGitOrigin = (args: string[]) => spawnSync('git', args, { cwd: originDir, encoding: 'utf-8' });
+    assert.equal(runGitOrigin(['init', '-b', 'main']).status, 0);
+    runGitOrigin(['config', 'user.email', 'ci@devguard.local']);
+    runGitOrigin(['config', 'user.name', 'DevGuard Test']);
+    runGitOrigin(['add', '.']);
+    assert.equal(runGitOrigin(['commit', '-m', 'base main commit']).status, 0);
+
+    // Create PR branch on origin adding sneaky workspace & importing it
+    assert.equal(runGitOrigin(['checkout', '-b', 'pr-feature']).status, 0);
+    fs.writeFileSync(path.join(originDir, 'package.json'), JSON.stringify({ name: 'shallow-root', workspaces: ['sneaky-lib'] }), 'utf-8');
+    fs.writeFileSync(path.join(originDir, 'sneaky-lib', 'package.json'), JSON.stringify({ name: '@shallow/sneaky' }), 'utf-8');
+    fs.writeFileSync(path.join(originDir, 'apps', 'web', 'src', 'pr.ts'), "import { x } from '@shallow/sneaky';\nexport const v = x;\n", 'utf-8');
+    runGitOrigin(['add', '.']);
+    assert.equal(runGitOrigin(['commit', '-m', 'pr commit']).status, 0);
+
+    // Clone shallow (--depth=1 --single-branch -b pr-feature): origin/main is NOT present locally
+    const cloneRes = spawnSync(
+      'git',
+      ['clone', '--depth=1', '--single-branch', '-b', 'pr-feature', `file://${originDir.replace(/\\/g, '/')}`, shallowDir],
+      { encoding: 'utf-8' }
+    );
+    assert.equal(cloneRes.status, 0, `Shallow clone failed: ${cloneRes.stderr}`);
+    const checkOriginMain = spawnSync('git', ['rev-parse', '--verify', 'origin/main'], { cwd: shallowDir, encoding: 'utf-8' });
+    assert.notEqual(checkOriginMain.status, 0, 'Scenario (b): origin/main must NOT exist in single-branch depth-1 shallow clone');
+
+    const baseAccessorB = resolveBaseWorkspaceFileAccessor(shallowDir, {
+      baseRef: 'main',
+      eventName: 'pull_request',
+    });
+    assert.ok(baseAccessorB, 'Scenario (b): Must return fail-closed accessor rather than undefined');
+    const classifB = classifyInScopeFiles(['apps/web/src/pr.ts'], { cwd: shallowDir, sourceMode: 'explicit' });
+    const auditResB = await auditClassifiedFiles(classifB, {
+      apiKey: '',
+      minScore: 85,
+      isFork: false,
+      verifiedAllowlist: {
+        rulesByPath: new Map(),
+        invalidAllowlistEntries: [],
+        allowlistModifiedInPr: false,
+        sourceMode: 'empty',
+        workspacesMode: 'auto',
+      },
+      cwd: shallowDir,
+      baseFileAccessor: baseAccessorB,
+    });
+    assert.equal(auditResB.hasFindingFailure, true, 'Scenario (b): Shallow clone missing origin/main must fail closed with DG004');
+    assert.equal(auditResB.workspaceContext?.packagesByName.size, 0, 'Scenario (b): Shallow clone must admit 0 PR workspace packages');
+    assert.ok((auditResB.summaries[0].inlineFindings ?? []).some((f) => f.ruleId === 'DG004' && f.message.includes('@shallow/sneaky')));
+    console.log('✔ Test 85(b): Shallow clone (--depth=1) without origin/main verified fail-closed (DG004 triggered)');
+
+    // Scenario (c): Base branch exists (origin/main present), but base branch has NO workspace config at all
+    const noWsBaseDir = path.join(tempRepo, 'no-ws-base-repo');
+    fs.mkdirSync(path.join(noWsBaseDir, 'apps', 'web', 'src'), { recursive: true });
+    fs.writeFileSync(path.join(noWsBaseDir, 'package.json'), JSON.stringify({ name: 'plain-repo', dependencies: { express: '^4.0.0' } }), 'utf-8');
+    fs.writeFileSync(path.join(noWsBaseDir, 'apps', 'web', 'src', 'index.ts'), 'export const a = 1;\n', 'utf-8');
+    const runGitNoWs = (args: string[]) => spawnSync('git', args, { cwd: noWsBaseDir, encoding: 'utf-8' });
+    assert.equal(runGitNoWs(['init', '-b', 'main']).status, 0);
+    runGitNoWs(['config', 'user.email', 'ci@devguard.local']);
+    runGitNoWs(['config', 'user.name', 'DevGuard Test']);
+    runGitNoWs(['add', '.']);
+    assert.equal(runGitNoWs(['commit', '-m', 'base commit without workspaces']).status, 0);
+    assert.equal(runGitNoWs(['update-ref', 'refs/remotes/origin/main', 'HEAD']).status, 0);
+
+    // PR working tree attempts to introduce workspaces & pnpm-workspace.yaml
+    fs.writeFileSync(path.join(noWsBaseDir, 'package.json'), JSON.stringify({ name: 'plain-repo', workspaces: ['packages/*'] }), 'utf-8');
+    fs.writeFileSync(path.join(noWsBaseDir, 'pnpm-workspace.yaml'), 'packages:\n  - "packages/*"\n', 'utf-8');
+    fs.mkdirSync(path.join(noWsBaseDir, 'packages', 'pr-ws'), { recursive: true });
+    fs.writeFileSync(path.join(noWsBaseDir, 'packages', 'pr-ws', 'package.json'), JSON.stringify({ name: '@pr/added-ws' }), 'utf-8');
+    fs.writeFileSync(path.join(noWsBaseDir, 'apps', 'web', 'src', 'use-pr-ws.ts'), "import { p } from '@pr/added-ws';\nexport const u = p;\n", 'utf-8');
+
+    const baseAccessorC = resolveBaseWorkspaceFileAccessor(noWsBaseDir, {
+      baseRef: 'main',
+      eventName: 'pull_request',
+    });
+    assert.ok(baseAccessorC);
+    const classifC = classifyInScopeFiles(['apps/web/src/use-pr-ws.ts'], { cwd: noWsBaseDir, sourceMode: 'explicit' });
+    const auditResC = await auditClassifiedFiles(classifC, {
+      apiKey: '',
+      minScore: 85,
+      isFork: false,
+      verifiedAllowlist: {
+        rulesByPath: new Map(),
+        invalidAllowlistEntries: [],
+        allowlistModifiedInPr: false,
+        sourceMode: 'empty',
+        workspacesMode: 'auto',
+      },
+      cwd: noWsBaseDir,
+      baseFileAccessor: baseAccessorC,
+    });
+    assert.equal(auditResC.hasFindingFailure, true, 'Scenario (c): Base branch with 0 workspace globs must block PR-introduced workspaces');
+    assert.equal(auditResC.workspaceContext?.packagesByName.size, 0);
+    assert.ok((auditResC.summaries[0].inlineFindings ?? []).some((f) => f.ruleId === 'DG004' && f.message.includes('@pr/added-ws')));
+    console.log('✔ Test 85(c): Base branch without workspace config verified fail-closed against PR-added workspaces');
+
+    // Allowlist PR modification fail-closed check
+    const allowlistMissingBase = loadVerifiedAllowlist({
+      baseRef: 'missing-base-branch',
+      eventName: 'pull_request',
+      isCi: true,
+      readBaseFile: () => null,
+      readWorkingFile: () => JSON.stringify({ ignoreRulesByPath: { 'apps/*': ['DG004'] } }),
+    });
+    assert.equal(allowlistMissingBase.allowlistModifiedInPr, true);
+    assert.equal(allowlistMissingBase.sourceMode, 'base-pr');
+    assert.equal(allowlistMissingBase.rulesByPath.size, 0, 'Missing base ref allowlist must fail-closed to 0 active rules');
+  } finally {
+    fs.rmSync(tempRepo, { recursive: true, force: true });
+  }
+});
+
+test('Test 86: Stage 6.1.d Acceptance Quotas A6-3 (>=5 TN x 5 Sources + >=5 Monorepo TP), A6-11 (All 5 Bail-Out Codes), & A6-2 Non-Workspace SARIF Parity', () => {
+  const makeAccessor = (files: Record<string, string>): WorkspaceFileAccessor => ({
+    readFile: (p) => files[p.replace(/\\/g, '/')] ?? null,
+    fileExists: (p) => Object.prototype.hasOwnProperty.call(files, p.replace(/\\/g, '/')),
+    listFiles: () => Object.keys(files),
+  });
+
+  // 1. A6-3 Source 1: package.json workspaces (array format) — 5 TN
+  const arrFiles: Record<string, string> = {
+    'package.json': JSON.stringify({ name: 'arr-root', workspaces: ['packages/*'] }),
+    'packages/p1/package.json': JSON.stringify({ name: '@arr/pkg1' }),
+    'packages/p2/package.json': JSON.stringify({ name: '@arr/pkg2' }),
+    'packages/p3/package.json': JSON.stringify({ name: '@arr/pkg3' }),
+    'packages/p4/package.json': JSON.stringify({ name: '@arr/pkg4' }),
+    'packages/p5/package.json': JSON.stringify({ name: '@arr/pkg5' }),
+    'packages/app/package.json': JSON.stringify({ name: '@arr/app', dependencies: {} }),
+  };
+  const arrAcc = makeAccessor(arrFiles);
+  const arrCtx = buildWorkspaceContext(arrAcc, { mode: 'auto' });
+  const arrCode = [
+    "import { a } from '@arr/pkg1';",
+    "import { b } from '@arr/pkg2/sub';",
+    "import { c } from '@arr/pkg3';",
+    "import { d } from '@arr/pkg4';",
+    "import { e } from '@arr/pkg5';",
+    'export const sum = [a, b, c, d, e].length;',
+  ].join('\n');
+  const arrReport = analyzeCodeDeterministically(arrCode, {
+    filePath: 'packages/app/src/index.ts',
+    workspaceContext: arrCtx,
+    workspaceFileAccessor: arrAcc,
+    workspacesMode: 'auto',
+  });
+  assert.equal((arrReport.inlineFindings ?? []).filter((f) => f.ruleId === 'DG004').length, 0, 'A6-3 array workspaces: 5 TN must produce 0 DG004 findings');
+
+  // 2. A6-3 Source 2: package.json workspaces (object { packages: [...] } format) — 5 TN
+  const objFiles: Record<string, string> = {
+    'package.json': JSON.stringify({ name: 'obj-root', workspaces: { packages: ['libs/*'] } }),
+    'libs/l1/package.json': JSON.stringify({ name: '@obj/lib1' }),
+    'libs/l2/package.json': JSON.stringify({ name: '@obj/lib2' }),
+    'libs/l3/package.json': JSON.stringify({ name: '@obj/lib3' }),
+    'libs/l4/package.json': JSON.stringify({ name: '@obj/lib4' }),
+    'libs/l5/package.json': JSON.stringify({ name: '@obj/lib5' }),
+    'libs/app/package.json': JSON.stringify({ name: '@obj/app', dependencies: {} }),
+  };
+  const objAcc = makeAccessor(objFiles);
+  const objCtx = buildWorkspaceContext(objAcc, { mode: 'auto' });
+  const objCode = [
+    "import { a } from '@obj/lib1';",
+    "import { b } from '@obj/lib2';",
+    "import { c } from '@obj/lib3/deep';",
+    "import { d } from '@obj/lib4';",
+    "import { e } from '@obj/lib5';",
+    'export const sum = [a, b, c, d, e].length;',
+  ].join('\n');
+  const objReport = analyzeCodeDeterministically(objCode, {
+    filePath: 'libs/app/src/index.ts',
+    workspaceContext: objCtx,
+    workspaceFileAccessor: objAcc,
+    workspacesMode: 'auto',
+  });
+  assert.equal((objReport.inlineFindings ?? []).filter((f) => f.ruleId === 'DG004').length, 0, 'A6-3 object workspaces: 5 TN must produce 0 DG004 findings');
+
+  // 3. A6-3 Source 3: pnpm-workspace.yaml — 5 TN
+  const pnpmFiles: Record<string, string> = {
+    'package.json': JSON.stringify({ name: 'pnpm-root' }),
+    'pnpm-workspace.yaml': 'packages:\n  - "pkgs/*"\n',
+    'pkgs/k1/package.json': JSON.stringify({ name: '@pnpm/mod1' }),
+    'pkgs/k2/package.json': JSON.stringify({ name: '@pnpm/mod2' }),
+    'pkgs/k3/package.json': JSON.stringify({ name: '@pnpm/mod3' }),
+    'pkgs/k4/package.json': JSON.stringify({ name: '@pnpm/mod4' }),
+    'pkgs/k5/package.json': JSON.stringify({ name: '@pnpm/mod5' }),
+    'pkgs/app/package.json': JSON.stringify({ name: '@pnpm/app', dependencies: {} }),
+  };
+  const pnpmAcc = makeAccessor(pnpmFiles);
+  const pnpmCtx = buildWorkspaceContext(pnpmAcc, { mode: 'auto' });
+  const pnpmCode = [
+    "import { a } from '@pnpm/mod1';",
+    "import { b } from '@pnpm/mod2';",
+    "import { c } from '@pnpm/mod3';",
+    "import { d } from '@pnpm/mod4/util';",
+    "import { e } from '@pnpm/mod5';",
+    'export const sum = [a, b, c, d, e].length;',
+  ].join('\n');
+  const pnpmReport = analyzeCodeDeterministically(pnpmCode, {
+    filePath: 'pkgs/app/src/index.ts',
+    workspaceContext: pnpmCtx,
+    workspaceFileAccessor: pnpmAcc,
+    workspacesMode: 'auto',
+  });
+  assert.equal((pnpmReport.inlineFindings ?? []).filter((f) => f.ruleId === 'DG004').length, 0, 'A6-3 pnpm-workspace.yaml: 5 TN must produce 0 DG004 findings');
+
+  // 4. A6-3 Source 4: tsconfig.json paths & baseUrl — 5 TN
+  const tsFiles: Record<string, string> = {
+    'package.json': JSON.stringify({ name: 'ts-root' }),
+    'tsconfig.json': JSON.stringify({
+      compilerOptions: {
+        baseUrl: '.',
+        paths: {
+          '@ui/*': ['src/ui/*'],
+          '@utils/*': ['src/utils/*'],
+          'exact-mod': ['src/exact.ts'],
+        },
+      },
+    }),
+    'shared/auth.ts': 'export const auth = 1;\n',
+    'shared/db.ts': 'export const db = 2;\n',
+  };
+  const tsAcc = makeAccessor(tsFiles);
+  const tsCtx = buildWorkspaceContext(tsAcc, { mode: 'auto' });
+  const tsCode = [
+    "import { Btn } from '@ui/Button';",
+    "import { fmt } from '@utils/format';",
+    "import { ex } from 'exact-mod';",
+    "import { auth } from 'shared/auth';",
+    "import { db } from 'shared/db';",
+    'export const out = [Btn, fmt, ex, auth, db].length;',
+  ].join('\n');
+  const tsReport = analyzeCodeDeterministically(tsCode, {
+    filePath: 'src/index.ts',
+    workspaceContext: tsCtx,
+    workspaceFileAccessor: tsAcc,
+    workspacesMode: 'auto',
+  });
+  assert.equal((tsReport.inlineFindings ?? []).filter((f) => f.ruleId === 'DG004').length, 0, 'A6-3 tsconfig paths/baseUrl: 5 TN must produce 0 DG004 findings');
+
+  // 5. A6-3 Source 5: package.json imports (#...) — 5 TN
+  const impFiles: Record<string, string> = {
+    'package.json': JSON.stringify({
+      name: 'imp-root',
+      imports: {
+        '#root-a': './src/a.js',
+        '#root-b': './src/b.js',
+        '#internal/*': './src/internal/*.js',
+      },
+    }),
+    'apps/web/package.json': JSON.stringify({
+      name: '@imp/web',
+      imports: {
+        '#pkg-c': './src/c.js',
+        '#pkg-d/*': './src/d/*.js',
+      },
+    }),
+  };
+  const impAcc = makeAccessor(impFiles);
+  const impCtx = buildWorkspaceContext(impAcc, { mode: 'auto' });
+  const impCode = [
+    "import { a } from '#root-a';",
+    "import { b } from '#root-b';",
+    "import { c } from '#pkg-c';",
+    "import { d } from '#pkg-d/sub';",
+    "import { e } from '#internal/helper';",
+    'export const res = [a, b, c, d, e].length;',
+  ].join('\n');
+  const impReport = analyzeCodeDeterministically(impCode, {
+    filePath: 'apps/web/src/index.ts',
+    workspaceContext: impCtx,
+    workspaceFileAccessor: impAcc,
+    workspacesMode: 'auto',
+  });
+  assert.equal((impReport.inlineFindings ?? []).filter((f) => f.ruleId === 'DG004').length, 0, 'A6-3 package.json #imports: 5 TN must produce 0 DG004 findings');
+
+  // 6. A6-3 Monorepo TP: >= 5 hallucinated packages inside active monorepo MUST still be caught by DG004
+  const tpCode = [
+    "import { x1 } from 'ai-hallucinated-one';",
+    "import { x2 } from 'phantom-sdk-two';",
+    "import { x3 } from '@ghost-scope/three';",
+    "import { x4 } from 'nonexistent-lib-four';",
+    "import { x5 } from 'fictitious-pkg-five';",
+    'export const bad = [x1, x2, x3, x4, x5].length;',
+  ].join('\n');
+  const tpReport = analyzeCodeDeterministically(tpCode, {
+    filePath: 'packages/app/src/bad.ts',
+    workspaceContext: arrCtx,
+    workspaceFileAccessor: arrAcc,
+    workspacesMode: 'auto',
+  });
+  const tpDg004 = (tpReport.inlineFindings ?? []).filter((f) => f.ruleId === 'DG004');
+  assert.equal(tpDg004.length, 5, `A6-3 Monorepo TP: expected 5 DG004 findings, got ${tpDg004.length}`);
+
+  // 7. A6-11: All 5 bail-out reason codes emit DG004-WS-UNPARSED (scoring: false) with 0 partial names
+  const bailoutCases: Array<{ reason: WorkspaceBailoutReason; files: Record<string, string>; checkTsconfig?: boolean }> = [
+    {
+      reason: 'yaml_unsupported_construct',
+      files: {
+        'package.json': JSON.stringify({ name: 'b1' }),
+        'pnpm-workspace.yaml': 'packages:\n  - &anchor "packages/*"\n  - *anchor\n',
+        'packages/a/package.json': JSON.stringify({ name: '@b1/a' }),
+      },
+    },
+    {
+      reason: 'jsonc_syntax',
+      files: {
+        'package.json': '{ "name": "b2", "workspaces": ["packages/*" ',
+        'packages/a/package.json': JSON.stringify({ name: '@b2/a' }),
+      },
+    },
+    {
+      reason: 'extends_external',
+      files: {
+        'package.json': JSON.stringify({ name: 'b3' }),
+        'tsconfig.json': JSON.stringify({ extends: '@tsconfig/node22/tsconfig.json', compilerOptions: { paths: { '@x/*': ['src/*'] } } }),
+      },
+      checkTsconfig: true,
+    },
+    {
+      reason: 'extends_cycle',
+      files: {
+        'package.json': JSON.stringify({ name: 'b4' }),
+        'tsconfig.json': JSON.stringify({ extends: './tsconfig.b.json' }),
+        'tsconfig.b.json': JSON.stringify({ extends: './tsconfig.json' }),
+      },
+      checkTsconfig: true,
+    },
+    {
+      reason: 'size_limit',
+      files: {
+        'package.json': JSON.stringify({ name: 'b5' }),
+        'pnpm-workspace.yaml': 'packages:\n  - "packages/*"\n# ' + 'a'.repeat(MAX_CONFIG_FILE_SIZE + 100),
+        'packages/a/package.json': JSON.stringify({ name: '@b5/a' }),
+      },
+    },
+  ];
+  for (const bc of bailoutCases) {
+    const ctx = buildWorkspaceContext(makeAccessor(bc.files), { mode: 'auto' });
+    const notices = ctx.diagnostics.filter((d) => d.ruleId === 'DG004-WS-UNPARSED' && d.reason === bc.reason);
+    assert.equal(notices.length, 1, `A6-11: expected exactly 1 DG004-WS-UNPARSED with reason=${bc.reason}`);
+    assert.equal(notices[0].scoring, false, `A6-11: ${bc.reason} notice must be non-scoring`);
+    if (bc.checkTsconfig) {
+      assert.equal(ctx.tsconfigData, undefined, `A6-11: ${bc.reason} must contribute 0 partial tsconfig paths`);
+    } else {
+      assert.equal(ctx.packagesByName.size, 0, `A6-11: ${bc.reason} must contribute 0 partial workspace packages`);
+    }
+  }
+
+  // 8. A6-2: Non-workspace repo SARIF parity (auto vs off byte-for-byte identical)
+  const plainFiles: Record<string, string> = {
+    'package.json': JSON.stringify({ name: 'plain-app', dependencies: { express: '^4.0.0' } }),
+  };
+  const plainAcc = makeAccessor(plainFiles);
+  const plainCode = "import express from 'express';\nimport fake from 'definitely-phantom-pkg';\nexport const x = [express, fake];\n";
+  const repAuto = analyzeCodeDeterministically(plainCode, {
+    filePath: 'src/app.ts',
+    workspaceContext: buildWorkspaceContext(plainAcc, { mode: 'auto' }),
+    workspaceFileAccessor: plainAcc,
+    workspacesMode: 'auto',
+  });
+  const repOff = analyzeCodeDeterministically(plainCode, {
+    filePath: 'src/app.ts',
+    workspaceContext: buildWorkspaceContext(plainAcc, { mode: 'off' }),
+    workspaceFileAccessor: plainAcc,
+    workspacesMode: 'off',
+  });
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-a62-'));
+  try {
+    const pAuto = path.join(tmpDir, 'auto.sarif');
+    const pOff = path.join(tmpDir, 'off.sarif');
+    const toSummary = (r: ReturnType<typeof analyzeCodeDeterministically>): FileAuditSummary => ({
+      filePath: 'src/app.ts',
+      security: r.skor.security,
+      correctness: r.skor.correctness,
+      maintainability: r.skor.maintainability,
+      overall: r.skor.totalScore,
+      passed: false,
+      fatalFlaws: [r.temuanUtama.description],
+      defenseInDepth: r.residualNotes || [],
+      inlineFindings: r.inlineFindings,
+      layer2Status: 'Skipped: No API Key',
+    });
+    generateSarifReport([toSummary(repAuto)], pAuto);
+    generateSarifReport([toSummary(repOff)], pOff);
+    assert.equal(fs.readFileSync(pAuto, 'utf-8'), fs.readFileSync(pOff, 'utf-8'), 'A6-2: Non-workspace SARIF must be byte-for-byte identical between auto and off');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+
+
 
 
 

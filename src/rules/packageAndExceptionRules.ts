@@ -10,8 +10,30 @@ import {
   type LineFinding,
 } from './lexicalMasker.ts';
 import { redactSecretsPreservingLayout } from './secretAndResilienceRules.ts';
+import {
+  buildWorkspaceContext,
+  extractPackageManifestData,
+  findNearestPackageManifest,
+  resolveWorkspaceImportSpecifier,
+  type ResolutionSource,
+  type WorkspaceContext,
+  type WorkspaceDiagnosticNotice,
+  type WorkspaceFileAccessor,
+  type WorkspaceResolutionResult,
+} from './workspaceResolver.ts';
 
-export { CRITICAL_FLOW_IDENTIFIERS };
+export {
+  CRITICAL_FLOW_IDENTIFIERS,
+  buildWorkspaceContext,
+  extractPackageManifestData,
+  findNearestPackageManifest,
+  resolveWorkspaceImportSpecifier,
+  type ResolutionSource,
+  type WorkspaceContext,
+  type WorkspaceDiagnosticNotice,
+  type WorkspaceFileAccessor,
+  type WorkspaceResolutionResult,
+};
 
 export const POPULAR_NPM_PACKAGES = [
   'express', 'lodash', 'axios', 'zod', 'jsonwebtoken', 'stripe', 'prisma',
@@ -82,6 +104,163 @@ function matchesSubpathImport(specifier: string, subpathImports: Record<string, 
   return false;
 }
 
+function getNodeBuiltinsFromProc(): {
+  fsMod?: {
+    existsSync: (p: string) => boolean;
+    readFileSync: (p: string, enc: string) => string;
+    statSync: (p: string) => { isFile: () => boolean };
+    readdirSync: (p: string) => string[];
+  };
+  pathMod?: {
+    resolve: (...parts: string[]) => string;
+    dirname: (p: string) => string;
+    join: (...parts: string[]) => string;
+    relative: (from: string, to: string) => string;
+    isAbsolute: (p: string) => boolean;
+  };
+} {
+  const proc = (globalThis as { process?: { getBuiltinModule?: (id: string) => unknown } }).process;
+  if (!proc || typeof proc.getBuiltinModule !== 'function') return {};
+  try {
+    const fsMod = proc.getBuiltinModule('node:fs') as {
+      existsSync: (p: string) => boolean;
+      readFileSync: (p: string, enc: string) => string;
+      statSync: (p: string) => { isFile: () => boolean };
+      readdirSync: (p: string) => string[];
+    };
+    const pathMod = proc.getBuiltinModule('node:path') as {
+      resolve: (...parts: string[]) => string;
+      dirname: (p: string) => string;
+      join: (...parts: string[]) => string;
+      relative: (from: string, to: string) => string;
+      isAbsolute: (p: string) => boolean;
+    };
+    return { fsMod, pathMod };
+  } catch {
+    return {};
+  }
+}
+
+function toRepoRelativePosixPath(filePath: string, rootDir?: string): string {
+  const isAbs = filePath.startsWith('/') || /^[A-Za-z]:[\\/]/.test(filePath);
+  if (!isAbs) {
+    return filePath.replace(/\\/g, '/').replace(/^\.\//, '');
+  }
+  const { pathMod } = getNodeBuiltinsFromProc();
+  const procCwd = (globalThis as { process?: { cwd?: () => string } }).process?.cwd?.();
+  const base = rootDir ?? procCwd;
+  if (pathMod && base) {
+    return pathMod.relative(pathMod.resolve(base), pathMod.resolve(filePath)).replace(/\\/g, '/').replace(/^\.\//, '');
+  }
+  return filePath.replace(/\\/g, '/');
+}
+
+function createFsWorkspaceAccessor(rootDir: string): WorkspaceFileAccessor | null {
+  const { fsMod, pathMod } = getNodeBuiltinsFromProc();
+  if (!fsMod || !pathMod) return null;
+  const absRoot = pathMod.resolve(rootDir);
+
+  const resolveSafe = (relPath: string): string | null => {
+    const cleanRel = relPath.replace(/\\/g, '/').replace(/^\/+/, '');
+    const full = pathMod.resolve(absRoot, cleanRel);
+    const relBack = pathMod.relative(absRoot, full);
+    if (relBack.startsWith('..') || pathMod.isAbsolute(relBack)) {
+      return null;
+    }
+    return full;
+  };
+
+  return {
+    rootDir: absRoot,
+    readFile(relPath: string): string | null {
+      try {
+        const full = resolveSafe(relPath);
+        if (!full || !fsMod.existsSync(full) || !fsMod.statSync(full).isFile()) return null;
+        return fsMod.readFileSync(full, 'utf-8');
+      } catch {
+        return null;
+      }
+    },
+    fileExists(relPath: string): boolean {
+      try {
+        const full = resolveSafe(relPath);
+        return Boolean(full && fsMod.existsSync(full) && fsMod.statSync(full).isFile());
+      } catch {
+        return false;
+      }
+    },
+    readDir(relDir: string): string[] | null {
+      try {
+        const full = relDir === '.' || !relDir ? absRoot : resolveSafe(relDir);
+        if (!full || !fsMod.existsSync(full)) return null;
+        return fsMod.readdirSync(full);
+      } catch {
+        return null;
+      }
+    },
+  };
+}
+
+function buildDefaultFsWorkspaceContext(filePath: string): {
+  context: WorkspaceContext;
+  accessor: WorkspaceFileAccessor;
+  relFilePath: string;
+} | null {
+  const { fsMod, pathMod } = getNodeBuiltinsFromProc();
+  if (!fsMod || !pathMod) return null;
+
+  try {
+    const readFileSafe = (targetPath: string): string | null => {
+      try {
+        return fsMod.readFileSync(targetPath, 'utf-8');
+      } catch {
+        return null;
+      }
+    };
+    let dir = pathMod.dirname(pathMod.resolve(filePath));
+    let firstPkgDir: string | null = null;
+    let workspaceRootDir: string | null = null;
+
+    for (let depth = 0; depth < 12; depth++) {
+      const pkgPath = pathMod.join(dir, 'package.json');
+      const yamlPath = pathMod.join(dir, 'pnpm-workspace.yaml');
+      const hasPkg = fsMod.existsSync(pkgPath) && fsMod.statSync(pkgPath).isFile();
+      const hasYaml = fsMod.existsSync(yamlPath) && fsMod.statSync(yamlPath).isFile();
+
+      if (hasPkg && !firstPkgDir) {
+        firstPkgDir = dir;
+      }
+      if (hasYaml) {
+        workspaceRootDir = dir;
+      } else if (hasPkg) {
+        const raw = readFileSafe(pkgPath);
+        if (raw !== null && raw.includes('"workspaces"')) {
+          workspaceRootDir = dir;
+        }
+      }
+
+      if (fsMod.existsSync(pathMod.join(dir, '.git'))) {
+        break;
+      }
+      const parent = pathMod.dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+
+    const chosenRoot = workspaceRootDir ?? firstPkgDir;
+    if (!chosenRoot) return null;
+
+    const accessor = createFsWorkspaceAccessor(chosenRoot);
+    if (!accessor) return null;
+
+    const context = buildWorkspaceContext(accessor, { mode: 'auto' });
+    const relFilePath = toRepoRelativePosixPath(filePath, chosenRoot);
+    return { context, accessor, relFilePath };
+  } catch {
+    return null;
+  }
+}
+
 function resolvePackageMetadata(options?: AuditAnalyzeOptions): ResolvedPackageMetadata {
   const result: ResolvedPackageMetadata = {
     declaredDeps:
@@ -96,20 +275,10 @@ function resolvePackageMetadata(options?: AuditAnalyzeOptions): ResolvedPackageM
   if (result.declaredDeps !== undefined && result.subpathImports !== undefined) return result;
   if (!options?.filePath || typeof options.filePath !== 'string') return result;
 
-  const proc = (globalThis as { process?: { getBuiltinModule?: (id: string) => unknown } }).process;
-  if (!proc || typeof proc.getBuiltinModule !== 'function') return result;
+  const { fsMod, pathMod } = getNodeBuiltinsFromProc();
+  if (!fsMod || !pathMod) return result;
 
   try {
-    const fsMod = proc.getBuiltinModule('node:fs') as {
-      existsSync: (p: string) => boolean;
-      readFileSync: (p: string, enc: string) => string;
-    };
-    const pathMod = proc.getBuiltinModule('node:path') as {
-      resolve: (...parts: string[]) => string;
-      dirname: (p: string) => string;
-      join: (...parts: string[]) => string;
-    };
-
     const mergedDeps = new Set<string>();
     let foundAnyPkg = false;
     let mergedImports: Record<string, unknown> | undefined;
@@ -153,36 +322,218 @@ function resolvePackageMetadata(options?: AuditAnalyzeOptions): ResolvedPackageM
   return result;
 }
 
+function emitTyposquatIfMatched(
+  num: number,
+  rawSpec: string,
+  basePkg: string,
+  lineText: string,
+  findings: LineFinding[],
+  inlineFindings: InlineFinding[]
+): boolean {
+  if (POPULAR_NPM_SET.has(basePkg)) return false;
+  let bestCandidate: string | undefined;
+  let bestDist = Number.POSITIVE_INFINITY;
+
+  for (const popular of POPULAR_NPM_PACKAGES) {
+    const dist = damerauLevenshtein(basePkg, popular);
+    const isMatch = (dist === 1 && basePkg.length >= 5) || (dist === 2 && basePkg.length >= 8);
+    if (isMatch && dist < bestDist) {
+      bestDist = dist;
+      bestCandidate = popular;
+    }
+  }
+
+  if (!bestCandidate) return false;
+
+  const replacementPkg = rawSpec === basePkg ? bestCandidate : rawSpec.replace(basePkg, bestCandidate);
+  const suggestion = lineText.replace(rawSpec, replacementPkg);
+  const msg = `Potensi slopsquatting / typosquatting pada paket '${rawSpec}' (jarak edit ${bestDist} dari '${bestCandidate}').`;
+  findings.push({
+    line: num,
+    category: 'security',
+    penalty: 40,
+    shortReason: `-40 [DG004] Typosquatting paket '${rawSpec}' -> '${bestCandidate}' (baris ${num})`,
+    detailedReason: msg,
+    isCritical: true,
+  });
+  inlineFindings.push({
+    ruleId: 'DG004',
+    line: num,
+    severity: 'error',
+    message: msg,
+    suggestion,
+  });
+  return true;
+}
+
+function emitPhantomFinding(
+  num: number,
+  basePkg: string,
+  findings: LineFinding[],
+  inlineFindings: InlineFinding[]
+): void {
+  const msg = `Phantom dependency '${basePkg}' diimpor pada baris ${num} namun tidak terdaftar di package.json.`;
+  findings.push({
+    line: num,
+    category: 'security',
+    penalty: 35,
+    shortReason: `-35 [DG004] Phantom dependency '${basePkg}' absen dari package.json (baris ${num})`,
+    detailedReason: msg,
+    isCritical: true,
+  });
+  inlineFindings.push({
+    ruleId: 'DG004',
+    line: num,
+    severity: 'error',
+    message: msg,
+  });
+}
+
+function emitSubpathFinding(
+  num: number,
+  rawSpec: string,
+  findings: LineFinding[],
+  inlineFindings: InlineFinding[]
+): void {
+  const msg = `Subpath import '${rawSpec}' tidak terdaftar pada field "imports" di package.json (baris ${num}).`;
+  findings.push({
+    line: num,
+    category: 'security',
+    penalty: 35,
+    shortReason: `-35 [DG004] Undeclared subpath import '${rawSpec}' (baris ${num})`,
+    detailedReason: msg,
+    isCritical: true,
+  });
+  inlineFindings.push({ ruleId: 'DG004', line: num, severity: 'error', message: msg });
+}
+
 /** DG004: Detects typosquatted and undeclared phantom package imports. */
 export function detectHallucinatedPackages(
   execLines: Array<{ num: number; text: string }>,
   maskedLines: string[],
   options: AuditAnalyzeOptions | undefined,
   findings: LineFinding[],
-  inlineFindings: InlineFinding[]
-): void {
+  inlineFindings: InlineFinding[],
+  isVirtualPass: boolean = false
+): WorkspaceContext | undefined {
   const builtinSet = getNodeBuiltinModuleSet(options?.builtinModules);
-  const { declaredDeps, subpathImports } = resolvePackageMetadata(options);
+  const isModeOff = options?.workspacesMode === 'off' || options?.workspaceContext?.mode === 'off';
+  const hasExplicitDepsOnly = options?.declaredDependencies !== undefined && options?.workspaceContext === undefined;
+
+  let wsContext: WorkspaceContext | undefined;
+  let wsAccessor: WorkspaceFileAccessor | undefined;
+  let relFilePath = options?.filePath ? toRepoRelativePosixPath(options.filePath) : 'index.ts';
+  let legacyMeta: ResolvedPackageMetadata | undefined;
+
+  if (isModeOff || hasExplicitDepsOnly) {
+    legacyMeta = resolvePackageMetadata(options);
+    if (
+      isModeOff &&
+      legacyMeta.declaredDeps === undefined &&
+      options?.workspaceContext &&
+      options?.workspaceFileAccessor
+    ) {
+      const rel = toRepoRelativePosixPath(
+        options.filePath ?? 'index.ts',
+        options.workspaceFileAccessor.rootDir
+      );
+      const nearest = findNearestPackageManifest(
+        rel,
+        options.workspaceFileAccessor,
+        options.workspaceContext.rootPkgPath,
+        options.workspaceContext
+      );
+      const hasAny =
+        nearest !== null || options.workspaceFileAccessor.fileExists(options.workspaceContext.rootPkgPath);
+      if (hasAny) {
+        const merged = new Set<string>(options.workspaceContext.rootDeclaredDeps);
+        if (nearest) {
+          for (const d of nearest.manifestData.declaredDeps) merged.add(d);
+        }
+        legacyMeta.declaredDeps = merged;
+        legacyMeta.subpathImports = nearest?.manifestData.subpathImports ?? options.workspaceContext.rootSubpathImports;
+      }
+    }
+  } else if (options?.workspaceContext) {
+    wsContext = options.workspaceContext;
+    wsAccessor =
+      options.workspaceFileAccessor ??
+      createFsWorkspaceAccessor(getNodeBuiltinsFromProc().pathMod ? '.' : '') ??
+      undefined;
+    relFilePath = toRepoRelativePosixPath(
+      options.filePath ?? 'index.ts',
+      wsAccessor?.rootDir
+    );
+  } else if (options?.filePath) {
+    const autoWs = buildDefaultFsWorkspaceContext(options.filePath);
+    if (autoWs) {
+      wsContext = autoWs.context;
+      wsAccessor = autoWs.accessor;
+      relFilePath = autoWs.relFilePath;
+    }
+  }
+
   const staticImportRe = /^\s*(?:(?:import|export)\b[^'"]*\bfrom\s+|import\s+|\}\s*from\s+)['"]([^'"]+)['"]/;
   const dynamicOrRequireRe =
     /(?:^|[^\w.'"`])\b(?:require|import)\s*\(\s*['"]([^'"]+)['"]\s*(?:,|\))/g;
   const maskedImportOrRequireRe = /^\s*(?:import\b|export\b[^\n;]*\bfrom\b|\}\s*from\b)|(?:^|[^\w.'"`])\b(?:require|import)\s*\(/;
 
+  const countBeforePass = wsContext ? wsContext.undeclaredWorkspaceImportsCount : 0;
+
   const evalSpec = (num: number, rawSpec: string, lineText: string): void => {
     if (!rawSpec) return;
 
+    if (wsContext && wsAccessor && !isModeOff) {
+      if (
+        rawSpec.startsWith('.') ||
+        rawSpec.startsWith('/') ||
+        rawSpec.startsWith('@/') ||
+        rawSpec.startsWith('~/') ||
+        rawSpec.startsWith('virtual:') ||
+        rawSpec.startsWith('workspace:') ||
+        rawSpec.startsWith('file:') ||
+        rawSpec.startsWith('link:') ||
+        (/^[a-z]+:/i.test(rawSpec) && !rawSpec.startsWith('node:') && !rawSpec.startsWith('npm:'))
+      ) {
+        return;
+      }
+
+      if (!rawSpec.startsWith('#') && !rawSpec.startsWith('npm:')) {
+        const strippedNode = rawSpec.startsWith('node:') ? rawSpec.slice(5) : rawSpec;
+        const baseStripped = getBasePackageName(strippedNode);
+        if (builtinSet.has(strippedNode) || builtinSet.has(baseStripped)) return;
+      }
+
+      const res = resolveWorkspaceImportSpecifier(rawSpec, relFilePath, wsContext, wsAccessor);
+      if (res.resolved) return;
+
+      if (rawSpec.startsWith('#')) {
+        const nearest = findNearestPackageManifest(relFilePath, wsAccessor, wsContext.rootPkgPath, wsContext);
+        const hasSubpathImports =
+          nearest?.manifestData.subpathImports !== undefined || wsContext.rootSubpathImports !== undefined;
+        if (hasSubpathImports) {
+          emitSubpathFinding(num, rawSpec, findings, inlineFindings);
+        }
+        return;
+      }
+
+      const basePkg = res.basePackage || getBasePackageName(rawSpec);
+      if (emitTyposquatIfMatched(num, rawSpec, basePkg, lineText, findings, inlineFindings)) {
+        return;
+      }
+
+      const nearest = findNearestPackageManifest(relFilePath, wsAccessor, wsContext.rootPkgPath, wsContext);
+      const hasAnyPkg = nearest !== null || wsAccessor.fileExists(wsContext.rootPkgPath);
+      if (hasAnyPkg) {
+        emitPhantomFinding(num, basePkg, findings, inlineFindings);
+      }
+      return;
+    }
+
+    // Legacy / mode: 'off' path (identical to v1.3.0 behavior)
     if (rawSpec.startsWith('#')) {
-      if (subpathImports && !matchesSubpathImport(rawSpec, subpathImports)) {
-        const msg = `Subpath import '${rawSpec}' tidak terdaftar pada field "imports" di package.json (baris ${num}).`;
-        findings.push({
-          line: num,
-          category: 'security',
-          penalty: 35,
-          shortReason: `-35 [DG004] Undeclared subpath import '${rawSpec}' (baris ${num})`,
-          detailedReason: msg,
-          isCritical: true,
-        });
-        inlineFindings.push({ ruleId: 'DG004', line: num, severity: 'error', message: msg });
+      if (legacyMeta?.subpathImports && !matchesSubpathImport(rawSpec, legacyMeta.subpathImports)) {
+        emitSubpathFinding(num, rawSpec, findings, inlineFindings);
       }
       return;
     }
@@ -203,59 +554,12 @@ export function detectHallucinatedPackages(
     if (builtinSet.has(strippedNode) || builtinSet.has(baseStripped)) return;
 
     const basePkg = getBasePackageName(rawSpec);
-
-    if (!POPULAR_NPM_SET.has(basePkg)) {
-      let bestCandidate: string | undefined;
-      let bestDist = Number.POSITIVE_INFINITY;
-
-      for (const popular of POPULAR_NPM_PACKAGES) {
-        const dist = damerauLevenshtein(basePkg, popular);
-        const isMatch = (dist === 1 && basePkg.length >= 5) || (dist === 2 && basePkg.length >= 8);
-        if (isMatch && dist < bestDist) {
-          bestDist = dist;
-          bestCandidate = popular;
-        }
-      }
-
-      if (bestCandidate) {
-        const replacementPkg = rawSpec === basePkg ? bestCandidate : rawSpec.replace(basePkg, bestCandidate);
-        const suggestion = lineText.replace(rawSpec, replacementPkg);
-        const msg = `Potensi slopsquatting / typosquatting pada paket '${rawSpec}' (jarak edit ${bestDist} dari '${bestCandidate}').`;
-        findings.push({
-          line: num,
-          category: 'security',
-          penalty: 40,
-          shortReason: `-40 [DG004] Typosquatting paket '${rawSpec}' -> '${bestCandidate}' (baris ${num})`,
-          detailedReason: msg,
-          isCritical: true,
-        });
-        inlineFindings.push({
-          ruleId: 'DG004',
-          line: num,
-          severity: 'error',
-          message: msg,
-          suggestion,
-        });
-        return;
-      }
+    if (emitTyposquatIfMatched(num, rawSpec, basePkg, lineText, findings, inlineFindings)) {
+      return;
     }
 
-    if (declaredDeps && !declaredDeps.has(basePkg)) {
-      const msg = `Phantom dependency '${basePkg}' diimpor pada baris ${num} namun tidak terdaftar di package.json.`;
-      findings.push({
-        line: num,
-        category: 'security',
-        penalty: 35,
-        shortReason: `-35 [DG004] Phantom dependency '${basePkg}' absen dari package.json (baris ${num})`,
-        detailedReason: msg,
-        isCritical: true,
-      });
-      inlineFindings.push({
-        ruleId: 'DG004',
-        line: num,
-        severity: 'error',
-        message: msg,
-      });
+    if (legacyMeta?.declaredDeps && !legacyMeta.declaredDeps.has(basePkg)) {
+      emitPhantomFinding(num, basePkg, findings, inlineFindings);
     }
   };
 
@@ -301,6 +605,12 @@ export function detectHallucinatedPackages(
       evalSpec(lineEntry.num, rawSpec, lineEntry.text);
     }
   }
+
+  if (isVirtualPass && wsContext) {
+    wsContext.undeclaredWorkspaceImportsCount = countBeforePass;
+  }
+
+  return wsContext;
 }
 
 const METHOD_PREFIX_KEYWORDS = new Set(['function', 'async', 'get', 'set', 'static']);

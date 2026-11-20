@@ -6,6 +6,7 @@ import {
   redactSecretsPreservingLayout,
   type InlineFinding,
   type ParsedSuppression,
+  type WorkspaceDiagnosticNotice,
 } from './devguardAnalyzer.ts';
 
 export interface PrEnvironmentInfo {
@@ -86,6 +87,12 @@ export interface PrCoverageSummary {
   failOnUnanalyzable?: boolean;
   maxSkippedDisplay?: number;
   maxPartialDisplay?: number;
+  workspaceSummary?: {
+    packageCount: number;
+    sources: ReadonlyArray<string>;
+    undeclaredWorkspaceImportsCount?: number;
+    diagnostics?: ReadonlyArray<WorkspaceDiagnosticNotice>;
+  };
 }
 
 export const MAX_PR_SKIPPED_FILES_DISPLAY = 20;
@@ -294,7 +301,12 @@ export function buildPullRequestCommentMarkdown(
   const hasAnalysisErrors =
     analysisFailureCount > 0 ||
     skippedFiles.some((s) => s.reason === 'parse_error' || s.reason === 'internal_error');
-  const unanalyzableFailed = Boolean(coverage?.failOnUnanalyzable && skippedCount > 0);
+  const unparsedWsCount = (coverage?.workspaceSummary?.diagnostics ?? []).filter(
+    (d) => d.ruleId === 'DG004-WS-UNPARSED'
+  ).length;
+  const unanalyzableFailed = Boolean(
+    coverage?.failOnUnanalyzable && (skippedCount > 0 || unparsedWsCount > 0)
+  );
 
   let badgeStatus: string;
   if (!analyzedPassed) {
@@ -361,6 +373,16 @@ export function buildPullRequestCommentMarkdown(
   if (ignoredDeletedCount > 0) {
     coverageLines.push(`- Ignored (deleted): ${ignoredDeletedCount}`);
   }
+  const wsSummary = coverage?.workspaceSummary;
+  if (wsSummary) {
+    if (wsSummary.packageCount > 0 || wsSummary.sources.length > 0) {
+      const sourcesLabel = wsSummary.sources.length > 0 ? wsSummary.sources.join(', ') : 'none';
+      coverageLines.push(`- Workspaces detected: ${wsSummary.packageCount} (sources: ${sourcesLabel})`);
+    }
+    if ((wsSummary.undeclaredWorkspaceImportsCount ?? 0) > 0) {
+      coverageLines.push(`- ${wsSummary.undeclaredWorkspaceImportsCount} impor workspace tanpa deklarasi`);
+    }
+  }
   const coverageBlock = coverageLines.join('\n');
 
   const tableRows = summaries.map((summary) => {
@@ -419,12 +441,32 @@ export function buildPullRequestCommentMarkdown(
     });
   }
 
-  const dynWarningGroups = summaries
-    .map((summary) => ({
-      filePath: normalizePosixRepoPath(summary.filePath).replace(/[\r\n]+/g, ' '),
-      warnings: (summary.inlineFindings || []).filter((f) => f.scoring === false),
-    }))
-    .filter((group) => group.warnings.length > 0);
+  const nonScoringGroupMap = new Map<string, Array<{ line: number; message: string }>>();
+  for (const summary of summaries) {
+    const filePath = normalizePosixRepoPath(summary.filePath).replace(/[\r\n]+/g, ' ');
+    const warnings = (summary.inlineFindings || []).filter((f) => f.scoring === false);
+    if (warnings.length > 0) {
+      const existing = nonScoringGroupMap.get(filePath) ?? [];
+      for (const w of warnings) {
+        existing.push({ line: w.line, message: w.message });
+      }
+      nonScoringGroupMap.set(filePath, existing);
+    }
+  }
+  const seenWsDiagKeys = new Set<string>();
+  for (const diag of wsSummary?.diagnostics ?? []) {
+    const filePath = normalizePosixRepoPath(diag.sourceFile).replace(/[\r\n]+/g, ' ');
+    const dedupKey = `${diag.ruleId}:${filePath}:${diag.reason ?? ''}`;
+    if (seenWsDiagKeys.has(dedupKey)) continue;
+    seenWsDiagKeys.add(dedupKey);
+    const existing = nonScoringGroupMap.get(filePath) ?? [];
+    existing.push({ line: 1, message: diag.message });
+    nonScoringGroupMap.set(filePath, existing);
+  }
+  const dynWarningGroups = Array.from(nonScoringGroupMap.entries()).map(([filePath, warnings]) => ({
+    filePath,
+    warnings,
+  }));
 
   let nonScoringWarningsSection = '';
   if (dynWarningGroups.length > 0) {

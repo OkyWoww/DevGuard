@@ -8,6 +8,7 @@ import {
   MAX_GLOB_PATTERN_LENGTH,
   PARTIAL_ANALYSIS_EXTENSIONS,
   analyzeCodeDeterministically,
+  buildWorkspaceContext,
   hasAnalyzableExtension,
   hasPartialAnalysisExtension,
   isValidSuppressionReason,
@@ -16,6 +17,8 @@ import {
   redactSecretsPreservingLayout,
   type AllowlistRuleId,
   type ParsedDevGuardReport,
+  type WorkspaceContext,
+  type WorkspaceFileAccessor,
 } from './devguardAnalyzer.ts';
 
 export {
@@ -123,6 +126,7 @@ export interface VerifiedAllowlistResult {
   invalidAllowlistEntries: string[];
   allowlistModifiedInPr: boolean;
   sourceMode: 'base-pr' | 'base-push' | 'local' | 'empty';
+  workspacesMode?: 'auto' | 'off';
 }
 
 function readBeforeShaFromEventFile(eventPath: string | undefined): string | undefined {
@@ -250,9 +254,10 @@ export function loadVerifiedAllowlist(options?: LoadAllowlistOptions): VerifiedA
 
   const rulesByPath = new Map<string, AllowlistRuleEntry[]>();
   const invalidAllowlistEntries: string[] = [];
+  let workspacesMode: 'auto' | 'off' = 'auto';
 
   if (!activeRaw) {
-    return { rulesByPath, invalidAllowlistEntries, allowlistModifiedInPr, sourceMode };
+    return { rulesByPath, invalidAllowlistEntries, allowlistModifiedInPr, sourceMode, workspacesMode };
   }
 
   let parsedJson: unknown;
@@ -260,13 +265,45 @@ export function loadVerifiedAllowlist(options?: LoadAllowlistOptions): VerifiedA
     parsedJson = JSON.parse(activeRaw);
   } catch {
     invalidAllowlistEntries.push('Malformed JSON in .devguard.json');
-    return { rulesByPath, invalidAllowlistEntries, allowlistModifiedInPr, sourceMode };
+    return { rulesByPath, invalidAllowlistEntries, allowlistModifiedInPr, sourceMode, workspacesMode: 'off' };
   }
 
-  const rawMap = (parsedJson as { ignoreRulesByPath?: unknown })?.ignoreRulesByPath;
+  if (!parsedJson || typeof parsedJson !== 'object' || Array.isArray(parsedJson)) {
+    invalidAllowlistEntries.push('Malformed JSON in .devguard.json');
+    return { rulesByPath, invalidAllowlistEntries, allowlistModifiedInPr, sourceMode, workspacesMode: 'off' };
+  }
+
+  const rawWorkspaces = (parsedJson as { workspaces?: unknown }).workspaces;
+  if (rawWorkspaces !== undefined) {
+    if (!rawWorkspaces || typeof rawWorkspaces !== 'object' || Array.isArray(rawWorkspaces)) {
+      invalidAllowlistEntries.push('Invalid workspaces configuration in .devguard.json: expected an object');
+      workspacesMode = 'off';
+    } else {
+      const wsKeys = Object.keys(rawWorkspaces as Record<string, unknown>);
+      if (wsKeys.some((k) => k !== 'mode')) {
+        invalidAllowlistEntries.push('Rejected unsupported workspaces property in .devguard.json: only "mode" is allowed');
+      }
+      const rawMode = (rawWorkspaces as { mode?: unknown }).mode;
+      if (rawMode === undefined || rawMode === 'auto') {
+        workspacesMode = 'auto';
+      } else if (rawMode === 'off') {
+        workspacesMode = 'off';
+      } else {
+        invalidAllowlistEntries.push(
+          `Rejected invalid workspaces.mode "${String(rawMode)}" in .devguard.json: expected "auto" or "off"`
+        );
+        workspacesMode = 'off';
+      }
+    }
+  }
+
+  const rawMap = (parsedJson as { ignoreRulesByPath?: unknown }).ignoreRulesByPath;
+  if (rawMap === undefined && rawWorkspaces !== undefined) {
+    return { rulesByPath, invalidAllowlistEntries, allowlistModifiedInPr, sourceMode, workspacesMode };
+  }
   if (!rawMap || typeof rawMap !== 'object' || Array.isArray(rawMap)) {
     invalidAllowlistEntries.push('.devguard.json must contain an ignoreRulesByPath object');
-    return { rulesByPath, invalidAllowlistEntries, allowlistModifiedInPr, sourceMode };
+    return { rulesByPath, invalidAllowlistEntries, allowlistModifiedInPr, sourceMode, workspacesMode };
   }
 
   for (const [rawKey, rawEntries] of Object.entries(rawMap as Record<string, unknown>)) {
@@ -303,7 +340,160 @@ export function loadVerifiedAllowlist(options?: LoadAllowlistOptions): VerifiedA
     }
   }
 
-  return { rulesByPath, invalidAllowlistEntries, allowlistModifiedInPr, sourceMode };
+  return { rulesByPath, invalidAllowlistEntries, allowlistModifiedInPr, sourceMode, workspacesMode };
+}
+
+export function createFsWorkspaceFileAccessor(rootDir: string): WorkspaceFileAccessor {
+  const absRoot = path.resolve(rootDir);
+  const resolveSafe = (relPath: string): string | null => {
+    const cleanRel = relPath.replace(/\\/g, '/').replace(/^\/+/, '');
+    const full = path.resolve(absRoot, cleanRel);
+    const relBack = path.relative(absRoot, full);
+    if (relBack.startsWith('..') || path.isAbsolute(relBack)) {
+      return null;
+    }
+    return full;
+  };
+  return {
+    rootDir: absRoot,
+    readFile(relPath: string): string | null {
+      try {
+        const full = resolveSafe(relPath);
+        if (!full || !fs.existsSync(full) || !fs.statSync(full).isFile()) return null;
+        return fs.readFileSync(full, 'utf-8');
+      } catch {
+        return null;
+      }
+    },
+    fileExists(relPath: string): boolean {
+      try {
+        const full = resolveSafe(relPath);
+        return Boolean(full && fs.existsSync(full) && fs.statSync(full).isFile());
+      } catch {
+        return false;
+      }
+    },
+    readDir(relDir: string): string[] | null {
+      try {
+        const full = relDir === '.' || !relDir ? absRoot : resolveSafe(relDir);
+        if (!full || !fs.existsSync(full)) return null;
+        return fs.readdirSync(full);
+      } catch {
+        return null;
+      }
+    },
+  };
+}
+
+export function createGitRefWorkspaceFileAccessor(
+  cwd: string,
+  gitRef: string
+): WorkspaceFileAccessor | undefined {
+  if (!gitRef || gitRef.startsWith('-')) return undefined;
+  try {
+    execFileSync('git', ['rev-parse', '--verify', gitRef], {
+      cwd,
+      stdio: ['ignore', 'ignore', 'ignore'],
+    });
+  } catch {
+    return undefined;
+  }
+
+  let listedFiles: string[] | null = null;
+  let fileSet: Set<string> | null = null;
+  const readCache = new Map<string, string | null>();
+
+  const ensureListed = (): { list: string[]; set: Set<string> } => {
+    if (listedFiles !== null && fileSet !== null) {
+      return { list: listedFiles, set: fileSet };
+    }
+    try {
+      const raw = execFileSync('git', ['ls-tree', '-r', '--name-only', '-z', gitRef], {
+        cwd,
+        encoding: 'utf-8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
+      const files = raw
+        .split('\0')
+        .map((s) => s.trim().replace(/\\/g, '/'))
+        .filter((s) => Boolean(s))
+        .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+      listedFiles = files;
+      fileSet = new Set(files);
+    } catch {
+      listedFiles = [];
+      fileSet = new Set();
+    }
+    return { list: listedFiles, set: fileSet };
+  };
+
+  return {
+    listFiles(): string[] {
+      return [...ensureListed().list];
+    },
+    fileExists(relPath: string): boolean {
+      const norm = relPath.replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, '');
+      return ensureListed().set.has(norm);
+    },
+    readFile(relPath: string): string | null {
+      const norm = relPath.replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, '');
+      if (readCache.has(norm)) {
+        return readCache.get(norm) ?? null;
+      }
+      if (!ensureListed().set.has(norm)) {
+        readCache.set(norm, null);
+        return null;
+      }
+      try {
+        const content = execFileSync('git', ['show', `${gitRef}:${norm}`], {
+          cwd,
+          encoding: 'utf-8',
+          stdio: ['ignore', 'pipe', 'ignore'],
+        });
+        readCache.set(norm, content);
+        return content;
+      } catch {
+        readCache.set(norm, null);
+        return null;
+      }
+    },
+  };
+}
+
+export function createEmptyFailClosedWorkspaceAccessor(): WorkspaceFileAccessor {
+  return {
+    listFiles: () => [],
+    fileExists: () => false,
+    readFile: () => null,
+    readDir: () => [],
+  };
+}
+
+export function resolveBaseWorkspaceFileAccessor(
+  cwd: string,
+  options?: {
+    baseRef?: string;
+    eventName?: string;
+    beforeSha?: string;
+  }
+): WorkspaceFileAccessor | undefined {
+  const eventName = options?.eventName ?? process.env.GITHUB_EVENT_NAME;
+  const baseRef = options?.baseRef ?? process.env.GITHUB_BASE_REF;
+  const beforeSha = options?.beforeSha ?? readBeforeShaFromEventFile(process.env.GITHUB_EVENT_PATH);
+
+  if (baseRef && eventName !== 'push') {
+    const accessor = createGitRefWorkspaceFileAccessor(cwd, `origin/${baseRef}`);
+    // If base ref is specified (PR mode) but cannot be resolved from git (shallow clone, missing fetch, etc),
+    // we MUST fail closed and NOT fallback to working-tree package.json workspaces.
+    return accessor ?? createEmptyFailClosedWorkspaceAccessor();
+  }
+
+  if (eventName === 'push' && beforeSha && !/^0+$/.test(beforeSha)) {
+    const accessor = createGitRefWorkspaceFileAccessor(cwd, beforeSha);
+    return accessor ?? createEmptyFailClosedWorkspaceAccessor();
+  }
+
+  return undefined;
 }
 
 export function matchAllowlistForFile(
@@ -387,15 +577,25 @@ export async function evaluateCodeHybrid(
   precomputedL1?: ParsedDevGuardReport,
   filePath?: string,
   externalAllowlist?: ReadonlyArray<AllowlistRuleEntry>,
-  isFork?: boolean
+  isFork?: boolean,
+  workspaceOptions?: {
+    workspaceContext?: WorkspaceContext;
+    workspaceFileAccessor?: WorkspaceFileAccessor;
+    workspacesMode?: 'auto' | 'off';
+  }
 ): Promise<CliAuditResult> {
-  const pkgInfo = filePath ? resolveNearestPackageInfo(filePath) : {};
+  const effectiveWsMode = workspaceOptions?.workspacesMode ?? workspaceOptions?.workspaceContext?.mode;
+  const shouldUseLegacyPkgLookup = effectiveWsMode === 'off';
+  const pkgInfo = shouldUseLegacyPkgLookup && filePath ? resolveNearestPackageInfo(filePath) : {};
   const l1Result = precomputedL1 || analyzeCodeDeterministically(code, {
     filePath,
     declaredDependencies: pkgInfo.declaredDependencies,
     subpathImports: pkgInfo.subpathImports,
     builtinModules,
     externalAllowlist,
+    workspaceContext: workspaceOptions?.workspaceContext,
+    workspaceFileAccessor: workspaceOptions?.workspaceFileAccessor,
+    workspacesMode: effectiveWsMode,
   });
 
   const effectiveIsFork = isFork ?? resolvePrEnvironmentFromEnv().isFork;
@@ -987,6 +1187,9 @@ export interface AuditExecutionOptions {
   cwd?: string;
   readFileFn?: (filePath: string) => string;
   evaluateFn?: typeof evaluateCodeHybrid;
+  workspaceContext?: WorkspaceContext;
+  workspaceFileAccessor?: WorkspaceFileAccessor;
+  baseFileAccessor?: WorkspaceFileAccessor;
 }
 
 export interface AuditExecutionOutput {
@@ -996,6 +1199,7 @@ export interface AuditExecutionOutput {
   analysisFailureCount: number;
   totalScoreSum: number;
   auditedCount: number;
+  workspaceContext?: WorkspaceContext;
 }
 
 function classifyAnalysisErrorReason(err: unknown): SkippedReason {
@@ -1016,6 +1220,15 @@ export async function auditClassifiedFiles(
   const cwd = options.cwd ?? process.cwd();
   const evaluate = options.evaluateFn ?? evaluateCodeHybrid;
   const { apiKey, minScore, isFork, verifiedAllowlist } = options;
+
+  const workspacesMode: 'auto' | 'off' = verifiedAllowlist.workspacesMode ?? 'auto';
+  const wsAccessor = options.workspaceFileAccessor ?? createFsWorkspaceFileAccessor(cwd);
+  const wsContext =
+    options.workspaceContext ??
+    buildWorkspaceContext(wsAccessor, {
+      mode: workspacesMode,
+      baseFileAccessor: options.baseFileAccessor,
+    });
 
   let hasFindingFailure = false;
   let analysisFailureCount = 0;
@@ -1039,7 +1252,12 @@ export async function auditClassifiedFiles(
         undefined,
         filePath,
         fileExternalAllowlist,
-        isFork
+        isFork,
+        {
+          workspaceContext: wsContext,
+          workspaceFileAccessor: wsAccessor,
+          workspacesMode,
+        }
       );
       const report = result.parsedReport;
       const score = report.skor;
@@ -1112,6 +1330,7 @@ export async function auditClassifiedFiles(
     analysisFailureCount,
     totalScoreSum,
     auditedCount,
+    workspaceContext: wsContext,
   };
 }
 
@@ -1157,11 +1376,12 @@ export function computeOverallGateVerdict(
   skippedCount: number,
   hasFatalFailure: boolean,
   failOnUnanalyzable: boolean,
-  analysisFailureCount: number = 0
+  analysisFailureCount: number = 0,
+  unparsedWorkspaceCount: number = 0
 ): OverallGateVerdict {
   const overallScore = auditedCount > 0 ? Math.round(totalScoreSum / auditedCount) : null;
   const overallScoreDisplay = overallScore === null ? 'N/A' : String(overallScore);
-  const unanalyzableFailed = failOnUnanalyzable && skippedCount > 0;
+  const unanalyzableFailed = failOnUnanalyzable && (skippedCount > 0 || unparsedWorkspaceCount > 0);
   const gateFailed = hasFatalFailure || analysisFailureCount > 0 || unanalyzableFailed;
   return {
     overallScore,
@@ -1266,8 +1486,15 @@ export async function runAction() {
           invalidAllowlistEntries: [],
           allowlistModifiedInPr: false,
           sourceMode: 'empty' as const,
+          workspacesMode: 'auto' as const,
         };
-  const { summaries, hasFindingFailure, totalScoreSum, auditedCount } = await auditClassifiedFiles(
+
+  let baseFileAccessor: WorkspaceFileAccessor | undefined;
+  if (classification.analyzed.length > 0) {
+    baseFileAccessor = resolveBaseWorkspaceFileAccessor(process.cwd());
+  }
+
+  const { summaries, hasFindingFailure, totalScoreSum, auditedCount, workspaceContext } = await auditClassifiedFiles(
     classification,
     {
       apiKey,
@@ -1275,6 +1502,7 @@ export async function runAction() {
       isFork: prEnv.isFork,
       verifiedAllowlist,
       cwd: process.cwd(),
+      baseFileAccessor,
     }
   );
 
@@ -1304,13 +1532,20 @@ export async function runAction() {
     classification.invariantError
   );
 
+  const activeWsDiagnostics =
+    workspaceContext && workspaceContext.mode !== 'off' ? workspaceContext.diagnostics : [];
+  const unparsedWorkspaceCount = activeWsDiagnostics.filter(
+    (d) => d.ruleId === 'DG004-WS-UNPARSED'
+  ).length;
+
   const verdict = computeOverallGateVerdict(
     auditedCount,
     totalScoreSum,
     skippedFiles.length,
     hasFindingFailure,
     failOnUnanalyzable,
-    analysisFailureCount
+    analysisFailureCount,
+    unparsedWorkspaceCount
   );
 
   const codeFilesCount = classification.analyzed.length + skippedFiles.length;
@@ -1339,6 +1574,15 @@ export async function runAction() {
         ? 'HYBRID'
         : engineMode;
 
+  const hasVisibleWorkspaceSummary = Boolean(
+    workspaceContext &&
+      workspaceContext.mode !== 'off' &&
+      (workspaceContext.packagesByName.size > 0 ||
+        workspaceContext.workspaceGlobs.length > 0 ||
+        workspaceContext.undeclaredWorkspaceImportsCount > 0 ||
+        activeWsDiagnostics.length > 0)
+  );
+
   const coverageSummary: PrCoverageSummary = {
     analyzedCount: classification.analyzed.length,
     partialFiles,
@@ -1349,6 +1593,14 @@ export async function runAction() {
     ignoredExcludedPathCount,
     overallScore: verdict.overallScore,
     failOnUnanalyzable,
+    workspaceSummary: hasVisibleWorkspaceSummary && workspaceContext
+      ? {
+          packageCount: workspaceContext.packagesByName.size,
+          sources: workspaceContext.detectedSources,
+          undeclaredWorkspaceImportsCount: workspaceContext.undeclaredWorkspaceImportsCount,
+          diagnostics: activeWsDiagnostics,
+        }
+      : undefined,
   };
 
   // Comment & post inline review suggestions before process.exit so reports are posted on both pass and failure.
@@ -1361,6 +1613,7 @@ export async function runAction() {
   generateSarifReport(summaries, sarifFile, skippedFiles, {
     partialFiles,
     hasAnalysisFailure: analysisFailureCount > 0,
+    workspaceDiagnostics: activeWsDiagnostics.length > 0 ? activeWsDiagnostics : undefined,
   });
 
   writeGitHubOutput(outputFile, 'sarif_file', sarifFile);
@@ -1376,7 +1629,7 @@ export async function runAction() {
       console.error('   Perbaiki celah di atas atau terapkan patch perbaikan sebelum melakukan merge PR.\n');
     } else if (verdict.unanalyzableFailed && analysisFailureCount === 0) {
       console.error(
-        `🚫 DevGuard Quality Gate Rejected: ${skippedFiles.length} berkas tidak dapat dianalisis (fail_on_unanalyzable=true).`
+        `🚫 DevGuard Quality Gate Rejected: ${skippedFiles.length} berkas tidak dapat dianalisis, ${unparsedWorkspaceCount} config workspace gagal di-parse (fail_on_unanalyzable=true).`
       );
     }
     process.exit(1);
