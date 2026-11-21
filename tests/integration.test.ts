@@ -8222,3 +8222,196 @@ test('Test 88: Stage 7.1 Core Extraction Isolation (A7-1) & Byte-for-Byte SARIF 
     fs.rmSync(tmpParityDir, { recursive: true, force: true });
   }
 });
+
+test('Test 89: Stage 7.2 Zero-Dep CLI Adapter Contract (A7-3), Git Modes & Injection Defense (A7-4), & CLI SARIF Parity (A7-2)', async () => {
+  const { runCli } = await import('../src/adapters/cli/index.js');
+  const { validateGitRef } = await import('../src/adapters/cli/git.js');
+  const { generateSarifReport: coreGenerateSarif } = await import('../src/core/sarif.js');
+  const { execFileSync: execGitSync } = await import('node:child_process');
+
+  const execCli = (args: string[], cwd: string) => {
+    let stdout = '';
+    let stderr = '';
+    const code = runCli(args, {
+      cwd,
+      stdout: (s) => {
+        stdout += s;
+      },
+      stderr: (s) => {
+        stderr += s;
+      },
+    });
+    return { code, stdout, stderr };
+  };
+
+  // === A7-3: Help, Version, & Invalid Flag Exit Code 2 ===
+  const helpRes = execCli(['--help'], REPO_ROOT);
+  assert.equal(helpRes.code, 0);
+  assert.ok(helpRes.stdout.includes('devguard check'), 'Help must document devguard check');
+
+  const verRes = execCli(['--version'], REPO_ROOT);
+  assert.equal(verRes.code, 0);
+  assert.equal(verRes.stdout.trim(), getDevGuardVersion());
+
+  for (const badArgs of [
+    ['check', '--unknown-flag'],
+    ['check', '--format', 'xml'],
+    ['check', '--min-score', '150'],
+    ['check', '--min-score', 'abc'],
+    ['check', '--staged', '--changed-since', 'HEAD'],
+    ['check', '--changed-since', '--output=pwned'],
+    ['check', '--config', 'does-not-exist-a73.json'],
+    ['bogus-subcommand'],
+  ]) {
+    const res = execCli(badArgs, REPO_ROOT);
+    assert.equal(res.code, 2, `Expected exit 2 for args ${JSON.stringify(badArgs)}, got ${res.code}`);
+    assert.ok(res.stderr.includes('Error:'), `Expected stderr error for ${JSON.stringify(badArgs)}`);
+  }
+
+  // === A7-4: Argument Injection Validation ===
+  assert.equal(validateGitRef('--exec=evil').ok, false);
+  assert.equal(validateGitRef('-n').ok, false);
+  assert.equal(validateGitRef('main; rm -rf /').ok, false);
+  assert.equal(validateGitRef('origin/main').ok, true);
+  assert.equal(validateGitRef('HEAD~1').ok, true);
+
+  // === A7-3 & A7-4: Non-Git Directory & Corrupt Config Fail-Closed ===
+  const nonGitDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-a7-nongit-'));
+  try {
+    const cleanFile = path.join(nonGitDir, 'clean.ts');
+    fs.writeFileSync(
+      cleanFile,
+      [
+        'export function addSafe(a: number, b: number): number {',
+        '  if (typeof a !== "number" || typeof b !== "number") throw new Error("invalid");',
+        '  return a + b;',
+        '}',
+      ].join('\n'),
+      'utf-8'
+    );
+
+    const vulnFile = path.join(nonGitDir, 'vuln.ts');
+    fs.writeFileSync(
+      vulnFile,
+      [
+        'export function runBad(input: string): unknown {',
+        '  const key = "' + 'sk_live_' + '51H9xK2L8mN4pQ7rS0tU3vW6yZ9aB2cD4eF";',
+        '  return eval(input + key);',
+        '}',
+      ].join('\n'),
+      'utf-8'
+    );
+
+    // Clean file -> exit 0
+    const cleanRes = execCli(['check', 'clean.ts'], nonGitDir);
+    assert.equal(cleanRes.code, 0, `Clean file must exit 0, stderr: ${cleanRes.stderr}`);
+    assert.ok(cleanRes.stdout.includes('Verdict: PASS'));
+
+    // Vulnerable file -> exit 1 (text)
+    const vulnText = execCli(['check', 'vuln.ts'], nonGitDir);
+    assert.equal(vulnText.code, 1, 'Vulnerable file must exit 1');
+    assert.ok(vulnText.stdout.includes('Verdict: FAIL'));
+    assert.ok(vulnText.stdout.includes('DG001') || vulnText.stdout.includes('DG007'));
+
+    // Vulnerable file -> exit 1 (json, Layer 2 offline by default)
+    const vulnJson = execCli(['check', 'vuln.ts', '--format', 'json'], nonGitDir);
+    assert.equal(vulnJson.code, 1);
+    const parsedJson = JSON.parse(vulnJson.stdout) as {
+      passed: boolean;
+      files: Array<{ layer2Status?: string; filePath: string }>;
+    };
+    assert.equal(parsedJson.passed, false);
+    assert.equal(parsedJson.files[0].layer2Status, 'Layer 2 (Gemini): Skipped [Offline]');
+
+    // A7-2: CLI `--format sarif` byte-for-byte parity with `src/core/sarif.ts`
+    const vulnSarif = execCli(['check', 'vuln.ts', '--format', 'sarif'], nonGitDir);
+    assert.equal(vulnSarif.code, 1);
+    const directSarifPath = path.join(nonGitDir, 'direct-core.sarif');
+    const jsonSummary = JSON.parse(vulnJson.stdout).files;
+    coreGenerateSarif(jsonSummary, directSarifPath, [], {
+      partialFiles: [],
+      hasAnalysisFailure: false,
+      workspaceDiagnostics: [],
+    });
+    const directSarifText = fs.readFileSync(directSarifPath, 'utf-8');
+    assert.equal(
+      vulnSarif.stdout,
+      directSarifText,
+      'A7-2: CLI --format sarif output must be byte-for-byte identical to src/core/sarif.ts'
+    );
+
+    // Non-git directory -> --staged and --changed-since must fail closed with exit 2
+    const stagedNonGit = execCli(['check', '--staged'], nonGitDir);
+    assert.equal(stagedNonGit.code, 2, '--staged outside Git repo must exit 2');
+
+    const changedNonGit = execCli(['check', '--changed-since', 'HEAD'], nonGitDir);
+    assert.equal(changedNonGit.code, 2, '--changed-since outside Git repo must exit 2');
+
+    // Corrupt .devguard.json -> fail closed with exit 2
+    const badCfgPath = path.join(nonGitDir, 'bad.devguard.json');
+    fs.writeFileSync(badCfgPath, '{ not valid json', 'utf-8');
+    const badCfgRes = execCli(['check', 'clean.ts', '--config', badCfgPath], nonGitDir);
+    assert.equal(badCfgRes.code, 2, 'Corrupt --config JSON must fail closed with exit 2');
+  } finally {
+    fs.rmSync(nonGitDir, { recursive: true, force: true });
+  }
+
+  // === A7-4: Real Git Repo (--staged & --changed-since) ===
+  const gitRepoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-a7-git-'));
+  try {
+    const git = (args: string[]) =>
+      execGitSync('git', args, { cwd: gitRepoDir, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] });
+
+    git(['init']);
+    git(['config', 'user.email', 'test@devguard.local']);
+    git(['config', 'user.name', 'DevGuard Test']);
+
+    fs.mkdirSync(path.join(gitRepoDir, 'src'), { recursive: true });
+    fs.writeFileSync(
+      path.join(gitRepoDir, 'src', 'base.ts'),
+      'export function baseOk(n: number): number { if (typeof n !== "number") throw new Error("bad"); return n + 1; }\n',
+      'utf-8'
+    );
+    git(['add', 'src/base.ts']);
+    git(['commit', '-m', 'init']);
+
+    // Create an unstaged vulnerable file + a staged clean file
+    fs.writeFileSync(
+      path.join(gitRepoDir, 'src', 'unstaged-bad.ts'),
+      'export function bad(x: string) { return eval(x); }\n',
+      'utf-8'
+    );
+    fs.writeFileSync(
+      path.join(gitRepoDir, 'src', 'staged-clean.ts'),
+      'export function stagedOk(n: number): number { if (typeof n !== "number") throw new Error("bad"); return n * 2; }\n',
+      'utf-8'
+    );
+    git(['add', 'src/staged-clean.ts']);
+
+    // --staged must ONLY audit staged-clean.ts (ignoring unstaged-bad.ts) -> exit 0
+    const stagedCleanRes = execCli(['check', '--staged', '--format', 'json'], gitRepoDir);
+    assert.equal(stagedCleanRes.code, 0, `--staged with only clean file must exit 0: ${stagedCleanRes.stderr}`);
+    const stagedCleanJson = JSON.parse(stagedCleanRes.stdout) as { files: Array<{ filePath: string }> };
+    assert.deepEqual(
+      stagedCleanJson.files.map((f) => f.filePath),
+      ['src/staged-clean.ts']
+    );
+
+    // Stage the vulnerable file -> --staged must now fail with exit 1
+    git(['add', 'src/unstaged-bad.ts']);
+    const stagedFailRes = execCli(['check', '--staged'], gitRepoDir);
+    assert.equal(stagedFailRes.code, 1, '--staged with vulnerable file must exit 1');
+
+    // Commit both and verify --changed-since HEAD~1
+    git(['commit', '-m', 'add files']);
+    const changedRes = execCli(['check', '--changed-since', 'HEAD~1', '--format', 'json'], gitRepoDir);
+    assert.equal(changedRes.code, 1, '--changed-since HEAD~1 must catch committed vulnerable file');
+    const changedJson = JSON.parse(changedRes.stdout) as { files: Array<{ filePath: string }> };
+    assert.deepEqual(
+      changedJson.files.map((f) => f.filePath).sort(),
+      ['src/staged-clean.ts', 'src/unstaged-bad.ts']
+    );
+  } finally {
+    fs.rmSync(gitRepoDir, { recursive: true, force: true });
+  }
+});
