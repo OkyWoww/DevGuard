@@ -8087,3 +8087,526 @@ test('Test 87: SPEC rev 1.3 pnpm v10 Non-Packages Top-Level Safe Skip, Unsupport
 
 
 
+
+test('Test 88: Stage 7.1 Core Extraction Isolation (A7-1) & Byte-for-Byte SARIF Parity (A7-2)', async () => {
+  // === A7-1: src/core/ Isolation Invariant ===
+  const coreRoot = path.join(REPO_ROOT, 'src', 'core');
+  assert.ok(fs.existsSync(coreRoot), 'src/core/ directory must exist');
+
+  const collectTsFiles = (dir: string): string[] => {
+    const out: string[] = [];
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        out.push(...collectTsFiles(full));
+      } else if (entry.isFile() && (entry.name.endsWith('.ts') || entry.name.endsWith('.tsx'))) {
+        out.push(full);
+      }
+    }
+    return out;
+  };
+
+  const coreFiles = collectTsFiles(coreRoot);
+  assert.ok(coreFiles.length >= 9, `Expected >= 9 files under src/core/, found ${coreFiles.length}`);
+
+  const forbiddenPatterns: Array<{ label: string; re: RegExp }> = [
+    { label: '@actions/* import', re: /\bfrom\s+['"]@actions\// },
+    { label: '@octokit/* import', re: /\bfrom\s+['"]@octokit\// },
+    { label: 'src/App or React UI import', re: /\bfrom\s+['"](?:react|lucide-react|\.\.?\/.*App(?:\.tsx?)?)['"]/ },
+    { label: 'githubCommenter import', re: /\bfrom\s+['"][^'"]*githubCommenter/ },
+    { label: 'adapters/ import', re: /\bfrom\s+['"][^'"]*adapters\// },
+    { label: 'process.exit() call', re: /\bprocess\.exit\s*\(/ },
+  ];
+
+  for (const file of coreFiles) {
+    const rel = path.relative(REPO_ROOT, file).replace(/\\/g, '/');
+    const content = fs.readFileSync(file, 'utf-8');
+    for (const { label, re } of forbiddenPatterns) {
+      assert.equal(
+        re.test(content),
+        false,
+        `A7-1 violation: ${rel} must not contain ${label}`
+      );
+    }
+  }
+
+  // === A7-2: Byte-for-Byte SARIF Parity across core/, adapters/action/, and legacy re-exports ===
+  const coreAnalyzer = await import('../src/core/analyzer.js');
+  const coreSarif = await import('../src/core/sarif.js');
+  const actionAdapter = await import('../src/adapters/action/index.js');
+
+  const parityFixtureCode = [
+    "import { nope } from 'totally-phantom-pkg-a72';",
+    'export async function processPayment(account: { balance: number }, amount: number, modName: string) {',
+    '  const apiKey = "' + 'sk_live_' + '51H9xK2L8mN4pQ7rS0tU3vW6yZ9aB2cD4eF";',
+    '  if (account.balance >= amount) {',
+    '    await fetch("https://api.stripe.com/v1/charges");',
+    '    account.balance -= amount;',
+    '  }',
+    '  try {',
+    '    await import(modName);',
+    '  } catch (e) {}',
+    '  return eval(modName + apiKey);',
+    '}',
+  ].join('\n');
+
+  const tmpParityDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-a72-'));
+  try {
+    const buildSummaryFrom = (
+      analyzeFn: typeof analyzeCodeDeterministically,
+      filePath: string
+    ) => {
+      const report = analyzeFn(parityFixtureCode, { filePath });
+      return {
+        filePath,
+        security: report.skor.security,
+        correctness: report.skor.correctness,
+        maintainability: report.skor.maintainability,
+        overall: report.skor.totalScore,
+        passed: report.skor.totalScore >= 85 && !report.temuanUtama.description,
+        fatalFlaws: report.temuanUtama.description ? [report.temuanUtama.description] : [],
+        defenseInDepth: report.temuanLain,
+        inlineFindings: report.inlineFindings,
+        suppressions: report.suppressions,
+        foldLimitExceeded: report.virtualView?.limitExceeded,
+      };
+    };
+
+    const sampleSkipped = [{ filePath: 'cmd/server.go', reason: 'unsupported_language' as const }];
+    const sampleOpts = {
+      partialFiles: ['scripts/helper.py'],
+      hasAnalysisFailure: false,
+      workspaceDiagnostics: [
+        {
+          ruleId: 'DG004-WS-UNPARSED' as const,
+          sourceFile: 'pnpm-workspace.yaml',
+          reason: 'yaml_unsupported_construct' as const,
+          message: 'Unsupported YAML anchor in pnpm-workspace.yaml',
+          scoring: false as const,
+        },
+      ],
+    };
+
+    const corePath = path.join(tmpParityDir, 'core.sarif');
+    const actionPath = path.join(tmpParityDir, 'action.sarif');
+    const legacyPath = path.join(tmpParityDir, 'legacy.sarif');
+
+    const coreSummary = buildSummaryFrom(coreAnalyzer.analyzeCodeDeterministically, 'src/payment.ts');
+    const actionSummary = buildSummaryFrom(actionAdapter.analyzeCodeDeterministically, 'src/payment.ts');
+    const legacySummary = buildSummaryFrom(analyzeCodeDeterministically, 'src/payment.ts');
+
+    assert.deepEqual(coreSummary, legacySummary, 'A7-2: core/analyzer output must match legacy re-export');
+    assert.deepEqual(actionSummary, legacySummary, 'A7-2: adapters/action output must match legacy re-export');
+
+    coreSarif.generateSarifReport([coreSummary], corePath, sampleSkipped, sampleOpts);
+    actionAdapter.generateSarifReport([actionSummary], actionPath, sampleSkipped, sampleOpts);
+    generateSarifReport([legacySummary], legacyPath, sampleSkipped, sampleOpts);
+
+    const coreBytes = fs.readFileSync(corePath);
+    const actionBytes = fs.readFileSync(actionPath);
+    const legacyBytes = fs.readFileSync(legacyPath);
+
+    assert.ok(Buffer.compare(coreBytes, actionBytes) === 0, 'A7-2: core SARIF and adapters/action SARIF must be byte-for-byte identical');
+    assert.ok(Buffer.compare(coreBytes, legacyBytes) === 0, 'A7-2: core SARIF and legacy SARIF must be byte-for-byte identical');
+
+    const parsedSarif = JSON.parse(coreBytes.toString('utf-8')) as {
+      version: string;
+      runs: Array<{ results: Array<{ ruleId: string }> }>;
+    };
+    assert.equal(parsedSarif.version, '2.1.0');
+    const ruleIds = new Set(parsedSarif.runs[0].results.map((r) => r.ruleId));
+    for (const expectedRule of ['DG001', 'DG004', 'DG004-DYN-01', 'DG005', 'DG006', 'DG007', 'DG008']) {
+      assert.ok(ruleIds.has(expectedRule), `A7-2: parity fixture SARIF must include ${expectedRule}`);
+    }
+  } finally {
+    fs.rmSync(tmpParityDir, { recursive: true, force: true });
+  }
+});
+
+test('Test 89: Stage 7.2 Zero-Dep CLI Adapter Contract (A7-3), Git Modes & Injection Defense (A7-4), & CLI SARIF Parity (A7-2)', async () => {
+  const { runCli } = await import('../src/adapters/cli/index.js');
+  const { validateGitRef } = await import('../src/adapters/cli/git.js');
+  const { generateSarifReport: coreGenerateSarif } = await import('../src/core/sarif.js');
+  const { execFileSync: execGitSync } = await import('node:child_process');
+
+  const execCli = (args: string[], cwd: string) => {
+    let stdout = '';
+    let stderr = '';
+    const code = runCli(args, {
+      cwd,
+      stdout: (s) => {
+        stdout += s;
+      },
+      stderr: (s) => {
+        stderr += s;
+      },
+    });
+    return { code, stdout, stderr };
+  };
+
+  // === A7-3: Help, Version, & Invalid Flag Exit Code 2 ===
+  const helpRes = execCli(['--help'], REPO_ROOT);
+  assert.equal(helpRes.code, 0);
+  assert.ok(helpRes.stdout.includes('devguard check'), 'Help must document devguard check');
+
+  const verRes = execCli(['--version'], REPO_ROOT);
+  assert.equal(verRes.code, 0);
+  assert.equal(verRes.stdout.trim(), getDevGuardVersion());
+
+  for (const badArgs of [
+    ['check', '--unknown-flag'],
+    ['check', '--format', 'xml'],
+    ['check', '--min-score', '150'],
+    ['check', '--min-score', 'abc'],
+    ['check', '--staged', '--changed-since', 'HEAD'],
+    ['check', '--changed-since', '--output=pwned'],
+    ['check', '--config', 'does-not-exist-a73.json'],
+    ['bogus-subcommand'],
+  ]) {
+    const res = execCli(badArgs, REPO_ROOT);
+    assert.equal(res.code, 2, `Expected exit 2 for args ${JSON.stringify(badArgs)}, got ${res.code}`);
+    assert.ok(res.stderr.includes('Error:'), `Expected stderr error for ${JSON.stringify(badArgs)}`);
+  }
+
+  // === A7-4: Argument Injection Validation ===
+  assert.equal(validateGitRef('--exec=evil').ok, false);
+  assert.equal(validateGitRef('-n').ok, false);
+  assert.equal(validateGitRef('main; rm -rf /').ok, false);
+  assert.equal(validateGitRef('origin/main').ok, true);
+  assert.equal(validateGitRef('HEAD~1').ok, true);
+
+  // === A7-3 & A7-4: Non-Git Directory & Corrupt Config Fail-Closed ===
+  const nonGitDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-a7-nongit-'));
+  try {
+    const cleanFile = path.join(nonGitDir, 'clean.ts');
+    fs.writeFileSync(
+      cleanFile,
+      [
+        'export function addSafe(a: number, b: number): number {',
+        '  if (typeof a !== "number" || typeof b !== "number") throw new Error("invalid");',
+        '  return a + b;',
+        '}',
+      ].join('\n'),
+      'utf-8'
+    );
+
+    const vulnFile = path.join(nonGitDir, 'vuln.ts');
+    fs.writeFileSync(
+      vulnFile,
+      [
+        'export function runBad(input: string): unknown {',
+        '  const key = "' + 'sk_live_' + '51H9xK2L8mN4pQ7rS0tU3vW6yZ9aB2cD4eF";',
+        '  return eval(input + key);',
+        '}',
+      ].join('\n'),
+      'utf-8'
+    );
+
+    // Clean file -> exit 0
+    const cleanRes = execCli(['check', 'clean.ts'], nonGitDir);
+    assert.equal(cleanRes.code, 0, `Clean file must exit 0, stderr: ${cleanRes.stderr}`);
+    assert.ok(cleanRes.stdout.includes('Verdict: PASS'));
+
+    // Vulnerable file -> exit 1 (text)
+    const vulnText = execCli(['check', 'vuln.ts'], nonGitDir);
+    assert.equal(vulnText.code, 1, 'Vulnerable file must exit 1');
+    assert.ok(vulnText.stdout.includes('Verdict: FAIL'));
+    assert.ok(vulnText.stdout.includes('DG001') || vulnText.stdout.includes('DG007'));
+
+    // Vulnerable file -> exit 1 (json, Layer 2 offline by default)
+    const vulnJson = execCli(['check', 'vuln.ts', '--format', 'json'], nonGitDir);
+    assert.equal(vulnJson.code, 1);
+    const parsedJson = JSON.parse(vulnJson.stdout) as {
+      passed: boolean;
+      files: Array<{ layer2Status?: string; filePath: string }>;
+    };
+    assert.equal(parsedJson.passed, false);
+    assert.equal(parsedJson.files[0].layer2Status, 'Layer 2 (Gemini): Skipped [Offline]');
+
+    // A7-2: CLI `--format sarif` byte-for-byte parity with `src/core/sarif.ts`
+    const vulnSarif = execCli(['check', 'vuln.ts', '--format', 'sarif'], nonGitDir);
+    assert.equal(vulnSarif.code, 1);
+    const directSarifPath = path.join(nonGitDir, 'direct-core.sarif');
+    const jsonSummary = JSON.parse(vulnJson.stdout).files;
+    coreGenerateSarif(jsonSummary, directSarifPath, [], {
+      partialFiles: [],
+      hasAnalysisFailure: false,
+      workspaceDiagnostics: [],
+    });
+    const directSarifText = fs.readFileSync(directSarifPath, 'utf-8');
+    assert.equal(
+      vulnSarif.stdout,
+      directSarifText,
+      'A7-2: CLI --format sarif output must be byte-for-byte identical to src/core/sarif.ts'
+    );
+
+    // Non-git directory -> --staged and --changed-since must fail closed with exit 2
+    const stagedNonGit = execCli(['check', '--staged'], nonGitDir);
+    assert.equal(stagedNonGit.code, 2, '--staged outside Git repo must exit 2');
+
+    const changedNonGit = execCli(['check', '--changed-since', 'HEAD'], nonGitDir);
+    assert.equal(changedNonGit.code, 2, '--changed-since outside Git repo must exit 2');
+
+    // Corrupt .devguard.json -> fail closed with exit 2
+    const badCfgPath = path.join(nonGitDir, 'bad.devguard.json');
+    fs.writeFileSync(badCfgPath, '{ not valid json', 'utf-8');
+    const badCfgRes = execCli(['check', 'clean.ts', '--config', badCfgPath], nonGitDir);
+    assert.equal(badCfgRes.code, 2, 'Corrupt --config JSON must fail closed with exit 2');
+  } finally {
+    fs.rmSync(nonGitDir, { recursive: true, force: true });
+  }
+
+  // === A7-4: Real Git Repo (--staged & --changed-since) ===
+  const gitRepoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-a7-git-'));
+  try {
+    const git = (args: string[]) =>
+      execGitSync('git', args, { cwd: gitRepoDir, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] });
+
+    git(['init']);
+    git(['config', 'user.email', 'test@devguard.local']);
+    git(['config', 'user.name', 'DevGuard Test']);
+
+    fs.mkdirSync(path.join(gitRepoDir, 'src'), { recursive: true });
+    fs.writeFileSync(
+      path.join(gitRepoDir, 'src', 'base.ts'),
+      'export function baseOk(n: number): number { if (typeof n !== "number") throw new Error("bad"); return n + 1; }\n',
+      'utf-8'
+    );
+    git(['add', 'src/base.ts']);
+    git(['commit', '-m', 'init']);
+
+    // Create an unstaged vulnerable file + a staged clean file
+    fs.writeFileSync(
+      path.join(gitRepoDir, 'src', 'unstaged-bad.ts'),
+      'export function bad(x: string) { return eval(x); }\n',
+      'utf-8'
+    );
+    fs.writeFileSync(
+      path.join(gitRepoDir, 'src', 'staged-clean.ts'),
+      'export function stagedOk(n: number): number { if (typeof n !== "number") throw new Error("bad"); return n * 2; }\n',
+      'utf-8'
+    );
+    git(['add', 'src/staged-clean.ts']);
+
+    // --staged must ONLY audit staged-clean.ts (ignoring unstaged-bad.ts) -> exit 0
+    const stagedCleanRes = execCli(['check', '--staged', '--format', 'json'], gitRepoDir);
+    assert.equal(stagedCleanRes.code, 0, `--staged with only clean file must exit 0: ${stagedCleanRes.stderr}`);
+    const stagedCleanJson = JSON.parse(stagedCleanRes.stdout) as { files: Array<{ filePath: string }> };
+    assert.deepEqual(
+      stagedCleanJson.files.map((f) => f.filePath),
+      ['src/staged-clean.ts']
+    );
+
+    // Stage the vulnerable file -> --staged must now fail with exit 1
+    git(['add', 'src/unstaged-bad.ts']);
+    const stagedFailRes = execCli(['check', '--staged'], gitRepoDir);
+    assert.equal(stagedFailRes.code, 1, '--staged with vulnerable file must exit 1');
+
+    // Commit both and verify --changed-since HEAD~1
+    git(['commit', '-m', 'add files']);
+    const changedRes = execCli(['check', '--changed-since', 'HEAD~1', '--format', 'json'], gitRepoDir);
+    assert.equal(changedRes.code, 1, '--changed-since HEAD~1 must catch committed vulnerable file');
+    const changedJson = JSON.parse(changedRes.stdout) as { files: Array<{ filePath: string }> };
+    assert.deepEqual(
+      changedJson.files.map((f) => f.filePath).sort(),
+      ['src/staged-clean.ts', 'src/unstaged-bad.ts']
+    );
+  } finally {
+    fs.rmSync(gitRepoDir, { recursive: true, force: true });
+  }
+});
+
+test('Test 90: Stage 7.3 Idempotent Pre-Commit Hook Installer & npx Binary Packaging (A7-5)', async () => {
+  const { runCli } = await import('../src/adapters/cli/index.js');
+  const { HOOK_BEGIN_MARKER, HOOK_END_MARKER } = await import('../src/adapters/cli/hook.js');
+  const { execFileSync: execBinSync } = await import('node:child_process');
+
+  const execCli = (args: string[], cwd: string) => {
+    let stdout = '';
+    let stderr = '';
+    const code = runCli(args, {
+      cwd,
+      stdout: (s) => {
+        stdout += s;
+      },
+      stderr: (s) => {
+        stderr += s;
+      },
+    });
+    return { code, stdout, stderr };
+  };
+
+  // 1. Outside a Git repository -> fail closed with exit 2
+  const nonGitDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-a75-nongit-'));
+  try {
+    const res = execCli(['install-hook'], nonGitDir);
+    assert.equal(res.code, 2, 'install-hook outside Git repo must exit 2');
+    assert.ok(res.stderr.includes('Error:'));
+  } finally {
+    fs.rmSync(nonGitDir, { recursive: true, force: true });
+  }
+
+  // 2. Fresh Git repo -> creates executable hook, idempotent on 2nd run
+  const gitRepoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-a75-git-'));
+  try {
+    execBinSync('git', ['init'], { cwd: gitRepoDir, stdio: ['ignore', 'pipe', 'pipe'] });
+    const hookFile = path.join(gitRepoDir, '.git', 'hooks', 'pre-commit');
+
+    const firstInstall = execCli(['install-hook'], gitRepoDir);
+    assert.equal(firstInstall.code, 0, `First install-hook must exit 0: ${firstInstall.stderr}`);
+    assert.ok(firstInstall.stdout.includes('(created)'));
+    assert.ok(fs.existsSync(hookFile), 'pre-commit hook file must be created');
+
+    const firstContent = fs.readFileSync(hookFile, 'utf-8');
+    assert.ok(firstContent.startsWith('#!/bin/sh\n'));
+    assert.ok(firstContent.includes(HOOK_BEGIN_MARKER));
+    assert.ok(firstContent.includes(HOOK_END_MARKER));
+    if (process.platform !== 'win32') {
+      assert.ok((fs.statSync(hookFile).mode & 0o111) !== 0, 'pre-commit hook must be executable');
+    }
+
+    // 2nd run -> idempotent
+    const secondInstall = execCli(['install-hook'], gitRepoDir);
+    assert.equal(secondInstall.code, 0);
+    assert.ok(secondInstall.stdout.includes('(already-installed)'));
+    const secondContent = fs.readFileSync(hookFile, 'utf-8');
+    assert.equal(secondContent, firstContent, 'install-hook must be strictly idempotent on repeat runs');
+    assert.equal(
+      secondContent.split(HOOK_BEGIN_MARKER).length - 1,
+      1,
+      'HOOK_BEGIN_MARKER must appear exactly once'
+    );
+
+    // 3. Existing custom POSIX shell hook -> non-destructive append & idempotent
+    const customHook = '#!/bin/sh\necho "custom-pre-commit-check"\n';
+    fs.writeFileSync(hookFile, customHook, 'utf-8');
+    const appendRes = execCli(['install-hook'], gitRepoDir);
+    assert.equal(appendRes.code, 0);
+    assert.ok(appendRes.stdout.includes('(appended)'));
+    const appendedContent = fs.readFileSync(hookFile, 'utf-8');
+    assert.ok(appendedContent.includes('echo "custom-pre-commit-check"'), 'Existing hook content must be preserved');
+    assert.ok(appendedContent.includes(HOOK_BEGIN_MARKER));
+    assert.ok(appendedContent.includes(HOOK_END_MARKER));
+
+    const appendAgain = execCli(['install-hook'], gitRepoDir);
+    assert.equal(appendAgain.code, 0);
+    assert.equal(fs.readFileSync(hookFile, 'utf-8'), appendedContent, 'Appended hook must stay idempotent');
+
+    // 4. Existing non-shell hook (Python) -> fail closed with exit 2 and zero modification
+    const pythonHook = '#!/usr/bin/env python3\nprint("python hook")\n';
+    fs.writeFileSync(hookFile, pythonHook, 'utf-8');
+    const pyRes = execCli(['install-hook'], gitRepoDir);
+    assert.equal(pyRes.code, 2, 'Non-shell pre-commit hook must fail closed with exit 2');
+    assert.equal(fs.readFileSync(hookFile, 'utf-8'), pythonHook, 'Unsafe hook must not be modified');
+
+    // 5. Corrupted unmatched marker -> fail closed with exit 2 and zero modification
+    const corruptHook = `#!/bin/sh\n${HOOK_BEGIN_MARKER}\necho broken\n`;
+    fs.writeFileSync(hookFile, corruptHook, 'utf-8');
+    const corruptRes = execCli(['install-hook'], gitRepoDir);
+    assert.equal(corruptRes.code, 2, 'Corrupted hook markers must fail closed with exit 2');
+    assert.equal(fs.readFileSync(hookFile, 'utf-8'), corruptHook, 'Corrupted hook must not be modified');
+  } finally {
+    fs.rmSync(gitRepoDir, { recursive: true, force: true });
+  }
+
+  // 6. package.json bin/files/dependencies contract & executable dist/cli.js
+  const pkgJson = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, 'package.json'), 'utf-8')) as {
+    bin?: Record<string, string>;
+    files?: string[];
+    dependencies?: Record<string, string>;
+  };
+  assert.equal(pkgJson.bin?.devguard, './dist/cli.js', 'package.json bin.devguard must point to ./dist/cli.js');
+  assert.ok(Array.isArray(pkgJson.files) && pkgJson.files.includes('dist/cli.js'), 'package.json files must include dist/cli.js');
+  assert.deepEqual(pkgJson.dependencies, {}, 'package.json dependencies must remain {}');
+
+  const cliDistPath = path.join(REPO_ROOT, 'dist', 'cli.js');
+  if (!fs.existsSync(cliDistPath)) {
+    execBinSync(process.execPath, ['-e', "require('esbuild').buildSync({ entryPoints: ['src/adapters/cli/index.ts'], bundle: true, platform: 'node', format: 'esm', target: 'node22', outfile: 'dist/cli.js' })"], { cwd: REPO_ROOT });
+  }
+  assert.ok(fs.existsSync(cliDistPath), 'dist/cli.js must be built');
+  assert.ok(fs.readFileSync(cliDistPath, 'utf-8').startsWith('#!/usr/bin/env node'), 'dist/cli.js must start with node shebang');
+
+  const binVersionOut = execBinSync(process.execPath, [cliDistPath, '--version'], {
+    cwd: REPO_ROOT,
+    encoding: 'utf-8',
+  }).trim();
+  assert.equal(binVersionOut, getDevGuardVersion(), 'dist/cli.js --version must match package version');
+});
+
+test('Test 91: Stage 7.4 Comprehensive Regression, Empty Staged Pass, & Built Binary E2E Exit Codes (A7-6)', async () => {
+  const { runCli } = await import('../src/adapters/cli/index.js');
+  const { execFileSync: execBinSync, spawnSync: spawnBinSync } = await import('node:child_process');
+
+  // 1. Empty staged set in a clean Git repo -> exits 0 with overallScore: null
+  const emptyStagedRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-a76-empty-'));
+  try {
+    execBinSync('git', ['init'], { cwd: emptyStagedRepo, stdio: ['ignore', 'pipe', 'pipe'] });
+    execBinSync('git', ['config', 'user.email', 'test@devguard.local'], { cwd: emptyStagedRepo });
+    execBinSync('git', ['config', 'user.name', 'DevGuard Test'], { cwd: emptyStagedRepo });
+    fs.writeFileSync(path.join(emptyStagedRepo, 'README.md'), '# init\n', 'utf-8');
+    execBinSync('git', ['add', 'README.md'], { cwd: emptyStagedRepo });
+    execBinSync('git', ['commit', '-m', 'init'], { cwd: emptyStagedRepo, stdio: ['ignore', 'pipe', 'pipe'] });
+
+    let stdout = '';
+    let stderr = '';
+    const code = runCli(['check', '--staged', '--format', 'json'], {
+      cwd: emptyStagedRepo,
+      stdout: (s) => {
+        stdout += s;
+      },
+      stderr: (s) => {
+        stderr += s;
+      },
+    });
+    assert.equal(code, 0, `Empty --staged set must exit 0, stderr: ${stderr}`);
+    const parsed = JSON.parse(stdout) as { passed: boolean; overallScore: number | null; analyzedCount: number };
+    assert.equal(parsed.passed, true);
+    assert.equal(parsed.overallScore, null);
+    assert.equal(parsed.analyzedCount, 0);
+
+    // Verify installed hook includes non-interactive fallbacks
+    let hookOut = '';
+    const hookCode = runCli(['install-hook'], {
+      cwd: emptyStagedRepo,
+      stdout: (s) => {
+        hookOut += s;
+      },
+    });
+    assert.equal(hookCode, 0, hookOut);
+    const hookText = fs.readFileSync(path.join(emptyStagedRepo, '.git', 'hooks', 'pre-commit'), 'utf-8');
+    assert.ok(hookText.includes('node ./dist/cli.js check --staged'));
+    assert.ok(hookText.includes('npx --no-install devguard check --staged'));
+  } finally {
+    fs.rmSync(emptyStagedRepo, { recursive: true, force: true });
+  }
+
+  // 2. Built dist/cli.js end-to-end subprocess exit codes (0, 1, 2)
+  const cliDistPath = path.join(REPO_ROOT, 'dist', 'cli.js');
+  if (!fs.existsSync(cliDistPath)) {
+    execBinSync(process.execPath, ['-e', "require('esbuild').buildSync({ entryPoints: ['src/adapters/cli/index.ts'], bundle: true, platform: 'node', format: 'esm', target: 'node22', outfile: 'dist/cli.js' })"], { cwd: REPO_ROOT });
+  }
+  assert.ok(fs.existsSync(cliDistPath), 'dist/cli.js must exist for A7-6 E2E verification');
+
+  const tmpE2e = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-a76-e2e-'));
+  try {
+    const okFile = path.join(tmpE2e, 'ok.ts');
+    fs.writeFileSync(
+      okFile,
+      'export function safeSum(a: number, b: number): number { if (typeof a !== "number" || typeof b !== "number") throw new Error("bad"); return a + b; }\n',
+      'utf-8'
+    );
+    const badFile = path.join(tmpE2e, 'bad.ts');
+    fs.writeFileSync(badFile, 'export function unsafeRun(x: string) { return eval(x); }\n', 'utf-8');
+
+    const run0 = spawnBinSync(process.execPath, [cliDistPath, 'check', okFile], { encoding: 'utf-8' });
+    assert.equal(run0.status, 0, `dist/cli.js on clean file must exit 0, stderr: ${run0.stderr}`);
+
+    const run1 = spawnBinSync(process.execPath, [cliDistPath, 'check', badFile], { encoding: 'utf-8' });
+    assert.equal(run1.status, 1, `dist/cli.js on vulnerable file must exit 1, stdout: ${run1.stdout}`);
+
+    const run2 = spawnBinSync(process.execPath, [cliDistPath, 'check', '--bogus-flag'], { encoding: 'utf-8' });
+    assert.equal(run2.status, 2, `dist/cli.js on unknown flag must exit 2, stderr: ${run2.stderr}`);
+  } finally {
+    fs.rmSync(tmpE2e, { recursive: true, force: true });
+  }
+});

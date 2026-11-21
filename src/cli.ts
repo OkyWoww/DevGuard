@@ -19,7 +19,7 @@ import {
   type ParsedDevGuardReport,
   type WorkspaceContext,
   type WorkspaceFileAccessor,
-} from './devguardAnalyzer.ts';
+} from './core/analyzer.ts';
 
 export {
   ANALYZABLE_EXTENSIONS,
@@ -48,7 +48,7 @@ import {
   type SkippedFileReportItem,
   type SkippedReason,
 } from './githubCommenter.ts';
-import { generateSarifReport } from './sarifGenerator.ts';
+import { generateSarifReport } from './core/sarif.ts';
 
 export {
   INVARIANT_MISMATCH_SENTINEL,
