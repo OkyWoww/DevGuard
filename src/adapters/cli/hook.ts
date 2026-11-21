@@ -10,6 +10,8 @@ const HOOK_SNIPPET = [
   HOOK_BEGIN_MARKER,
   'if command -v devguard >/dev/null 2>&1; then',
   '  devguard check --staged',
+  'elif [ -f "./dist/cli.js" ]; then',
+  '  node ./dist/cli.js check --staged',
   'else',
   '  npx --no-install devguard check --staged',
   'fi',

@@ -8529,3 +8529,78 @@ test('Test 90: Stage 7.3 Idempotent Pre-Commit Hook Installer & npx Binary Packa
   }).trim();
   assert.equal(binVersionOut, getDevGuardVersion(), 'dist/cli.js --version must match package version');
 });
+
+test('Test 91: Stage 7.4 Comprehensive Regression, Empty Staged Pass, & Built Binary E2E Exit Codes (A7-6)', async () => {
+  const { runCli } = await import('../src/adapters/cli/index.js');
+  const { execFileSync: execBinSync, spawnSync: spawnBinSync } = await import('node:child_process');
+
+  // 1. Empty staged set in a clean Git repo -> exits 0 with overallScore: null
+  const emptyStagedRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-a76-empty-'));
+  try {
+    execBinSync('git', ['init'], { cwd: emptyStagedRepo, stdio: ['ignore', 'pipe', 'pipe'] });
+    execBinSync('git', ['config', 'user.email', 'test@devguard.local'], { cwd: emptyStagedRepo });
+    execBinSync('git', ['config', 'user.name', 'DevGuard Test'], { cwd: emptyStagedRepo });
+    fs.writeFileSync(path.join(emptyStagedRepo, 'README.md'), '# init\n', 'utf-8');
+    execBinSync('git', ['add', 'README.md'], { cwd: emptyStagedRepo });
+    execBinSync('git', ['commit', '-m', 'init'], { cwd: emptyStagedRepo, stdio: ['ignore', 'pipe', 'pipe'] });
+
+    let stdout = '';
+    let stderr = '';
+    const code = runCli(['check', '--staged', '--format', 'json'], {
+      cwd: emptyStagedRepo,
+      stdout: (s) => {
+        stdout += s;
+      },
+      stderr: (s) => {
+        stderr += s;
+      },
+    });
+    assert.equal(code, 0, `Empty --staged set must exit 0, stderr: ${stderr}`);
+    const parsed = JSON.parse(stdout) as { passed: boolean; overallScore: number | null; analyzedCount: number };
+    assert.equal(parsed.passed, true);
+    assert.equal(parsed.overallScore, null);
+    assert.equal(parsed.analyzedCount, 0);
+
+    // Verify installed hook includes non-interactive fallbacks
+    let hookOut = '';
+    const hookCode = runCli(['install-hook'], {
+      cwd: emptyStagedRepo,
+      stdout: (s) => {
+        hookOut += s;
+      },
+    });
+    assert.equal(hookCode, 0, hookOut);
+    const hookText = fs.readFileSync(path.join(emptyStagedRepo, '.git', 'hooks', 'pre-commit'), 'utf-8');
+    assert.ok(hookText.includes('node ./dist/cli.js check --staged'));
+    assert.ok(hookText.includes('npx --no-install devguard check --staged'));
+  } finally {
+    fs.rmSync(emptyStagedRepo, { recursive: true, force: true });
+  }
+
+  // 2. Built dist/cli.js end-to-end subprocess exit codes (0, 1, 2)
+  const cliDistPath = path.join(REPO_ROOT, 'dist', 'cli.js');
+  assert.ok(fs.existsSync(cliDistPath), 'dist/cli.js must exist for A7-6 E2E verification');
+
+  const tmpE2e = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-a76-e2e-'));
+  try {
+    const okFile = path.join(tmpE2e, 'ok.ts');
+    fs.writeFileSync(
+      okFile,
+      'export function safeSum(a: number, b: number): number { if (typeof a !== "number" || typeof b !== "number") throw new Error("bad"); return a + b; }\n',
+      'utf-8'
+    );
+    const badFile = path.join(tmpE2e, 'bad.ts');
+    fs.writeFileSync(badFile, 'export function unsafeRun(x: string) { return eval(x); }\n', 'utf-8');
+
+    const run0 = spawnBinSync(process.execPath, [cliDistPath, 'check', okFile], { encoding: 'utf-8' });
+    assert.equal(run0.status, 0, `dist/cli.js on clean file must exit 0, stderr: ${run0.stderr}`);
+
+    const run1 = spawnBinSync(process.execPath, [cliDistPath, 'check', badFile], { encoding: 'utf-8' });
+    assert.equal(run1.status, 1, `dist/cli.js on vulnerable file must exit 1, stdout: ${run1.stdout}`);
+
+    const run2 = spawnBinSync(process.execPath, [cliDistPath, 'check', '--bogus-flag'], { encoding: 'utf-8' });
+    assert.equal(run2.status, 2, `dist/cli.js on unknown flag must exit 2, stderr: ${run2.stderr}`);
+  } finally {
+    fs.rmSync(tmpE2e, { recursive: true, force: true });
+  }
+});
