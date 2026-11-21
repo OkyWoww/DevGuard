@@ -1,9 +1,9 @@
-# 🛡️ DevGuard v1.4.0 — The AI-Slop & Vibe-Coding Security Gatekeeper
+# 🛡️ DevGuard v1.5.0 — The AI-Slop & Vibe-Coding Security Gatekeeper
 
 [![Zero-Dependency Runtime](https://img.shields.io/badge/Runtime-100%25%20Zero--Dependency-emerald.svg)](#hybrid-dual-layer-architecture)
 [![OASIS SARIF v2.1.0](https://img.shields.io/badge/SARIF-v2.1.0%20Compliant-blue.svg)](#quick-start-choose-your-path)
-[![GitHub Action](https://img.shields.io/badge/GitHub%20Action-v1.4.0-black.svg)](#quick-start-choose-your-path)
-[![Tests 88/88 Passing](https://img.shields.io/badge/Tests-88%2F88%20Passing-success.svg)](#local-development--verification)
+[![GitHub Action](https://img.shields.io/badge/GitHub%20Action-v1.5.0-black.svg)](#quick-start-choose-your-path)
+[![Tests 92/92 Passing](https://img.shields.io/badge/Tests-92%2F92%20Passing-success.svg)](#local-development--verification)
 
 **DevGuard** is a deterministic CI/CD security gatekeeper engineered to catch silent failures, slopsquatting, leaked API keys, and financial race conditions hidden inside AI-generated (*Cursor, Windsurf, Copilot, Antigravity*) Pull Requests before they reach production.
 
@@ -13,12 +13,13 @@ Unlike generic LLM code reviewers that only leave probabilistic chat comments, D
 
 ## ⚡ Quick Start: Choose Your Path
 
-DevGuard supports two distinct workflows depending on whether you want to test a snippet quickly or protect a repository/monorepo in CI:
+DevGuard supports three workflows depending on whether you are exploring in the browser, auditing locally in your terminal, or gating Pull Requests in CI:
 
 | Path | Best For | Monorepo `DG004` Resolver & Base-Branch `.devguard.json`? |
 | :--- | :--- | :---: |
 | **Path A: Local Browser Dashboard** | Testing a single code snippet interactively in the browser | No *(single-file mode)* |
-| **Path B: GitHub Actions CI (Recommended)** | Protecting repositories, Pull Requests, & monorepos with SARIF + inline fixes | **Yes** *(requires `fetch-depth: 0`)* |
+| **Path B: Zero-Dep CLI & Pre-Commit Hook** | Running fast pre-commit audits locally in terminal via `npx devguard` | **Yes** *(reads working tree & git index)* |
+| **Path C: GitHub Actions CI (Recommended)** | Protecting repositories, Pull Requests, & monorepos with SARIF + inline fixes | **Yes** *(requires `fetch-depth: 0`)* |
 
 ### Path A: Try Quickly in the Browser Dashboard (Single-File Snippets)
 
@@ -29,11 +30,26 @@ npm run dev
 
 Open the local dashboard URL printed in your terminal and paste any JS/TS/Python snippet to inspect deterministic Layer 1 findings immediately.
 > [!NOTE]
-> The browser dashboard audits standalone snippets without repository git history. Importing internal monorepo workspace packages (e.g., `@myorg/ui`) in the browser will trigger `DG004`; use **Path B (GitHub Actions CI)** for full monorepo workspace resolution.
+> The browser dashboard audits standalone snippets without repository git history. Importing internal monorepo workspace packages (e.g., `@myorg/ui`) in the browser will trigger `DG004`; use **Path B (CLI)** or **Path C (GitHub Actions CI)** for full monorepo workspace resolution.
 
-### Path B: Install in GitHub Actions CI (Fork-Safe & Monorepo-Ready)
+### Path B: Zero-Dependency CLI & Pre-Commit Hook (`npx devguard`)
 
-Pin DevGuard by release tag or **full 40-character commit SHA** (`git rev-parse v1.4.0^{commit}`) in `.github/workflows/devguard.yml`. Always set **`fetch-depth: 0`** on `actions/checkout@v4` so DevGuard can read `origin/<baseRef>` for base-branch `.devguard.json` and monorepo workspace configs (avoiding shallow-clone `DG004-WS-SHALLOW` fallbacks):
+Run DevGuard directly from your terminal or install a Git pre-commit hook with zero setup:
+
+```bash
+# Audit staged files before committing
+npx devguard check --staged
+
+# Audit specific files or directories
+npx devguard check src/
+
+# Install idempotent Git pre-commit hook
+npx devguard install-hook
+```
+
+### Path C: Install in GitHub Actions CI (Fork-Safe & Monorepo-Ready)
+
+Pin DevGuard by release tag or **full 40-character commit SHA** (`git rev-parse v1.5.0^{commit}`) in `.github/workflows/devguard.yml`. Always set **`fetch-depth: 0`** on `actions/checkout@v4` so DevGuard can read `origin/<baseRef>` for base-branch `.devguard.json` and monorepo workspace configs (avoiding shallow-clone `DG004-WS-SHALLOW` fallbacks):
 
 ```yaml
 name: DevGuard Security Audit
@@ -59,9 +75,9 @@ jobs:
         with:
           fetch-depth: 0 # Required so base-branch .devguard.json & workspace configs are readable
 
-      - name: Run DevGuard v1.4.0
+      - name: Run DevGuard v1.5.0
         id: devguard
-        uses: OkyWoww/DevGuard@v1.4.0 # Or pin by 40-char commit SHA (git rev-parse v1.4.0^{commit})
+        uses: OkyWoww/DevGuard@v1.5.0 # Or pin by 40-char commit SHA (git rev-parse v1.5.0^{commit})
         with:
           # Optional: Omit for 100% Free Offline Single-Pass Lexical & Heuristic mode
           gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
@@ -351,9 +367,16 @@ See also [docs/benchmarks/realworld-2026-11-16.md](docs/benchmarks/realworld-202
 
 ### Known Limitations (Path Exclusions, CLI Scope, & Monorepo `pnpm strict`)
 * **Path Exclusions by Mode (`modified` vs. `all`):** Dot-prefixed paths (`.github/`, `.husky/`), `node_modules`, `dist`, `build`, `coverage`, `remotion`, `out`, `tests`, all files inside `scripts/`, anchored self-reference files (`src/devguardAnalyzer.ts`, `scripts/devguard_verify.py`, `devguard_verify.py` when `package.json` `"name": "devguard"`), `*.d.ts`, `*.test.*`, and `*.spec.*` are excluded from code auditing. In `modified` (`git diff`) mode, touched excluded paths enter the classifier as `ignored/excluded_path` and appear in PR Coverage as `- Ignored (excluded path): N` when `N > 0` so the coverage invariant covers 100% of `git diff`. In `all` mode, excluded directories are skipped during workspace traversal so `node_modules` is never walked.
-* **Explicit CLI Arguments & `--version`:** Explicit file arguments passed on the CLI follow the coverage classifier (`.py` is analyzed with `partial` coverage; unsupported extensions like `.go` are marked `skipped`). Missing explicit CLI paths and invalid `fail_on_unanalyzable` values write `overall_score=N/A` and `audit_status=FAIL` to `GITHUB_OUTPUT` before exiting `1` rather than counting as `ignored/deleted`. Passing `--version` or `-v` prints the resolved package version (e.g. `1.4.0`) and exits `0`.
+* **Explicit CLI Arguments & `--version`:** Explicit file arguments passed on the CLI follow the coverage classifier (`.py` is analyzed with `partial` coverage; unsupported extensions like `.go` are marked `skipped`). Missing explicit CLI paths and invalid `fail_on_unanalyzable` values write `overall_score=N/A` and `audit_status=FAIL` to `GITHUB_OUTPUT` before exiting `1` rather than counting as `ignored/deleted`. Passing `--version` or `-v` prints the resolved package version (e.g. `1.5.0`) and exits `0`.
 * **Monorepo `pnpm strict` Non-Hoisting Limitation (`SPEC §6.2a`):** On `pnpm` repositories that disable dependency hoisting, importing a dependency declared only in the repository root `package.json` from a nested workspace package will fail at runtime under strict `pnpm`, whereas DevGuard resolves it as `resolvedVia: root` for cross-mode determinism (`DG004` detects fictitious/hallucinated package names, and root-declared packages are real dependencies). Intermediate ancestor manifests and sibling package dependencies are never merged (`A6-9`, `A6-12`).
 * **Shallow Clone (`fetch-depth: 1`) Base-Ref Fallback & Notice (`[DG004-WS-SHALLOW]`):** When CI runs with default `fetch-depth: 1` and `origin/<baseRef>` cannot be fetched, DevGuard fails closed to `0` admitted base workspace packages (preventing PR-injected bypasses) and surfaces an explicit non-scoring `[DG004-WS-SHALLOW]` notice in the sticky PR comment reminding developers to configure `fetch-depth: 0` on `actions/checkout@v4`.
+
+### Behavior Changes from `v1.4.0` to `v1.5.0`
+* **Headless Core Engine Architecture (`src/core/`, SPEC Stage 7):** Full separation of analyzer core logic (`src/core/analyzer.ts`), rule suites (`src/core/rules/`), types (`src/core/types.ts`), and SARIF formatting (`src/core/sarif.ts`) from GitHub Action runtime, verified with byte-for-byte SARIF parity (`Test 88`).
+* **Standalone Zero-Dependency CLI (`src/adapters/cli/`):** Run audits anywhere locally with `devguard check [<paths>...]` supporting `--staged`, `--changed-since=<ref>`, `--format=text|json|sarif`, `--min-score=<n>`, `--config=<path>`, `--fail-on-unanalyzable`. Features strict argument injection defense (`--` separator, ref validation) and offline-by-default Layer 2 operation (`Skipped [Offline]`).
+* **Idempotent Git Pre-Commit Hook Installer (`devguard install-hook`):** Automatically wires zero-dependency pre-commit checks dynamically into `.git/hooks/pre-commit` (supporting worktrees via `git rev-parse --git-path hooks`) with safe marker blocks (`# BEGIN DEVGUARD HOOK`) and multi-tier runtime fallback (`devguard` -> `./dist/cli.js` -> `npx --no-install devguard`).
+* **`npx` Packaging & Dual Entrypoints:** Bundles standalone zero-dependency executable CLI at `dist/cli.js` via `esbuild` with `"bin": { "devguard": "./dist/cli.js" }` and `"files": ["dist/cli.js", "README.md"]`.
+* **Zero-Dep Bilingual UI Toggle (`src/i18n.ts`):** Added strongly-typed `EN` / `ID` language switcher in the local dashboard header without external runtime dependencies.
 
 ### Behavior Changes from `v1.3.0` to `v1.4.0`
 * **DG004 Monorepo Workspace Resolver (`SPEC-v1.4.md` rev 1.3):** Full zero-dependency resolution for monorepos (pnpm workspaces, npm/Yarn workspaces, Bun workspaces, and TypeScript path aliases via `tsconfig.json` `paths` / `baseUrl` and Node `#subpath` imports). Resolves packages via strict precedence (`nearest` → `root` → `workspace` → `tsconfig`/`#imports`), dramatically reducing monorepo false positives across real-world codebases (`nestjs/nest` 481 → 8, `tj/commander.js` 39 → 3, `vitejs/vite` 59 → 55).
@@ -365,26 +388,26 @@ See also [docs/benchmarks/realworld-2026-11-16.md](docs/benchmarks/realworld-202
 
 ## 🧪 Local Development & Verification
 
-DevGuard enforces a strict zero-dependency test harness using Node's built-in assertion & test runner (`node:test` compiled via `tsconfig.test.json` and executed in-process), currently verified at **88 passing test scenarios** across [tests/corpus.test.ts](tests/corpus.test.ts) (`Corpus Benchmark`) and [tests/integration.test.ts](tests/integration.test.ts) (`Tests 1–87`):
+DevGuard enforces a strict zero-dependency test harness using Node's built-in assertion & test runner (`node:test` compiled via `tsconfig.test.json` and executed in-process), currently verified at **92 passing test scenarios** across [tests/corpus.test.ts](tests/corpus.test.ts) (`Corpus Benchmark`) and [tests/integration.test.ts](tests/integration.test.ts) (`Tests 1–91`):
 
 ```bash
 # 1. Typecheck application, CLI, & tests
 npm run lint
 
-# 2. Build standalone web UI bundle
+# 2. Build standalone web UI bundle & CLI binary (dist/cli.js)
 npm run build
 
-# 3. Run zero-dependency benchmark + integration test suite (88 passing scenarios)
+# 3. Run zero-dependency benchmark + integration test suite (92 passing scenarios)
 npm test
 
-# 4. Print DevGuard CLI version cleanly under Node --experimental-strip-types
-node --experimental-strip-types src/loader.mjs --version
+# 4. Print DevGuard CLI version cleanly
+node dist/cli.js --version
 
-# 5. Regenerate labeled corpus Markdown summary
+# 5. Run standalone CLI check on staged files
+node dist/cli.js check --staged
+
+# 6. Regenerate labeled corpus Markdown summary
 npm run corpus:report
-
-# 6. Run DevGuard self-audit locally (zero-install Node 22 native TypeScript loader)
-node --experimental-strip-types src/loader.mjs src/devguardAnalyzer.ts src/cli.ts src/githubCommenter.ts src/sarifGenerator.ts
 ```
 
 ---
