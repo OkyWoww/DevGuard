@@ -14,6 +14,7 @@ export interface CliCheckOptions {
 export type ParsedCliCommand =
   | { kind: 'help' }
   | { kind: 'version' }
+  | { kind: 'install-hook' }
   | { kind: 'error'; message: string }
   | CliCheckOptions;
 
@@ -23,6 +24,7 @@ export function getCliUsageText(): string {
   return [
     'Usage:',
     '  devguard check [paths...] [options]',
+    '  devguard install-hook',
     '  devguard --version | -v',
     '  devguard --help | -h',
     '',
@@ -75,11 +77,22 @@ export function parseCliArgs(argv: readonly string[]): ParsedCliCommand {
     return { kind: 'version' };
   }
 
+  if (first === 'install-hook') {
+    if (argv.length > 1) {
+      const extra = argv[1];
+      if (extra === '--help' || extra === '-h') {
+        return { kind: 'help' };
+      }
+      return { kind: 'error', message: `Unknown option for install-hook: ${extra}` };
+    }
+    return { kind: 'install-hook' };
+  }
+
   if (first !== 'check') {
     if (first.startsWith('-')) {
       return { kind: 'error', message: `Unknown option: ${first}` };
     }
-    return { kind: 'error', message: `Unknown command: ${first}. Expected "check".` };
+    return { kind: 'error', message: `Unknown command: ${first}. Expected "check" or "install-hook".` };
   }
 
   const paths: string[] = [];

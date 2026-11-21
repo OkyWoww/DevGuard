@@ -8415,3 +8415,117 @@ test('Test 89: Stage 7.2 Zero-Dep CLI Adapter Contract (A7-3), Git Modes & Injec
     fs.rmSync(gitRepoDir, { recursive: true, force: true });
   }
 });
+
+test('Test 90: Stage 7.3 Idempotent Pre-Commit Hook Installer & npx Binary Packaging (A7-5)', async () => {
+  const { runCli } = await import('../src/adapters/cli/index.js');
+  const { HOOK_BEGIN_MARKER, HOOK_END_MARKER } = await import('../src/adapters/cli/hook.js');
+  const { execFileSync: execBinSync } = await import('node:child_process');
+
+  const execCli = (args: string[], cwd: string) => {
+    let stdout = '';
+    let stderr = '';
+    const code = runCli(args, {
+      cwd,
+      stdout: (s) => {
+        stdout += s;
+      },
+      stderr: (s) => {
+        stderr += s;
+      },
+    });
+    return { code, stdout, stderr };
+  };
+
+  // 1. Outside a Git repository -> fail closed with exit 2
+  const nonGitDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-a75-nongit-'));
+  try {
+    const res = execCli(['install-hook'], nonGitDir);
+    assert.equal(res.code, 2, 'install-hook outside Git repo must exit 2');
+    assert.ok(res.stderr.includes('Error:'));
+  } finally {
+    fs.rmSync(nonGitDir, { recursive: true, force: true });
+  }
+
+  // 2. Fresh Git repo -> creates executable hook, idempotent on 2nd run
+  const gitRepoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-a75-git-'));
+  try {
+    execBinSync('git', ['init'], { cwd: gitRepoDir, stdio: ['ignore', 'pipe', 'pipe'] });
+    const hookFile = path.join(gitRepoDir, '.git', 'hooks', 'pre-commit');
+
+    const firstInstall = execCli(['install-hook'], gitRepoDir);
+    assert.equal(firstInstall.code, 0, `First install-hook must exit 0: ${firstInstall.stderr}`);
+    assert.ok(firstInstall.stdout.includes('(created)'));
+    assert.ok(fs.existsSync(hookFile), 'pre-commit hook file must be created');
+
+    const firstContent = fs.readFileSync(hookFile, 'utf-8');
+    assert.ok(firstContent.startsWith('#!/bin/sh\n'));
+    assert.ok(firstContent.includes(HOOK_BEGIN_MARKER));
+    assert.ok(firstContent.includes(HOOK_END_MARKER));
+    if (process.platform !== 'win32') {
+      assert.ok((fs.statSync(hookFile).mode & 0o111) !== 0, 'pre-commit hook must be executable');
+    }
+
+    // 2nd run -> idempotent
+    const secondInstall = execCli(['install-hook'], gitRepoDir);
+    assert.equal(secondInstall.code, 0);
+    assert.ok(secondInstall.stdout.includes('(already-installed)'));
+    const secondContent = fs.readFileSync(hookFile, 'utf-8');
+    assert.equal(secondContent, firstContent, 'install-hook must be strictly idempotent on repeat runs');
+    assert.equal(
+      secondContent.split(HOOK_BEGIN_MARKER).length - 1,
+      1,
+      'HOOK_BEGIN_MARKER must appear exactly once'
+    );
+
+    // 3. Existing custom POSIX shell hook -> non-destructive append & idempotent
+    const customHook = '#!/bin/sh\necho "custom-pre-commit-check"\n';
+    fs.writeFileSync(hookFile, customHook, 'utf-8');
+    const appendRes = execCli(['install-hook'], gitRepoDir);
+    assert.equal(appendRes.code, 0);
+    assert.ok(appendRes.stdout.includes('(appended)'));
+    const appendedContent = fs.readFileSync(hookFile, 'utf-8');
+    assert.ok(appendedContent.includes('echo "custom-pre-commit-check"'), 'Existing hook content must be preserved');
+    assert.ok(appendedContent.includes(HOOK_BEGIN_MARKER));
+    assert.ok(appendedContent.includes(HOOK_END_MARKER));
+
+    const appendAgain = execCli(['install-hook'], gitRepoDir);
+    assert.equal(appendAgain.code, 0);
+    assert.equal(fs.readFileSync(hookFile, 'utf-8'), appendedContent, 'Appended hook must stay idempotent');
+
+    // 4. Existing non-shell hook (Python) -> fail closed with exit 2 and zero modification
+    const pythonHook = '#!/usr/bin/env python3\nprint("python hook")\n';
+    fs.writeFileSync(hookFile, pythonHook, 'utf-8');
+    const pyRes = execCli(['install-hook'], gitRepoDir);
+    assert.equal(pyRes.code, 2, 'Non-shell pre-commit hook must fail closed with exit 2');
+    assert.equal(fs.readFileSync(hookFile, 'utf-8'), pythonHook, 'Unsafe hook must not be modified');
+
+    // 5. Corrupted unmatched marker -> fail closed with exit 2 and zero modification
+    const corruptHook = `#!/bin/sh\n${HOOK_BEGIN_MARKER}\necho broken\n`;
+    fs.writeFileSync(hookFile, corruptHook, 'utf-8');
+    const corruptRes = execCli(['install-hook'], gitRepoDir);
+    assert.equal(corruptRes.code, 2, 'Corrupted hook markers must fail closed with exit 2');
+    assert.equal(fs.readFileSync(hookFile, 'utf-8'), corruptHook, 'Corrupted hook must not be modified');
+  } finally {
+    fs.rmSync(gitRepoDir, { recursive: true, force: true });
+  }
+
+  // 6. package.json bin/files/dependencies contract & executable dist/cli.js
+  const pkgJson = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, 'package.json'), 'utf-8')) as {
+    bin?: Record<string, string>;
+    files?: string[];
+    dependencies?: Record<string, string>;
+  };
+  assert.equal(pkgJson.bin?.devguard, './dist/cli.js', 'package.json bin.devguard must point to ./dist/cli.js');
+  assert.ok(Array.isArray(pkgJson.files) && pkgJson.files.includes('dist/cli.js'), 'package.json files must include dist/cli.js');
+  assert.deepEqual(pkgJson.dependencies, {}, 'package.json dependencies must remain {}');
+
+  const cliDistPath = path.join(REPO_ROOT, 'dist', 'cli.js');
+  assert.ok(fs.existsSync(cliDistPath), 'dist/cli.js must be built');
+  assert.ok(fs.readFileSync(cliDistPath, 'utf-8').startsWith('#!/usr/bin/env node'), 'dist/cli.js must start with node shebang');
+
+  const binVersionOut = execBinSync(process.execPath, [cliDistPath, '--version'], {
+    cwd: REPO_ROOT,
+    encoding: 'utf-8',
+  }).trim();
+  assert.equal(binVersionOut, getDevGuardVersion(), 'dist/cli.js --version must match package version');
+});

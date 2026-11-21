@@ -21,6 +21,7 @@ import {
 import { getCliUsageText, parseCliArgs } from './args.ts';
 import { formatCliOutput, type CliCheckResult } from './formatters.ts';
 import { getChangedFilesSince, getStagedFiles } from './git.ts';
+import { installPreCommitHook } from './hook.ts';
 
 const MAX_AUDIT_FILE_SIZE = 1_048_576; // 1 MiB ReDoS safety limit
 const ALLOWED_ALLOWLIST_RULES = new Set<string>([
@@ -272,6 +273,15 @@ export function runCli(argv: readonly string[], io?: CliIo): number {
   if (parsed.kind === 'error') {
     writeErr(`Error: ${parsed.message}\n`);
     return 2;
+  }
+  if (parsed.kind === 'install-hook') {
+    const hookRes = installPreCommitHook(cwd);
+    if (!hookRes.ok) {
+      writeErr(`Error: ${hookRes.error}\n`);
+      return 2;
+    }
+    writeOut(`DevGuard pre-commit hook (${hookRes.status}): ${hookRes.hookPath}\n`);
+    return 0;
   }
 
   // 1. Load & validate local .devguard.json (strict fail-closed -> exit 2)

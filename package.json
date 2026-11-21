@@ -3,12 +3,20 @@
   "private": true,
   "version": "1.4.0",
   "type": "module",
+  "bin": {
+    "devguard": "./dist/cli.js"
+  },
+  "files": [
+    "dist/cli.js",
+    "README.md"
+  ],
   "scripts": {
     "dev": "tsx server.ts",
     "audit": "tsx src/cli.ts",
     "audit:ci": "tsx src/cli.ts --ci",
     "corpus:report": "npx tsx scripts/corpus-report.ts",
-    "build": "vite build",
+    "build:cli": "node -e \"require('esbuild').buildSync({ entryPoints: ['src/adapters/cli/index.ts'], bundle: true, platform: 'node', format: 'esm', target: 'node22', outfile: 'dist/cli.js' })\"",
+    "build": "vite build && npm run build:cli",
     "start": "tsx server.ts",
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
