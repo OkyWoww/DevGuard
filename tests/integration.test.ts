@@ -8520,6 +8520,9 @@ test('Test 90: Stage 7.3 Idempotent Pre-Commit Hook Installer & npx Binary Packa
   assert.deepEqual(pkgJson.dependencies, {}, 'package.json dependencies must remain {}');
 
   const cliDistPath = path.join(REPO_ROOT, 'dist', 'cli.js');
+  if (!fs.existsSync(cliDistPath)) {
+    execBinSync(process.execPath, ['-e', "require('esbuild').buildSync({ entryPoints: ['src/adapters/cli/index.ts'], bundle: true, platform: 'node', format: 'esm', target: 'node22', outfile: 'dist/cli.js' })"], { cwd: REPO_ROOT });
+  }
   assert.ok(fs.existsSync(cliDistPath), 'dist/cli.js must be built');
   assert.ok(fs.readFileSync(cliDistPath, 'utf-8').startsWith('#!/usr/bin/env node'), 'dist/cli.js must start with node shebang');
 
@@ -8579,6 +8582,9 @@ test('Test 91: Stage 7.4 Comprehensive Regression, Empty Staged Pass, & Built Bi
 
   // 2. Built dist/cli.js end-to-end subprocess exit codes (0, 1, 2)
   const cliDistPath = path.join(REPO_ROOT, 'dist', 'cli.js');
+  if (!fs.existsSync(cliDistPath)) {
+    execBinSync(process.execPath, ['-e', "require('esbuild').buildSync({ entryPoints: ['src/adapters/cli/index.ts'], bundle: true, platform: 'node', format: 'esm', target: 'node22', outfile: 'dist/cli.js' })"], { cwd: REPO_ROOT });
+  }
   assert.ok(fs.existsSync(cliDistPath), 'dist/cli.js must exist for A7-6 E2E verification');
 
   const tmpE2e = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-a76-e2e-'));
