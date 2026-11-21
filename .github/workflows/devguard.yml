@@ -29,6 +29,12 @@ jobs:
       - name: Install Dependencies
         run: npm install
 
+      - name: Typecheck
+        run: npm run lint
+
+      - name: Build Project and CLI Binary
+        run: npm run build
+
       - name: Run Integration Tests
         run: npm test
 
