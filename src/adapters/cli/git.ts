@@ -37,6 +37,7 @@ function runGitSafely(
       encoding: 'utf-8',
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: 15000,
+      maxBuffer: 10 * 1024 * 1024,
     });
     return { ok: true, stdout };
   } catch (err) {
@@ -62,16 +63,16 @@ export function resolveGitRepoRoot(cwd: string): { ok: true; repoRoot: string } 
   return { ok: true, repoRoot: res.stdout.trim() };
 }
 
-function parseGitFileList(stdout: string): string[] {
+function parseGitNullSeparatedFileList(stdout: string): string[] {
   return stdout
-    .split(/\r?\n/)
-    .map((line) => line.trim().replace(/\\/g, '/'))
-    .filter((line) => line.length > 0);
+    .split('\0')
+    .map((entry) => entry.replace(/\\/g, '/'))
+    .filter((entry) => entry.length > 0);
 }
 
 /**
- * Resolves staged files via `git diff --cached --name-only --diff-filter=ACMR --`.
- * Fails closed if `cwd` is not a Git repository.
+ * Resolves staged files via `git -c core.quotePath=false diff --cached --name-only -z --diff-filter=ACMR --`.
+ * Preserves spaces and non-ASCII filenames without quoting; fails closed outside a Git repository.
  */
 export function getStagedFiles(cwd: string): GitResolveResult {
   const rootRes = resolveGitRepoRoot(cwd);
@@ -80,7 +81,7 @@ export function getStagedFiles(cwd: string): GitResolveResult {
   }
 
   const diffRes = runGitSafely(
-    ['diff', '--cached', '--name-only', '--diff-filter=ACMR', '--'],
+    ['-c', 'core.quotePath=false', 'diff', '--cached', '--name-only', '-z', '--diff-filter=ACMR', '--'],
     rootRes.repoRoot
   );
   if (!diffRes.ok) {
@@ -89,14 +90,14 @@ export function getStagedFiles(cwd: string): GitResolveResult {
 
   return {
     ok: true,
-    files: parseGitFileList(diffRes.stdout),
+    files: parseGitNullSeparatedFileList(diffRes.stdout),
     repoRoot: rootRes.repoRoot,
   };
 }
 
 /**
- * Resolves files changed since `ref` via `git diff --name-only --diff-filter=ACMR <ref> --`.
- * Validates `ref` first and uses `execFileSync` with `--` separator to prevent argument injection.
+ * Resolves files changed since `ref` via `git -c core.quotePath=false diff --name-only -z --diff-filter=ACMR <ref> --`.
+ * Validates `ref` first and uses `execFileSync` with `-z` and `--` separator to prevent argument injection and path quoting loss.
  */
 export function getChangedFilesSince(ref: string, cwd: string): GitResolveResult {
   const refCheck = validateGitRef(ref);
@@ -118,7 +119,7 @@ export function getChangedFilesSince(ref: string, cwd: string): GitResolveResult
   }
 
   const diffRes = runGitSafely(
-    ['diff', '--name-only', '--diff-filter=ACMR', refCheck.ref, '--'],
+    ['-c', 'core.quotePath=false', 'diff', '--name-only', '-z', '--diff-filter=ACMR', refCheck.ref, '--'],
     rootRes.repoRoot
   );
   if (!diffRes.ok) {
@@ -130,7 +131,7 @@ export function getChangedFilesSince(ref: string, cwd: string): GitResolveResult
 
   return {
     ok: true,
-    files: parseGitFileList(diffRes.stdout),
+    files: parseGitNullSeparatedFileList(diffRes.stdout),
     repoRoot: rootRes.repoRoot,
   };
 }

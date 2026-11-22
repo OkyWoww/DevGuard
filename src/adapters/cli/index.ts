@@ -316,11 +316,14 @@ export function runCli(argv: readonly string[], io?: CliIo): number {
     isExplicitList = true;
     for (const rawTarget of parsed.paths) {
       const resolvedTarget = path.resolve(cwd, rawTarget);
-      if (!fs.existsSync(resolvedTarget)) {
-        writeErr(`Error: Target path not found: ${rawTarget}\n`);
+      let stat: fs.Stats;
+      try {
+        stat = fs.statSync(resolvedTarget);
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        writeErr(`Error: Target path not accessible (${rawTarget}): ${reason}\n`);
         return 2;
       }
-      const stat = fs.statSync(resolvedTarget);
       if (stat.isDirectory()) {
         collectDirectoryFiles(resolvedTarget, cwd, candidateRelFiles);
       } else if (stat.isFile()) {
@@ -348,10 +351,36 @@ export function runCli(argv: readonly string[], io?: CliIo): number {
   const partialFiles: string[] = [];
   const skippedFiles: SkippedFileReportItem[] = [];
   let hasBlockingFailure = false;
+  let hasOperationalError = false;
 
   for (const relPath of uniqueFiles) {
     const fullPath = path.resolve(baseDir, relPath);
-    if (!fs.existsSync(fullPath)) continue;
+    if (parsed.staged || parsed.changedSince !== null) {
+      const contained = path.relative(baseDir, fullPath);
+      if (contained.startsWith('..') || path.isAbsolute(contained)) {
+        writeErr(`Error: Refusing path outside repository root: ${relPath}\n`);
+        return 2;
+      }
+    }
+
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(fullPath);
+    } catch (err) {
+      const codeErr = (err as { code?: string })?.code;
+      if (!isExplicitList && codeErr === 'ENOENT') {
+        continue;
+      }
+      const reason = err instanceof Error ? err.message : String(err);
+      writeErr(`Error: Unable to inspect file "${relPath}": ${reason}\n`);
+      skippedFiles.push({ filePath: relPath, reason: 'internal_error' });
+      hasOperationalError = true;
+      continue;
+    }
+
+    if (!stat.isFile()) {
+      continue;
+    }
 
     const isJsTs = hasAnalyzableExtension(relPath);
     const isPy = hasPartialAnalysisExtension(relPath);
@@ -363,7 +392,6 @@ export function runCli(argv: readonly string[], io?: CliIo): number {
       continue;
     }
 
-    const stat = fs.statSync(fullPath);
     if (stat.size > MAX_AUDIT_FILE_SIZE) {
       skippedFiles.push({ filePath: relPath, reason: 'file_too_large' });
       continue;
@@ -373,16 +401,35 @@ export function runCli(argv: readonly string[], io?: CliIo): number {
       partialFiles.push(relPath);
     }
 
-    const code = fs.readFileSync(fullPath, 'utf-8');
+    let code: string;
+    try {
+      code = fs.readFileSync(fullPath, 'utf-8');
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      writeErr(`Error: Unable to read file "${relPath}": ${reason}\n`);
+      skippedFiles.push({ filePath: relPath, reason: 'internal_error' });
+      hasOperationalError = true;
+      continue;
+    }
+
     const allowlistRules = getAllowedRulesForPath(relPath, cfgRes.config.rulesByPath);
 
-    const report = analyzeCodeDeterministically(code, {
-      filePath: relPath,
-      externalAllowlist: allowlistRules.length > 0 ? allowlistRules : undefined,
-      workspaceContext,
-      workspaceFileAccessor: localFsAccessor,
-      workspacesMode: cfgRes.config.workspacesMode,
-    });
+    let report: ReturnType<typeof analyzeCodeDeterministically>;
+    try {
+      report = analyzeCodeDeterministically(code, {
+        filePath: relPath,
+        externalAllowlist: allowlistRules.length > 0 ? allowlistRules : undefined,
+        workspaceContext,
+        workspaceFileAccessor: localFsAccessor,
+        workspacesMode: cfgRes.config.workspacesMode,
+      });
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      writeErr(`Error: Internal analyzer failure on "${relPath}": ${reason}\n`);
+      skippedFiles.push({ filePath: relPath, reason: 'internal_error' });
+      hasOperationalError = true;
+      continue;
+    }
 
     const blockingFindings = (report.inlineFindings ?? []).filter(
       (f) => f.scoring !== false && f.severity === 'error'
@@ -423,7 +470,9 @@ export function runCli(argv: readonly string[], io?: CliIo): number {
       ? null
       : Math.round(summaries.reduce((acc, s) => acc + s.overall, 0) / summaries.length);
   const passed =
-    !hasBlockingFailure && (overallScore === null || overallScore >= parsed.minScore);
+    !hasOperationalError &&
+    !hasBlockingFailure &&
+    (overallScore === null || overallScore >= parsed.minScore);
 
   const checkResult: CliCheckResult = {
     version: getDevGuardVersion(),
@@ -436,12 +485,30 @@ export function runCli(argv: readonly string[], io?: CliIo): number {
     workspaceDiagnostics: workspaceContext?.diagnostics ?? [],
   };
 
-  const formatted = formatCliOutput(parsed.format, checkResult);
+  let formatted: string;
+  try {
+    formatted = formatCliOutput(parsed.format, checkResult);
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    writeErr(`Error: Failed to format CLI output: ${reason}\n`);
+    return 2;
+  }
+
   if (parsed.outputPath !== null) {
     const resolvedOut = path.resolve(cwd, parsed.outputPath);
-    fs.writeFileSync(resolvedOut, formatted, 'utf-8');
+    try {
+      fs.writeFileSync(resolvedOut, formatted, 'utf-8');
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      writeErr(`Error: Unable to write output file "${parsed.outputPath}": ${reason}\n`);
+      return 2;
+    }
   } else {
     writeOut(formatted);
+  }
+
+  if (hasOperationalError) {
+    return 2;
   }
 
   return passed ? 0 : 1;

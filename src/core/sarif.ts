@@ -87,14 +87,18 @@ export interface GenerateSarifOptions {
   partialFiles?: ReadonlyArray<string>;
   hasAnalysisFailure?: boolean;
   workspaceDiagnostics?: ReadonlyArray<WorkspaceDiagnosticNotice>;
+  silent?: boolean;
 }
 
-export function generateSarifReport(
+/**
+ * Builds the canonical SARIF v2.1.0 JSON string in memory without side effects
+ * (no disk writes, no stdout logging). Shared by `generateSarifReport` and CLI `--format sarif`.
+ */
+export function buildSarifReportString(
   summaries: FileAuditSummary[],
-  outputPath: string = 'devguard-results.sarif',
   skippedFiles: ReadonlyArray<SkippedFileReportItem> = [],
   options?: GenerateSarifOptions
-): string {
+): { sarifJson: string; resultCount: number } {
   const rulesMap = new Map<string, {
     id: string;
     name: string;
@@ -534,9 +538,25 @@ export function generateSarifReport(
     ]
   };
 
+  return {
+    sarifJson: JSON.stringify(sarifLog, null, 2),
+    resultCount: results.length,
+  };
+}
+
+export function generateSarifReport(
+  summaries: FileAuditSummary[],
+  outputPath: string = 'devguard-results.sarif',
+  skippedFiles: ReadonlyArray<SkippedFileReportItem> = [],
+  options?: GenerateSarifOptions
+): string {
+  const { sarifJson, resultCount } = buildSarifReportString(summaries, skippedFiles, options);
+
   const resolvedPath = path.resolve(process.cwd(), outputPath);
-  fs.writeFileSync(resolvedPath, JSON.stringify(sarifLog, null, 2), 'utf-8');
-  console.log(`📄 Laporan SARIF v2.1.0 berhasil dibuat: ${resolvedPath} (${results.length} anotasi)`);
+  fs.writeFileSync(resolvedPath, sarifJson, 'utf-8');
+  if (!options?.silent) {
+    console.log(`📄 Laporan SARIF v2.1.0 berhasil dibuat: ${resolvedPath} (${resultCount} anotasi)`);
+  }
 
   return resolvedPath;
 }

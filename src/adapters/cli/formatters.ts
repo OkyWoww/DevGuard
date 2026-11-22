@@ -1,7 +1,4 @@
-import * as fs from 'node:fs';
-import * as os from 'node:os';
-import * as path from 'node:path';
-import { generateSarifReport } from '../../core/sarif.ts';
+import { buildSarifReportString } from '../../core/sarif.ts';
 import type {
   FileAuditSummary,
   SkippedFileReportItem,
@@ -79,22 +76,17 @@ export function formatJsonReport(result: CliCheckResult): string {
 }
 
 /**
- * Generates SARIF v2.1.0 string using `src/core/sarif.ts` so `--format sarif`
- * is guaranteed byte-for-byte identical to `src/core/` and `adapters/action/`.
+ * Generates SARIF v2.1.0 string purely in memory using `src/core/sarif.ts` so `--format sarif`
+ * is guaranteed byte-for-byte identical to `src/core/` and `adapters/action/` with zero stdout log pollution.
  */
 export function formatSarifReport(result: CliCheckResult): string {
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-cli-sarif-'));
-  try {
-    const tmpFile = path.join(tmpDir, 'report.sarif');
-    generateSarifReport(result.summaries, tmpFile, result.skippedFiles, {
-      partialFiles: result.partialFiles,
-      hasAnalysisFailure: false,
-      workspaceDiagnostics: result.workspaceDiagnostics,
-    });
-    return fs.readFileSync(tmpFile, 'utf-8');
-  } finally {
-    fs.rmSync(tmpDir, { recursive: true, force: true });
-  }
+  const { sarifJson } = buildSarifReportString(result.summaries, result.skippedFiles, {
+    partialFiles: result.partialFiles,
+    hasAnalysisFailure: false,
+    workspaceDiagnostics: result.workspaceDiagnostics,
+    silent: true,
+  });
+  return sarifJson;
 }
 
 export function formatCliOutput(format: CliFormat, result: CliCheckResult): string {
