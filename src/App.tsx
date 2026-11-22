@@ -66,6 +66,25 @@ function clampLine(line: number, totalLines: number): number {
   return Math.min(Math.max(1, Math.trunc(line)), safeTotal);
 }
 
+/** Fail-closed score sanitizer: any non-finite or missing score defaults to 0. */
+function clampValidScore(value: unknown): number {
+  const numeric = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(numeric)) return 0;
+  return Math.min(100, Math.max(0, Math.round(numeric)));
+}
+
+function isValidParsedReport(candidate: unknown): candidate is ParsedDevGuardReport {
+  if (!candidate || typeof candidate !== 'object') return false;
+  const reportObj = candidate as Partial<ParsedDevGuardReport>;
+  if (!reportObj.skor || typeof reportObj.skor !== 'object') return false;
+  return (
+    Number.isFinite(Number(reportObj.skor.totalScore)) &&
+    Number.isFinite(Number(reportObj.skor.security)) &&
+    Number.isFinite(Number(reportObj.skor.correctness)) &&
+    Number.isFinite(Number(reportObj.skor.maintainability))
+  );
+}
+
 function extractFirstLineNumber(text: string): number {
   const match = text.match(/\d+/);
   if (!match) return 1;
@@ -198,11 +217,24 @@ function normalizeParsedReport(
     });
   }
 
+  const rawScores = parsed?.skor;
+  const hasAllFiniteScores =
+    Boolean(rawScores) &&
+    Number.isFinite(Number(rawScores.totalScore)) &&
+    Number.isFinite(Number(rawScores.security)) &&
+    Number.isFinite(Number(rawScores.correctness)) &&
+    Number.isFinite(Number(rawScores.maintainability));
+
+  const overallScore = clampValidScore(rawScores?.totalScore);
+  const securityScore = clampValidScore(rawScores?.security);
+  const correctnessScore = clampValidScore(rawScores?.correctness);
+  const maintainabilityScore = clampValidScore(rawScores?.maintainability);
+
   const hasBlocking = findings.some((f) => f.blocking);
   let verdict: AuditVerdict = 'PASS';
-  if (hasBlocking || parsed.skor.totalScore < 70 || parsed.skor.security < 70) {
+  if (!hasAllFiniteScores || hasBlocking || overallScore < 70 || securityScore < 70) {
     verdict = 'FAIL';
-  } else if (parsed.skor.totalScore < 85) {
+  } else if (overallScore < 85) {
     verdict = 'REVIEW';
   }
 
@@ -222,10 +254,10 @@ function normalizeParsedReport(
   return {
     verdict,
     scores: {
-      overall: parsed.skor.totalScore,
-      security: parsed.skor.security,
-      correctness: parsed.skor.correctness,
-      maintainability: parsed.skor.maintainability,
+      overall: overallScore,
+      security: securityScore,
+      correctness: correctnessScore,
+      maintainability: maintainabilityScore,
     },
     findings,
     notices,
@@ -294,7 +326,12 @@ export default function App() {
   }, []);
 
   const handleCodeChange = useCallback((nextCode: string) => {
+    auditSeqRef.current += 1;
     setCode(nextCode);
+    setRunState('idle');
+    setReport(null);
+    setEngineSource(null);
+    setError(null);
     setActiveLine(null);
     setSelectedFindingKey(null);
   }, []);
@@ -386,14 +423,18 @@ export default function App() {
           return;
         }
 
-        const payload = (await response.json()) as { parsedReport?: ParsedDevGuardReport };
+        const payload = (await response.json()) as {
+          isLiveApi?: boolean;
+          parsedReport?: ParsedDevGuardReport;
+        };
         if (auditSeqRef.current !== requestSeq) return;
 
-        const hasLiveReport = Boolean(payload.parsedReport);
-        const source: AuditEngineSource = hasLiveReport ? 'live' : 'offline';
-        const parsed =
-          payload.parsedReport ??
-          analyzeCodeDeterministically(targetCode, { filePath: fileName });
+        const hasValidServerReport = isValidParsedReport(payload?.parsedReport);
+        const isLiveGemini = payload?.isLiveApi === true && hasValidServerReport;
+        const source: AuditEngineSource = isLiveGemini ? 'live' : 'offline';
+        const parsed = hasValidServerReport
+          ? payload.parsedReport!
+          : analyzeCodeDeterministically(targetCode, { filePath: fileName });
         const durationMs = Math.max(1, Math.round(performance.now() - startedAt));
         setEngineSource(source);
         setReport(normalizeParsedReport(parsed, targetCode, fileName, durationMs, source));
