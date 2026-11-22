@@ -8,6 +8,8 @@ export type FindingSeverity = 'error' | 'warning' | 'info';
 
 export type ExportFormat = 'json' | 'sarif';
 
+export type AuditEngineSource = 'live' | 'offline';
+
 export interface CodePreset {
   id: string;
   label: string;
@@ -46,6 +48,7 @@ export interface AuditReport {
   notices: AuditNotice[];
   rawSarif?: unknown;
   durationMs?: number;
+  engineSource?: AuditEngineSource;
 }
 
 export interface AuditErrorInfo {
