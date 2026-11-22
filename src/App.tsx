@@ -1,4 +1,4 @@
-import React, { useCallback, useMemo, useState } from 'react';
+import React, { useCallback, useMemo, useRef, useState } from 'react';
 import {
   analyzeCodeDeterministically,
   type InlineFinding,
@@ -14,6 +14,7 @@ import type {
   AuditErrorInfo,
   AuditFinding,
   AuditNotice,
+  AuditRemediation,
   AuditReport,
   AuditRunState,
   AuditVerdict,
@@ -138,6 +139,7 @@ function buildSarifExport(
 
 function normalizeParsedReport(
   parsed: ParsedDevGuardReport,
+  sourceCode: string,
   fileName: string,
   durationMs: number,
   engineSource: AuditEngineSource
@@ -204,6 +206,19 @@ function normalizeParsedReport(
     verdict = 'REVIEW';
   }
 
+  const rawPatch = parsed.perbaikan?.code ?? '';
+  const remediation: AuditRemediation | undefined =
+    verdict !== 'PASS' &&
+    !parsed.isHardened &&
+    rawPatch.trim().length > 0 &&
+    rawPatch.trim() !== sourceCode.trim()
+      ? {
+          code: rawPatch,
+          language: parsed.perbaikan?.language || 'code',
+          summary: parsed.perbaikan?.summary || '',
+        }
+      : undefined;
+
   return {
     verdict,
     scores: {
@@ -214,6 +229,7 @@ function normalizeParsedReport(
     },
     findings,
     notices,
+    remediation,
     rawSarif: buildSarifExport(fileName, findings, notices),
     durationMs,
     engineSource,
@@ -257,6 +273,8 @@ export default function App() {
   const [activeLine, setActiveLine] = useState<number | null>(null);
   const [selectedFindingKey, setSelectedFindingKey] = useState<string | null>(null);
 
+  const auditSeqRef = useRef<number>(0);
+
   const totalLines = useMemo(() => Math.max(1, code.split('\n').length), [code]);
 
   const flaggedLines = useMemo<ReadonlySet<number>>(() => {
@@ -285,6 +303,7 @@ export default function App() {
     (presetId: string) => {
       const target = presets.find((item) => item.id === presetId);
       if (!target) return;
+      auditSeqRef.current += 1;
       setSelectedPresetId(target.id);
       setCode(target.code);
       setFileName(target.fileName);
@@ -305,6 +324,7 @@ export default function App() {
   }, []);
 
   const handleClearCode = useCallback(() => {
+    auditSeqRef.current += 1;
     setCode('');
     setRunState('idle');
     setReport(null);
@@ -314,105 +334,141 @@ export default function App() {
     setSelectedFindingKey(null);
   }, []);
 
-  const handleRunAudit = useCallback(async () => {
-    if (code.trim().length === 0) {
-      setRunState('error');
-      setReport(null);
-      setEngineSource(null);
+  const executeAudit = useCallback(
+    async (targetCode: string) => {
+      const requestSeq = ++auditSeqRef.current;
+
+      if (targetCode.trim().length === 0) {
+        setRunState('error');
+        setReport(null);
+        setEngineSource(null);
+        setActiveLine(null);
+        setSelectedFindingKey(null);
+        setError({
+          code: 'INVALID_INPUT',
+          message:
+            locale === 'id'
+              ? 'Editor kode kosong. Masukkan cuplikan kode sebelum menjalankan audit.'
+              : 'Code editor is empty. Provide a source snippet before running an audit.',
+          retryable: false,
+        });
+        return;
+      }
+
+      const startedAt = performance.now();
+      setRunState('running');
+      setError(null);
       setActiveLine(null);
       setSelectedFindingKey(null);
-      setError({
-        code: 'INVALID_INPUT',
-        message:
-          locale === 'id'
-            ? 'Editor kode kosong. Masukkan cuplikan kode sebelum menjalankan audit.'
-            : 'Code editor is empty. Provide a source snippet before running an audit.',
-        retryable: false,
-      });
-      return;
-    }
 
-    const startedAt = performance.now();
-    setRunState('running');
-    setError(null);
-    setActiveLine(null);
-    setSelectedFindingKey(null);
-
-    try {
-      const response = await fetch('/api/devguard/review', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ code, fileName, locale }),
-        signal: AbortSignal.timeout(AUDIT_TIMEOUT_MS),
-      });
-
-      if (!response.ok) {
-        setRunState('error');
-        setReport(null);
-        setEngineSource(null);
-        setError({
-          code: 'HTTP_ERROR',
-          message:
-            locale === 'id'
-              ? `Server audit mengembalikan status HTTP ${response.status}.`
-              : `Audit endpoint returned HTTP ${response.status}.`,
-          retryable: true,
-        });
-        return;
-      }
-
-      const payload = (await response.json()) as { parsedReport?: ParsedDevGuardReport };
-      const hasLiveReport = Boolean(payload.parsedReport);
-      const source: AuditEngineSource = hasLiveReport ? 'live' : 'offline';
-      const parsed =
-        payload.parsedReport ??
-        analyzeCodeDeterministically(code, { filePath: fileName });
-      const durationMs = Math.max(1, Math.round(performance.now() - startedAt));
-      setEngineSource(source);
-      setReport(normalizeParsedReport(parsed, fileName, durationMs, source));
-      setRunState('success');
-    } catch (caught: unknown) {
-      const isTimeout =
-        caught instanceof Error &&
-        (caught.name === 'TimeoutError' || caught.name === 'AbortError');
-
-      if (isTimeout) {
-        setRunState('error');
-        setReport(null);
-        setEngineSource(null);
-        setError({
-          code: 'TIMEOUT',
-          message:
-            locale === 'id'
-              ? 'Permintaan audit melebihi batas waktu 10 detik. Coba jalankan ulang.'
-              : 'Audit request timed out after 10 seconds. Please retry.',
-          retryable: true,
-        });
-        return;
-      }
-
-      // Explicit offline fallback to local deterministic analyzer when API backend is unreachable
       try {
-        const localParsed = analyzeCodeDeterministically(code, { filePath: fileName });
+        const response = await fetch('/api/devguard/review', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code: targetCode, fileName, locale }),
+          signal: AbortSignal.timeout(AUDIT_TIMEOUT_MS),
+        });
+
+        if (auditSeqRef.current !== requestSeq) return;
+
+        if (!response.ok) {
+          setRunState('error');
+          setReport(null);
+          setEngineSource(null);
+          setError({
+            code: 'HTTP_ERROR',
+            message:
+              locale === 'id'
+                ? `Server audit mengembalikan status HTTP ${response.status}.`
+                : `Audit endpoint returned HTTP ${response.status}.`,
+            retryable: true,
+          });
+          return;
+        }
+
+        const payload = (await response.json()) as { parsedReport?: ParsedDevGuardReport };
+        if (auditSeqRef.current !== requestSeq) return;
+
+        const hasLiveReport = Boolean(payload.parsedReport);
+        const source: AuditEngineSource = hasLiveReport ? 'live' : 'offline';
+        const parsed =
+          payload.parsedReport ??
+          analyzeCodeDeterministically(targetCode, { filePath: fileName });
         const durationMs = Math.max(1, Math.round(performance.now() - startedAt));
-        setEngineSource('offline');
-        setReport(normalizeParsedReport(localParsed, fileName, durationMs, 'offline'));
+        setEngineSource(source);
+        setReport(normalizeParsedReport(parsed, targetCode, fileName, durationMs, source));
         setRunState('success');
-      } catch (fallbackErr: unknown) {
-        setRunState('error');
+      } catch (caught: unknown) {
+        if (auditSeqRef.current !== requestSeq) return;
+
+        const isTimeout =
+          caught instanceof Error &&
+          (caught.name === 'TimeoutError' || caught.name === 'AbortError');
+
+        if (isTimeout) {
+          setRunState('error');
+          setReport(null);
+          setEngineSource(null);
+          setError({
+            code: 'TIMEOUT',
+            message:
+              locale === 'id'
+                ? 'Permintaan audit melebihi batas waktu 10 detik. Coba jalankan ulang.'
+                : 'Audit request timed out after 10 seconds. Please retry.',
+            retryable: true,
+          });
+          return;
+        }
+
+        // Explicit offline fallback to local deterministic analyzer when API backend is unreachable
+        try {
+          const localParsed = analyzeCodeDeterministically(targetCode, { filePath: fileName });
+          if (auditSeqRef.current !== requestSeq) return;
+          const durationMs = Math.max(1, Math.round(performance.now() - startedAt));
+          setEngineSource('offline');
+          setReport(normalizeParsedReport(localParsed, targetCode, fileName, durationMs, 'offline'));
+          setRunState('success');
+        } catch (fallbackErr: unknown) {
+          if (auditSeqRef.current !== requestSeq) return;
+          setRunState('error');
+          setReport(null);
+          setEngineSource(null);
+          setError({
+            code: 'NETWORK',
+            message:
+              fallbackErr instanceof Error
+                ? fallbackErr.message
+                : 'Unable to reach audit server or run local deterministic fallback.',
+            retryable: true,
+          });
+        }
+      }
+    },
+    [fileName, locale]
+  );
+
+  const handleRunAudit = useCallback(() => {
+    void executeAudit(code);
+  }, [code, executeAudit]);
+
+  const handleApplyRemediation = useCallback(
+    (remediationCode: string, reAudit: boolean) => {
+      if (!remediationCode || remediationCode.trim().length === 0) return;
+      setCode(remediationCode);
+      setActiveLine(null);
+      setSelectedFindingKey(null);
+      if (reAudit) {
+        void executeAudit(remediationCode);
+      } else {
+        auditSeqRef.current += 1;
+        setRunState('idle');
         setReport(null);
         setEngineSource(null);
-        setError({
-          code: 'NETWORK',
-          message:
-            fallbackErr instanceof Error
-              ? fallbackErr.message
-              : 'Unable to reach audit server or run local deterministic fallback.',
-          retryable: true,
-        });
+        setError(null);
       }
-    }
-  }, [code, fileName, locale]);
+    },
+    [executeAudit]
+  );
 
   const handleExport = useCallback(
     (format: ExportFormat) => {
@@ -489,6 +545,7 @@ export default function App() {
             engineSource={engineSource}
             onSelectFinding={handleSelectFinding}
             onSelectNoticeLine={handleSelectNoticeLine}
+            onApplyRemediation={handleApplyRemediation}
             onRetry={handleRunAudit}
             locale={locale}
           />

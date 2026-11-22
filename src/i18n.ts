@@ -419,3 +419,227 @@ export const UI_TEXT: Record<Locale, UiDictionary> = {
     },
   },
 };
+
+const RULE_TITLES_BY_LOCALE: Record<Locale, Record<string, string>> = {
+  en: {
+    DG001: 'Security or Logic Flaw',
+    DG002: 'Defense-in-Depth Hardening',
+    DG003: 'Score Below Threshold',
+    DG004: 'Supply-Chain / Undeclared Package',
+    'DG004-DYN-01': 'Dynamic import() Specifier',
+    'DG004-DYN-02': 'Dynamic require() Specifier',
+    'DG004-WS-NEW': 'New Workspace Package in PR',
+    'DG004-WS-UNPARSED': 'Unparseable Workspace Config',
+    'DG004-WS-SHALLOW': 'Shallow Clone Base Ref',
+    DG005: 'Swallowed Exception',
+    DG006: 'Non-Atomic State Mutation (TOCTOU)',
+    DG007: 'Hardcoded Secret or Credential',
+    DG008: 'Missing Timeout or Unbounded Async Loop',
+  },
+  id: {
+    DG001: 'Celah Keamanan atau Logika',
+    DG002: 'Penguatan Defense-in-Depth',
+    DG003: 'Skor di Bawah Ambang Batas',
+    DG004: 'Rantai Pasok / Paket Tidak Terdaftar',
+    'DG004-DYN-01': 'Spesifier import() Dinamis',
+    'DG004-DYN-02': 'Spesifier require() Dinamis',
+    'DG004-WS-NEW': 'Paket Workspace Baru di PR',
+    'DG004-WS-UNPARSED': 'Konfigurasi Workspace Gagal Di-parse',
+    'DG004-WS-SHALLOW': 'Base Ref Shallow Clone',
+    DG005: 'Pengecualian Ditelan (Swallowed Exception)',
+    DG006: 'Mutasi Status Non-Atomik (TOCTOU)',
+    DG007: 'Rahasia atau Kredensial Hardcoded',
+    DG008: 'Tanpa Timeout atau Loop Async Tak Terbatas',
+  },
+};
+
+const DEFAULT_FINDING_FALLBACK: Record<Locale, Record<string, string>> = {
+  en: {
+    DG001: 'Critical security vulnerability or exploitable logic flaw detected.',
+    DG002: 'Defense-in-Depth architectural hardening recommendation.',
+    DG003: 'Overall score fell below the required quality gate threshold.',
+    DG004: 'Undeclared or potentially typosquatted package dependency detected.',
+    DG005: 'Empty or log-only catch block swallows exceptions in a critical flow.',
+    DG006: 'Non-atomic check-then-act state mutation across an await boundary (TOCTOU).',
+    DG007: 'Hardcoded secret or API credential detected in source code.',
+    DG008: 'External network call lacks AbortSignal.timeout() or async loop is unbounded.',
+  },
+  id: {
+    DG001: 'Ditemukan celah keamanan kritis atau kesalahan logika yang dapat dieksploitasi.',
+    DG002: 'Rekomendasi penguatan arsitektur Defense-in-Depth.',
+    DG003: 'Skor keseluruhan berada di bawah ambang batas minimum quality gate.',
+    DG004: 'Terdeteksi dependensi paket tidak terdaftar atau berpotensi typosquatting.',
+    DG005: 'Blok catch kosong atau hanya logging menelan pengecualian pada alur kritis.',
+    DG006: 'Mutasi status check-then-act tidak atomik melintasi batas await (TOCTOU).',
+    DG007: 'Terdeteksi rahasia atau kredensial API hardcoded di dalam kode sumber.',
+    DG008: 'Pemanggilan jaringan eksternal tanpa AbortSignal.timeout() atau loop async tak terbatas.',
+  },
+};
+
+const INDONESIAN_HINT_RE =
+  /\b(?:pada baris|baris \d+|tidak terdaftar|tertanam secara|mempercayai parameter|konkatenasi|celah|ditemukan|disarankan|gunakan|pastikan|tanpa sanitasi|blok catch|kunci rahasia|pembatasan laju|bekukan katalog|muat )\b/i;
+
+export function getLocalizedRuleTitle(ruleId: string, locale: Locale): string {
+  return RULE_TITLES_BY_LOCALE[locale][ruleId] ?? ruleId;
+}
+
+export function localizeFindingMessage(
+  ruleId: string,
+  message: string,
+  line: number,
+  locale: Locale
+): string {
+  const trimmed = message.trim();
+  if (!trimmed) {
+    return DEFAULT_FINDING_FALLBACK[locale][ruleId] ?? '';
+  }
+  if (locale === 'id') {
+    return trimmed;
+  }
+
+  // Translate built-in Indonesian analyzer findings into concise technical English
+  const segments: string[] = [];
+
+  if (/JWT_SECRET/i.test(trimmed) && /hardcoded/i.test(trimmed)) {
+    segments.push(
+      `Production secret JWT_SECRET is hardcoded in source (line ${line}), risking credential exposure via Git history.`
+    );
+  }
+  if (/req\.params\.id/i.test(trimmed) && /JWT|pemilik|IDOR/i.test(trimmed)) {
+    segments.push(
+      'Billing endpoint trusts req.params.id without verifying caller ownership against the verified JWT payload (IDOR / BOLA).'
+    );
+  }
+  if (/Injeksi SQL/i.test(trimmed) && /konkatenasi/i.test(trimmed)) {
+    segments.push(
+      `Fatal SQL injection on line ${line} caused by concatenating untrusted input directly into a SQL query string without parameter binding ('?').`
+    );
+  }
+  if (/TOCTOU/i.test(trimmed) && /SELECT|UPDATE|saldo|mutasi/i.test(trimmed)) {
+    segments.push(
+      `Time-of-Check to Time-of-Use (TOCTOU) race condition on line ${line}: reading state before mutating it without an atomic conditional update or transaction allows double-spending.`
+    );
+  }
+  if (/Konkatenasi string perintah/i.test(trimmed) || /os\.system|command injection/i.test(trimmed)) {
+    segments.push(
+      `Unsanitized command string concatenation on line ${line} enables OS command injection; validate input strictly and invoke subprocesses with shell=False.`
+    );
+  }
+  if (/Path Traversal/i.test(trimmed) && /direktori|penggabungan path|path\.basename/i.test(trimmed)) {
+    segments.push(
+      `Path traversal on line ${line}: untrusted filename joined directly into a filesystem path without path.basename() and canonical directory-boundary verification.`
+    );
+  }
+  if (/item\.price|manipulasi harga|kuantitas negatif|total negatif/i.test(trimmed)) {
+    segments.push(
+      `Business-logic price tampering on line ${line}: trusts client-supplied prices or unvalidated negative/overflow quantities without server-side catalog lookup and bounds checks.`
+    );
+  }
+  if (/eksekusi kode\/perintah dinamis/i.test(trimmed)) {
+    segments.push(
+      `Dynamic code or command execution sink detected on line ${line}, exposing Remote Code Execution (RCE) / Command Injection.`
+    );
+  }
+  if (/Phantom dependency/i.test(trimmed)) {
+    const pkgMatch = trimmed.match(/'([^']+)'/);
+    const pkgName = pkgMatch ? `'${pkgMatch[1]}'` : 'package';
+    segments.push(
+      `Phantom dependency ${pkgName} imported on line ${line} is not declared in package.json.`
+    );
+  }
+  if (/Typosquat|slopsquat/i.test(trimmed) && INDONESIAN_HINT_RE.test(trimmed)) {
+    segments.push(
+      `Suspected typosquatted or hallucinated package import detected on line ${line}; verify package spelling and declaration in package.json.`
+    );
+  }
+  if (/Swallowed exception/i.test(trimmed) || /blok catch kosong/i.test(trimmed)) {
+    segments.push(
+      `Swallowed exception in critical flow on line ${line}: empty or log-only catch block hides failures without rethrowing, rolling back, or returning an explicit error.`
+    );
+  }
+  if (/AbortSignal\.timeout/i.test(trimmed) && INDONESIAN_HINT_RE.test(trimmed)) {
+    segments.push(
+      `External fetch() call on line ${line} omits AbortSignal.timeout(), risking indefinitely hung requests.`
+    );
+  }
+  if (/rate-limiting|JTI blacklist/i.test(trimmed) && INDONESIAN_HINT_RE.test(trimmed)) {
+    segments.push(
+      'Defense-in-Depth: add request rate-limiting and JWT token revocation checks (JTI denylist) on sensitive billing endpoints.'
+    );
+  }
+  if (/Kontrak Input Ketat/i.test(trimmed)) {
+    segments.push(
+      'Defense-in-Depth — Strict Input Contracts: validate parameter types, numeric ranges, and maximum lengths at function entry.'
+    );
+  }
+  if (/Penanganan Kesalahan Defensif/i.test(trimmed)) {
+    segments.push(
+      'Defense-in-Depth — Defensive Error Handling: catch external failures explicitly and return safe errors without leaking stack traces.'
+    );
+  }
+  if (/anotasi tipe statis/i.test(trimmed)) {
+    segments.push(
+      `Line ${line}: add explicit static type annotations and structured logging to improve long-term maintainability.`
+    );
+  }
+
+  if (segments.length > 0) {
+    return segments.join(' ');
+  }
+
+  if (INDONESIAN_HINT_RE.test(trimmed)) {
+    return DEFAULT_FINDING_FALLBACK.en[ruleId] ?? trimmed;
+  }
+
+  return trimmed;
+}
+
+export function localizeRemediationSummary(summary: string, locale: Locale): string {
+  const trimmed = summary.trim();
+  if (!trimmed || locale === 'id') {
+    return trimmed;
+  }
+
+  if (/type\(jumlah\) is not int/i.test(trimmed) || /WHERE username = \? AND poin >= \?/i.test(trimmed)) {
+    return 'Enforce strict type(amount) is not int checks (blocking Python bool subclasses), use parameterized "?" queries, and execute an atomic conditional UPDATE (WHERE username = ? AND poin >= ?) to eliminate SQL injection and TOCTOU race conditions.';
+  }
+  if (/JWT_SECRET/i.test(trimmed) && /HS256/i.test(trimmed)) {
+    return 'Load JWT_SECRET from environment variables (min 32 chars), enforce strict Request/Response/JwtPayload types (no any), pin algorithms: ["HS256"] in jwt.verify, and verify String(payload.userId) === String(req.params.id).';
+  }
+  if (/ipaddress\.ip_address/i.test(trimmed) && /shell=False/i.test(trimmed)) {
+    return 'Validate IP addresses with ipaddress.ip_address(), reject private/loopback ranges (is_private / is_loopback) to prevent SSRF, and run subprocess.run with shell=False and timeout=5.';
+  }
+  if (/path\.basename/i.test(trimmed) && /realpath/i.test(trimmed)) {
+    return 'Sanitize filenames with path.basename(), verify directory containment via path.relative(safeBaseDir, candidatePath) to block prefix collisions, resolve symlinks with fs.promises.realpath(), and read files asynchronously.';
+  }
+  if (/Object\.freeze/i.test(trimmed) && /Number\.isSafeInteger/i.test(trimmed)) {
+    return 'Freeze the server-side price catalog with Object.freeze(), validate Number.isSafeInteger(item.quantity) within MAX_QUANTITY_PER_ITEM (<= 1000), guard against arithmetic overflow, and clamp the final total to >= 0.';
+  }
+
+  if (INDONESIAN_HINT_RE.test(trimmed)) {
+    return 'Apply the hardened reference patch to remediate the detected security and correctness findings.';
+  }
+
+  return trimmed;
+}
+
+export function localizeNoticeMessage(code: string, message: string, locale: Locale): string {
+  const trimmed = message.trim();
+  if (locale === 'id') return trimmed;
+  if (!INDONESIAN_HINT_RE.test(trimmed)) return trimmed;
+
+  switch (code) {
+    case 'DG004-DYN-01':
+      return 'Non-scoring notice: dynamic import() uses a non-literal specifier that cannot be statically verified against package.json.';
+    case 'DG004-DYN-02':
+      return 'Non-scoring notice: dynamic require() uses a non-literal specifier that cannot be statically verified against package.json.';
+    case 'DG004-WS-NEW':
+      return 'Non-scoring notice: new workspace package added in PR; confirm it is intentional and not a supply-chain bypass.';
+    case 'DG004-WS-UNPARSED':
+      return 'Non-scoring notice: workspace configuration could not be parsed (fail-closed per source).';
+    case 'DG004-WS-SHALLOW':
+      return 'Non-scoring notice: base branch ref unavailable in shallow clone; workspace allowlist checks fell back safely.';
+    default:
+      return trimmed;
+  }
+}

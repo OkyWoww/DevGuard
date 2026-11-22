@@ -41,11 +41,18 @@ export interface AuditNotice {
   line?: number;
 }
 
+export interface AuditRemediation {
+  code: string;
+  language: string;
+  summary: string;
+}
+
 export interface AuditReport {
   verdict: AuditVerdict;
   scores: ScoreBreakdown;
   findings: AuditFinding[];
   notices: AuditNotice[];
+  remediation?: AuditRemediation;
   rawSarif?: unknown;
   durationMs?: number;
   engineSource?: AuditEngineSource;
