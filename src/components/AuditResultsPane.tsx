@@ -1,13 +1,25 @@
-import React from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   AlertCircle,
   AlertTriangle,
+  Check,
   CheckCircle2,
+  ChevronDown,
+  ChevronRight,
+  Copy,
   Info,
+  Play,
   RefreshCw,
   RotateCcw,
   ShieldAlert,
+  Wrench,
 } from 'lucide-react';
+import {
+  getLocalizedRuleTitle,
+  localizeFindingMessage,
+  localizeNoticeMessage,
+  localizeRemediationSummary,
+} from '../i18n';
 import type {
   AuditEngineSource,
   AuditErrorInfo,
@@ -28,9 +40,12 @@ export interface AuditResultsPaneProps {
   engineSource?: AuditEngineSource | null;
   onSelectFinding: (finding: AuditFinding) => void;
   onSelectNoticeLine: (notice: AuditNotice) => void;
+  onApplyRemediation?: (remediationCode: string, reAudit: boolean) => void;
   onRetry: () => void;
   locale?: WorkbenchLocale;
 }
+
+const COPY_FEEDBACK_MS = 1500;
 
 const COPY: Record<
   WorkbenchLocale,
@@ -45,6 +60,14 @@ const COPY: Record<
     securityLabel: string;
     correctnessLabel: string;
     maintainabilityLabel: string;
+    remediationHeading: string;
+    remediationBadge: string;
+    applyFixBtn: string;
+    applyAndReauditBtn: string;
+    copyCodeBtn: string;
+    copiedBtn: string;
+    previewPatchShow: string;
+    previewPatchHide: string;
     blockingHeading: string;
     blockingEmpty: string;
     advisoryHeading: string;
@@ -66,6 +89,14 @@ const COPY: Record<
     securityLabel: 'Security',
     correctnessLabel: 'Correctness',
     maintainabilityLabel: 'Maintainability',
+    remediationHeading: 'Hardened Remediation Patch',
+    remediationBadge: 'PATCH READY',
+    applyFixBtn: 'Apply Fix to Editor',
+    applyAndReauditBtn: 'Apply Fix & Re-Audit',
+    copyCodeBtn: 'Copy Code',
+    copiedBtn: 'Copied',
+    previewPatchShow: 'Preview Patch',
+    previewPatchHide: 'Hide Patch',
     blockingHeading: 'Blocking Findings',
     blockingEmpty: 'No blocking findings detected in this buffer.',
     advisoryHeading: 'Advisory Findings',
@@ -86,6 +117,14 @@ const COPY: Record<
     securityLabel: 'Security',
     correctnessLabel: 'Correctness',
     maintainabilityLabel: 'Maintainability',
+    remediationHeading: 'Patch Remediasi Hardened',
+    remediationBadge: 'PATCH SIAP',
+    applyFixBtn: 'Terapkan ke Editor',
+    applyAndReauditBtn: 'Terapkan & Audit Ulang',
+    copyCodeBtn: 'Salin Kode',
+    copiedBtn: 'Disalin',
+    previewPatchShow: 'Lihat Kode Patch',
+    previewPatchHide: 'Sembunyikan Patch',
     blockingHeading: 'Temuan Blocking',
     blockingEmpty: 'Tidak ada temuan blocking pada berkas ini.',
     advisoryHeading: 'Temuan Tambahan',
@@ -132,11 +171,46 @@ export const AuditResultsPane: React.FC<AuditResultsPaneProps> = ({
   engineSource,
   onSelectFinding,
   onSelectNoticeLine,
+  onApplyRemediation,
   onRetry,
   locale = 'en',
 }) => {
   const copy = COPY[locale];
   const resolvedEngineSource = engineSource ?? report?.engineSource ?? null;
+  const [showPatchPreview, setShowPatchPreview] = useState<boolean>(false);
+  const [copiedPatch, setCopiedPatch] = useState<boolean>(false);
+  const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    setShowPatchPreview(false);
+    setCopiedPatch(false);
+  }, [report]);
+
+  useEffect(() => {
+    return () => {
+      if (copyTimerRef.current !== null) {
+        clearTimeout(copyTimerRef.current);
+        copyTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  const handleCopyRemediation = async (patchCode: string) => {
+    if (!patchCode) return;
+    try {
+      await navigator.clipboard.writeText(patchCode);
+      if (copyTimerRef.current !== null) {
+        clearTimeout(copyTimerRef.current);
+      }
+      setCopiedPatch(true);
+      copyTimerRef.current = setTimeout(() => {
+        setCopiedPatch(false);
+        copyTimerRef.current = null;
+      }, COPY_FEEDBACK_MS);
+    } catch {
+      setCopiedPatch(false);
+    }
+  };
 
   const renderBody = () => {
     if (runState === 'running') {
@@ -198,6 +272,12 @@ export const AuditResultsPane: React.FC<AuditResultsPaneProps> = ({
 
     const blockingFindings = report.findings.filter((item) => item.blocking);
     const advisoryFindings = report.findings.filter((item) => !item.blocking);
+    const remediation =
+      report.verdict !== 'PASS' &&
+      report.remediation &&
+      report.remediation.code.trim().length > 0
+        ? report.remediation
+        : null;
 
     return (
       <div className="flex flex-1 flex-col gap-4 overflow-y-auto p-4">
@@ -247,6 +327,90 @@ export const AuditResultsPane: React.FC<AuditResultsPaneProps> = ({
             ))}
           </div>
         </div>
+
+        {/* Hardened Remediation Card (Below Summary Strip, Above Blocking Findings) */}
+        {remediation && onApplyRemediation && (
+          <div className="rounded-md border border-slate-700 bg-[#0A0E17] p-3.5">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <Wrench className="h-3.5 w-3.5 text-emerald-400" aria-hidden="true" />
+                <h3 className="text-xs font-semibold text-slate-100">
+                  {copy.remediationHeading}
+                </h3>
+                <span className="rounded border border-emerald-500/40 bg-emerald-950/30 px-1.5 py-0.5 font-mono text-[10px] text-emerald-300">
+                  {copy.remediationBadge}
+                </span>
+              </div>
+              <span className="rounded border border-slate-800 bg-slate-900 px-1.5 py-0.5 font-mono text-[10px] text-slate-400">
+                {remediation.language || 'code'}
+              </span>
+            </div>
+
+            {remediation.summary && (
+              <p className="mt-2 font-mono text-[11px] leading-relaxed text-slate-300">
+                {localizeRemediationSummary(remediation.summary, locale)}
+              </p>
+            )}
+
+            <div className="mt-3 flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={() => onApplyRemediation(remediation.code, true)}
+                className="inline-flex h-8 items-center gap-1.5 rounded-md bg-emerald-600 px-3 text-xs font-semibold text-white transition-colors hover:bg-emerald-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
+              >
+                <Play className="h-3 w-3 fill-current" aria-hidden="true" />
+                <span>{copy.applyAndReauditBtn}</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => onApplyRemediation(remediation.code, false)}
+                className="inline-flex h-8 items-center gap-1.5 rounded-md border border-slate-700 bg-slate-900 px-3 text-xs font-medium text-slate-200 transition-colors hover:border-slate-600 hover:bg-slate-800 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-emerald-400"
+              >
+                <span>{copy.applyFixBtn}</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => void handleCopyRemediation(remediation.code)}
+                className={`inline-flex h-8 items-center gap-1.5 rounded-md border px-2.5 font-mono text-[11px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-emerald-400 ${
+                  copiedPatch
+                    ? 'border-emerald-500/50 bg-emerald-950/40 text-emerald-300'
+                    : 'border-slate-700 bg-slate-900 text-slate-300 hover:border-slate-600 hover:bg-slate-800'
+                }`}
+              >
+                {copiedPatch ? (
+                  <Check className="h-3 w-3 text-emerald-400" aria-hidden="true" />
+                ) : (
+                  <Copy className="h-3 w-3 text-slate-400" aria-hidden="true" />
+                )}
+                <span>{copiedPatch ? copy.copiedBtn : copy.copyCodeBtn}</span>
+              </button>
+
+              <button
+                type="button"
+                aria-expanded={showPatchPreview}
+                onClick={() => setShowPatchPreview((prev) => !prev)}
+                className="ml-auto inline-flex h-8 items-center gap-1 rounded-md border border-slate-800 bg-[#0D1117] px-2.5 font-mono text-[11px] text-slate-400 transition-colors hover:border-slate-700 hover:text-slate-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-emerald-400"
+              >
+                {showPatchPreview ? (
+                  <ChevronDown className="h-3.5 w-3.5" aria-hidden="true" />
+                ) : (
+                  <ChevronRight className="h-3.5 w-3.5" aria-hidden="true" />
+                )}
+                <span>
+                  {showPatchPreview ? copy.previewPatchHide : copy.previewPatchShow}
+                </span>
+              </button>
+            </div>
+
+            {showPatchPreview && (
+              <pre className="mt-3 max-h-60 overflow-auto rounded border border-slate-800 bg-[#06090F] p-3 font-mono text-[11px] leading-relaxed text-slate-200">
+                {remediation.code}
+              </pre>
+            )}
+          </div>
+        )}
 
         {/* Blocking Findings */}
         <div className="space-y-2">
@@ -300,7 +464,7 @@ export const AuditResultsPane: React.FC<AuditResultsPaneProps> = ({
                             {finding.severity}
                           </span>
                           <span className="text-xs font-medium text-slate-300">
-                            {finding.ruleTitle}
+                            {getLocalizedRuleTitle(finding.id, locale)}
                           </span>
                         </div>
                         <span className="font-mono text-[11px] text-emerald-400">
@@ -308,7 +472,7 @@ export const AuditResultsPane: React.FC<AuditResultsPaneProps> = ({
                         </span>
                       </div>
                       <p className="mt-1.5 text-xs leading-relaxed text-slate-300">
-                        {finding.message}
+                        {localizeFindingMessage(finding.id, finding.message, finding.line, locale)}
                       </p>
                     </button>
                   </li>
@@ -358,14 +522,16 @@ export const AuditResultsPane: React.FC<AuditResultsPaneProps> = ({
                           >
                             {finding.severity}
                           </span>
-                          <span className="text-xs text-slate-400">{finding.ruleTitle}</span>
+                          <span className="text-xs text-slate-400">
+                            {getLocalizedRuleTitle(finding.id, locale)}
+                          </span>
                         </div>
                         <span className="font-mono text-[11px] text-slate-400">
                           L{finding.line}
                         </span>
                       </div>
                       <p className="mt-1 text-xs leading-relaxed text-slate-400">
-                        {finding.message}
+                        {localizeFindingMessage(finding.id, finding.message, finding.line, locale)}
                       </p>
                     </button>
                   </li>
@@ -408,7 +574,7 @@ export const AuditResultsPane: React.FC<AuditResultsPaneProps> = ({
                       )}
                     </div>
                     <p className="mt-1 text-xs leading-relaxed text-slate-400">
-                      {notice.message}
+                      {localizeNoticeMessage(notice.code, notice.message, locale)}
                     </p>
                   </>
                 );
