@@ -1317,7 +1317,8 @@ export function detectSwallowedExceptions(
 export function detectNonAtomicBalanceMutations(
   rawLines: string[],
   findings: LineFinding[],
-  inlineFindings: InlineFinding[]
+  inlineFindings: InlineFinding[],
+  maskedLines?: string[]
 ): void {
   const entityCompareRe = /\b((?:\w+\.)?(?:balance|saldo|credits?|wallet|stock|inventory|quota|points))\b\s*(?:>=|<=|>|<)/i;
   const reverseCompareRe = /(?:>=|<=|>|<)\s*\b((?:\w+\.)?(?:balance|saldo|credits?|wallet|stock|inventory|quota|points))\b/i;
@@ -1348,11 +1349,15 @@ export function detectNonAtomicBalanceMutations(
     for (let j = i + 1; j <= windowEnd; j++) {
       const line2 = rawLines[j];
       if (isCommentOrEmptyLine(line2)) continue;
-      if (/\bawait\b/.test(line2)) sawAwait = true;
+      const checkLine = maskedLines
+        ? (maskedLines[j] ?? '')
+        : line2.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/\/\/[^\n]*/g, ' ');
+      if (/\bawait\b/.test(checkLine)) sawAwait = true;
 
       if (sawAwait && mutationRe.test(line2) && !flaggedMutationLines.has(j + 1)) {
         const contextSlice = rawLines.slice(Math.max(0, i - 15), Math.min(rawLines.length, j + 10)).join('\n');
-        if (atomicGuardRe.test(contextSlice)) break;
+        const codeOnlyContext = contextSlice.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/\/\/[^\n]*/g, ' ');
+        if (atomicGuardRe.test(codeOnlyContext)) break;
 
         const mutLineNum = j + 1;
         flaggedMutationLines.add(mutLineNum);

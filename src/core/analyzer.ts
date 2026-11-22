@@ -549,6 +549,9 @@ export function replaceVirtualLineInText(text: string, vLine: number, oLine: num
   return text
     .replace(new RegExp(`(baris\\s+)${vStr}\\b`, 'gi'), `$1${oStr}`)
     .replace(new RegExp(`(line\\s+)${vStr}\\b`, 'gi'), `$1${oStr}`)
+    .replace(new RegExp(`(->\\s*)${vStr}\\b`, 'g'), `$1${oStr}`)
+    .replace(new RegExp(`(,\\s*)${vStr}\\b`, 'g'), `$1${oStr}`)
+    .replace(new RegExp(`(&\\s*)${vStr}\\b`, 'g'), `$1${oStr}`)
     .replace(new RegExp(`:${vStr}\\b`, 'g'), `:${oStr}`);
 }
 
@@ -1329,18 +1332,21 @@ export function analyzeCodeDeterministically(
     if (evalLines.length > 0) {
       findings.push({
         line: evalLines[0],
+        extraLines: evalLines.length > 1 ? evalLines.slice(1) : undefined,
         category: 'security',
         penalty: 40,
         shortReason: `-40 Eksekusi kode/perintah dinamis berbahaya (baris ${evalLines.join(', ')})`,
         detailedReason: `Ditemukan pemanggilan eksekusi kode/perintah dinamis pada baris ${evalLines.join(', ')} yang membuka celah Remote Code Execution (RCE) / Command Injection.`,
         isCritical: true,
       });
-      inlineFindings.push({
-        ruleId: 'DG001',
-        line: evalLines[0],
-        severity: 'error',
-        message: `[DG001] Dangerous dynamic code/command execution sink on line ${evalLines.join(', ')}`,
-      });
+      for (const elLine of evalLines) {
+        inlineFindings.push({
+          ruleId: 'DG001',
+          line: elLine,
+          severity: 'error',
+          message: `[DG001] Dangerous dynamic code/command execution sink on line ${elLine}`,
+        });
+      }
     }
 
     const secretLines = findAllLines(/(?:secret|password|api_key|apikey|token)\s*=\s*["'][^"']{4,}["']/i)
@@ -1467,7 +1473,7 @@ export function analyzeCodeDeterministically(
       ));
     }
     detectSwallowedExceptions(code, findings, inlineFindings, lexical.maskedCode);
-    detectNonAtomicBalanceMutations(rawLines, findings, inlineFindings);
+    detectNonAtomicBalanceMutations(rawLines, findings, inlineFindings, lexical.maskedCode.split('\n'));
     detectMissingTimeoutsAndLoops(code, lexical.maskedCode, rawLines, findings, inlineFindings);
   }
 
@@ -1586,7 +1592,7 @@ export function analyzeCodeDeterministically(
         detectSwallowedExceptions(virtualView.virtualCode, vFindings, vInlineFindings, vLex.maskedCode);
       }
       if (/\bawait\b/.test(vLex.maskedCode)) {
-        detectNonAtomicBalanceMutations(vRawLines, vFindings, vInlineFindings);
+        detectNonAtomicBalanceMutations(vRawLines, vFindings, vInlineFindings, vMaskedLines);
       }
       if (/\b(?:while|for|do|fetch)\b/.test(vLex.maskedCode)) {
         detectMissingTimeoutsAndLoops(virtualView.virtualCode, vLex.maskedCode, vRawLines, vFindings, vInlineFindings);
@@ -1598,19 +1604,21 @@ export function analyzeCodeDeterministically(
         if (vEvalLines.length > 0) {
           vFindings.push({
             line: vEvalLines[0],
-            extraLines: vEvalLines.slice(1),
+            extraLines: vEvalLines.length > 1 ? vEvalLines.slice(1) : undefined,
             category: 'security',
             penalty: 40,
             shortReason: `-40 Eksekusi kode/perintah dinamis berbahaya (baris ${vEvalLines.join(', ')})`,
             detailedReason: `Ditemukan pemanggilan eksekusi kode/perintah dinamis pada baris ${vEvalLines.join(', ')} yang membuka celah Remote Code Execution (RCE) / Command Injection.`,
             isCritical: true,
           });
-          vInlineFindings.push({
-            ruleId: 'DG001',
-            line: vEvalLines[0],
-            severity: 'error',
-            message: `[DG001] Dangerous dynamic code/command execution sink on line ${vEvalLines.join(', ')}`,
-          });
+          for (const velLine of vEvalLines) {
+            vInlineFindings.push({
+              ruleId: 'DG001',
+              line: velLine,
+              severity: 'error',
+              message: `[DG001] Dangerous dynamic code/command execution sink on line ${velLine}`,
+            });
+          }
         }
       }
     }
@@ -1662,8 +1670,15 @@ export function analyzeCodeDeterministically(
 
       if (!isDuplicate) {
         const tag = ' [via-fold]';
-        const shortUpdated = replaceVirtualLineInText(vFinding.shortReason, vFinding.line, oLine);
-        const detailUpdated = replaceVirtualLineInText(vFinding.detailedReason, vFinding.line, oLine);
+        let shortUpdated = replaceVirtualLineInText(vFinding.shortReason, vFinding.line, oLine);
+        let detailUpdated = replaceVirtualLineInText(vFinding.detailedReason, vFinding.line, oLine);
+        if (vFinding.extraLines) {
+          for (const vExtra of vFinding.extraLines) {
+            const oExtra = remapVirtualLineRange(vExtra, undefined, hintRe).line;
+            shortUpdated = replaceVirtualLineInText(shortUpdated, vExtra, oExtra);
+            detailUpdated = replaceVirtualLineInText(detailUpdated, vExtra, oExtra);
+          }
+        }
         findings.push({
           ...vFinding,
           line: oLine,
@@ -1734,14 +1749,18 @@ export function analyzeCodeDeterministically(
 
   // Construct Secondary Findings / Defense-in-Depth Notes
   const temuanLainList: string[] = [];
+  let findingCount = 0;
   for (const f of findings) {
-    if (temuanLainList.length < 5) {
+    if (findingCount < 5) {
       temuanLainList.push(`[Baris ${f.line}] ${f.detailedReason}`);
+      findingCount++;
     }
   }
+  let noteCount = 0;
   for (const note of residualNotes) {
-    if (temuanLainList.length < 5) {
+    if (noteCount < 5) {
       temuanLainList.push(`[Defense-in-Depth] ${note}`);
+      noteCount++;
     }
   }
 
