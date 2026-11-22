@@ -15,6 +15,7 @@ export type ParsedCliCommand =
   | { kind: 'help' }
   | { kind: 'version' }
   | { kind: 'install-hook' }
+  | { kind: 'mcp'; workspaceRoot: string | null }
   | { kind: 'error'; message: string }
   | CliCheckOptions;
 
@@ -25,6 +26,7 @@ export function getCliUsageText(): string {
     'Usage:',
     '  devguard check [paths...] [options]',
     '  devguard install-hook',
+    '  devguard mcp [--workspace <dir>]',
     '  devguard --version | -v',
     '  devguard --help | -h',
     '',
@@ -88,11 +90,43 @@ export function parseCliArgs(argv: readonly string[]): ParsedCliCommand {
     return { kind: 'install-hook' };
   }
 
+  if (first === 'mcp') {
+    let workspaceRoot: string | null = null;
+    for (let i = 1; i < argv.length; i++) {
+      const rawToken = argv[i];
+      if (rawToken === '--help' || rawToken === '-h') {
+        return { kind: 'help' };
+      }
+      const { flag, inlineValue } = splitOptionToken(rawToken);
+      if (flag === '--workspace') {
+        if (inlineValue !== null) {
+          if (inlineValue.length === 0) {
+            return { kind: 'error', message: 'Option --workspace requires a non-empty directory path.' };
+          }
+          workspaceRoot = inlineValue;
+        } else {
+          const next = argv[i + 1];
+          if (next === undefined || next.length === 0) {
+            return { kind: 'error', message: 'Option --workspace requires a directory path.' };
+          }
+          if (next.startsWith('-')) {
+            return { kind: 'error', message: `Option --workspace requires a value, but got flag "${next}".` };
+          }
+          i++;
+          workspaceRoot = next;
+        }
+        continue;
+      }
+      return { kind: 'error', message: `Unknown option for mcp: ${rawToken}` };
+    }
+    return { kind: 'mcp', workspaceRoot };
+  }
+
   if (first !== 'check') {
     if (first.startsWith('-')) {
       return { kind: 'error', message: `Unknown option: ${first}` };
     }
-    return { kind: 'error', message: `Unknown command: ${first}. Expected "check" or "install-hook".` };
+    return { kind: 'error', message: `Unknown command: ${first}. Expected "check", "install-hook", or "mcp".` };
   }
 
   const paths: string[] = [];
