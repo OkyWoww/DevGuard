@@ -7,6 +7,8 @@ import dotenv from 'dotenv';
 import { GoogleGenAI, Type } from '@google/genai';
 import {
   analyzeCodeDeterministically,
+  prepareRedactedCodeForLlm,
+  redactSecretsPreservingLayout,
   ParsedDevGuardReport,
   ParsedScores,
 } from './src/devguardAnalyzer';
@@ -17,6 +19,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const isProduction = process.env.NODE_ENV === 'production';
 const PORT = process.env.PORT || 3000;
+const MAX_AUDIT_FILE_SIZE = 1_048_576; // 1 MiB ReDoS / event-loop safety limit
 
 const app = express();
 app.use(express.json({ limit: '5mb' }));
@@ -31,6 +34,86 @@ function clampScore(value: unknown, fallback: number): number {
     : 0;
   if (!Number.isFinite(numeric)) return safeFallback;
   return Math.min(100, Math.max(0, Math.round(numeric)));
+}
+
+function extractExplicitLineNumbers(text: string): number[] {
+  const lines: number[] = [];
+  const explicitRe = /(?:line|baris)\s*[:#\s]?\s*(\d+)/gi;
+  for (const match of text.matchAll(explicitRe)) {
+    const parsed = Number.parseInt(match[1], 10);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      lines.push(parsed);
+    }
+  }
+  return lines;
+}
+
+function clampUniqueLines(nums: number[], totalLines: number): number[] {
+  const safeTotal = Math.max(1, totalLines);
+  const unique: number[] = [];
+  for (const num of nums) {
+    if (!Number.isFinite(num) || num < 1) continue;
+    const clamped = Math.min(Math.trunc(num), safeTotal);
+    if (!unique.includes(clamped)) {
+      unique.push(clamped);
+    }
+  }
+  return unique;
+}
+
+function normalizeLineRef(rawLineRef: unknown, totalLines: number): string {
+  if (typeof rawLineRef !== 'string') return '-';
+  const trimmed = rawLineRef.trim();
+  if (!trimmed || trimmed === '-') return '-';
+  const explicit = extractExplicitLineNumbers(trimmed);
+  const candidates =
+    explicit.length > 0
+      ? explicit
+      : Array.from(trimmed.matchAll(/\d+/g), (m) => Number.parseInt(m[0], 10));
+  const clamped = clampUniqueLines(candidates, totalLines);
+  return clamped.length > 0 ? `Baris ${clamped.slice(0, 3).join(' & ')}` : '-';
+}
+
+function sanitizeStringArray(raw: unknown, maxItems?: number): string[] {
+  if (!Array.isArray(raw)) return [];
+  const cleaned = raw
+    .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+    .map((item) => redactSecretsPreservingLayout(item.trim()));
+  return typeof maxItems === 'number' ? cleaned.slice(0, maxItems) : cleaned;
+}
+
+function buildMergedRawMarkdown(report: ParsedDevGuardReport): string {
+  const lineRef = report.temuanUtama.line;
+  const linePrefix = lineRef && lineRef !== '-' ? `[${lineRef}] ` : '';
+  return [
+    '## 👋 Apresiasi',
+    report.apresiasi,
+    '',
+    '## 📊 Skor',
+    `Security: ${report.skor.security}/100 (${report.skor.securityDeductions.join('; ')})`,
+    `Correctness: ${report.skor.correctness}/100 (${report.skor.correctnessDeductions.join('; ')})`,
+    `Maintainability: ${report.skor.maintainability}/100 (${report.skor.maintainabilityDeductions.join('; ')})`,
+    `Overall Guard: ${report.skor.totalScore}/100`,
+    '',
+    '## 💣 Temuan Utama',
+    `${linePrefix}${report.temuanUtama.description}`,
+    '',
+    '## 🗒️ Temuan Lain',
+    report.temuanLain.map((item) => `- ${item}`).join('\n'),
+    '',
+    '## 🏪 Analogi',
+    `${report.analogi.story} Istilah teknis: ${report.analogi.technicalTerm}.`,
+    '',
+    '## 🔧 Perbaikan',
+    report.perbaikan.summary,
+    '',
+    `\`\`\`${report.perbaikan.language}`,
+    report.perbaikan.code,
+    '```',
+    '',
+    '## ✅ Tes',
+    report.tesMarkdown,
+  ].join('\n');
 }
 
 // -----------------------------------------------------------------------------
@@ -62,6 +145,17 @@ async function evaluateCodeHybrid(
     };
   }
 
+  // Fail-closed Pre-LLM redaction gate: block sensitive files & redact secrets before external API call
+  const effectivePath = normalizedPath ?? 'snippet.ts';
+  const llmGate = prepareRedactedCodeForLlm(effectivePath, code);
+  if (llmGate.aborted || llmGate.safeCode.length === 0) {
+    return {
+      isLiveApi: false,
+      rawMarkdown: layer1Report.rawMarkdown,
+      parsedReport: layer1Report,
+    };
+  }
+
   // Layer 2: Live Gemini API Deep Adversarial Reasoning (temperature: 0.1, JSON Schema)
   let timeoutId: ReturnType<typeof setTimeout> | null = null;
   try {
@@ -77,6 +171,7 @@ async function evaluateCodeHybrid(
         'Act as a Principal AppSec Engineer and Zero-Leniency Adversarial Code Auditor.';
     }
 
+    const safeLayer1Detail = redactSecretsPreservingLayout(layer1Report.temuanUtama.description);
     const prompt = [
       'Anda adalah Principal AppSec Engineer & Zero-Leniency Adversarial Code Auditor.',
       'Evaluasi kode di dalam <code_to_review> secara jujur, ketat, dan tanpa kompromi.',
@@ -86,10 +181,10 @@ async function evaluateCodeHybrid(
       'Hasil deteksi Layer 1 Static/AST Heuristic Analyzer (wajib dihormati sebagai batas atas skor):',
       `- Skor Layer 1: Security=${layer1Report.skor.security}, Correctness=${layer1Report.skor.correctness}, Maintainability=${layer1Report.skor.maintainability}`,
       `- Baris Temuan Layer 1: ${layer1Report.temuanUtama.line}`,
-      `- Detail Layer 1: ${layer1Report.temuanUtama.description}`,
+      `- Detail Layer 1: ${safeLayer1Detail}`,
       '',
       '<code_to_review>',
-      code,
+      llmGate.safeCode,
       '</code_to_review>',
     ].join('\n');
 
@@ -140,6 +235,8 @@ async function evaluateCodeHybrid(
     if (jsonText.length > 0) {
       const llmData = JSON.parse(jsonText);
       if (llmData && typeof llmData === 'object') {
+        const totalLines = Math.max(1, code.split('\n').length);
+
         // Enforce zero-leniency ceiling with strict finite number guards (fail-closed against NaN)
         const l1Sec = clampScore(layer1Report.skor.security, 0);
         const l1Corr = clampScore(layer1Report.skor.correctness, 0);
@@ -154,62 +251,78 @@ async function evaluateCodeHybrid(
         const maint = Math.min(l1Maint, llmMaint);
         const total = clampScore((sec + corr + maint) / 3, 0);
 
+        const llmSecDeductions = sanitizeStringArray(llmData.securityDeductions);
+        const llmCorrDeductions = sanitizeStringArray(llmData.correctnessDeductions);
+        const llmMaintDeductions = sanitizeStringArray(llmData.maintainabilityDeductions);
+        const llmTemuanLain = sanitizeStringArray(llmData.temuanLain, 5);
+        const llmVerifiedMitigations = sanitizeStringArray(llmData.verifiedMitigations);
+        const llmResidualNotes = sanitizeStringArray(llmData.residualNotes);
+
+        const llmDescription =
+          typeof llmData.temuanUtamaDescription === 'string' &&
+          llmData.temuanUtamaDescription.trim().length > 0
+            ? redactSecretsPreservingLayout(llmData.temuanUtamaDescription.trim())
+            : '';
+
+        const l1NormalizedLine = normalizeLineRef(layer1Report.temuanUtama.line, totalLines);
+        const llmNormalizedLine = normalizeLineRef(llmData.temuanUtamaLine, totalLines);
+        const descReferencedLines = clampUniqueLines(
+          extractExplicitLineNumbers(llmDescription),
+          totalLines
+        );
+
+        let alignedLine: string;
+        if (llmDescription.length > 0) {
+          if (descReferencedLines.length > 0) {
+            alignedLine = `Baris ${descReferencedLines.slice(0, 3).join(' & ')}`;
+          } else if (llmNormalizedLine !== '-') {
+            alignedLine = llmNormalizedLine;
+          } else {
+            alignedLine = l1NormalizedLine;
+          }
+        } else {
+          alignedLine = l1NormalizedLine !== '-' ? l1NormalizedLine : llmNormalizedLine;
+        }
+
         const mergedReport: ParsedDevGuardReport = {
           ...layer1Report,
           apresiasi:
             typeof llmData.apresiasi === 'string' && llmData.apresiasi.trim().length > 0
-              ? llmData.apresiasi
+              ? redactSecretsPreservingLayout(llmData.apresiasi.trim())
               : layer1Report.apresiasi,
           skor: {
             security: sec,
             securityDeductions:
-              l1Sec <= llmSec
+              l1Sec <= llmSec || llmSecDeductions.length === 0
                 ? layer1Report.skor.securityDeductions
-                : Array.isArray(llmData.securityDeductions)
-                  ? llmData.securityDeductions
-                  : layer1Report.skor.securityDeductions,
+                : llmSecDeductions,
             correctness: corr,
             correctnessDeductions:
-              l1Corr <= llmCorr
+              l1Corr <= llmCorr || llmCorrDeductions.length === 0
                 ? layer1Report.skor.correctnessDeductions
-                : Array.isArray(llmData.correctnessDeductions)
-                  ? llmData.correctnessDeductions
-                  : layer1Report.skor.correctnessDeductions,
+                : llmCorrDeductions,
             maintainability: maint,
             maintainabilityDeductions:
-              l1Maint <= llmMaint
+              l1Maint <= llmMaint || llmMaintDeductions.length === 0
                 ? layer1Report.skor.maintainabilityDeductions
-                : Array.isArray(llmData.maintainabilityDeductions)
-                  ? llmData.maintainabilityDeductions
-                  : layer1Report.skor.maintainabilityDeductions,
+                : llmMaintDeductions,
             totalScore: total,
           },
           temuanUtama: {
-            line:
-              layer1Report.temuanUtama.line !== '-'
-                ? layer1Report.temuanUtama.line
-                : typeof llmData.temuanUtamaLine === 'string' && llmData.temuanUtamaLine.trim()
-                  ? llmData.temuanUtamaLine
-                  : '-',
-            description:
-              typeof llmData.temuanUtamaDescription === 'string' &&
-              llmData.temuanUtamaDescription.trim().length > 0
-                ? llmData.temuanUtamaDescription
-                : layer1Report.temuanUtama.description,
+            line: alignedLine,
+            description: llmDescription || layer1Report.temuanUtama.description,
           },
           temuanLain:
-            Array.isArray(llmData.temuanLain) && llmData.temuanLain.length > 0
-              ? llmData.temuanLain.slice(0, 5)
-              : layer1Report.temuanLain,
+            llmTemuanLain.length > 0 ? llmTemuanLain : layer1Report.temuanLain,
           verifiedMitigations:
-            Array.isArray(llmData.verifiedMitigations) && llmData.verifiedMitigations.length > 0
-              ? llmData.verifiedMitigations
+            llmVerifiedMitigations.length > 0
+              ? llmVerifiedMitigations
               : layer1Report.verifiedMitigations,
           residualNotes:
-            Array.isArray(llmData.residualNotes) && llmData.residualNotes.length > 0
-              ? llmData.residualNotes
-              : layer1Report.residualNotes,
+            llmResidualNotes.length > 0 ? llmResidualNotes : layer1Report.residualNotes,
         };
+
+        mergedReport.rawMarkdown = buildMergedRawMarkdown(mergedReport);
 
         return {
           isLiveApi: true,
@@ -244,9 +357,20 @@ async function evaluateCodeHybrid(
 // 1. POST /api/devguard/review
 app.post('/api/devguard/review', async (req: Request, res: Response) => {
   try {
-    const { code, fileName } = req.body;
+    const body =
+      req.body && typeof req.body === 'object'
+        ? (req.body as { code?: unknown; fileName?: unknown })
+        : {};
+    const { code, fileName } = body;
     if (!code || typeof code !== 'string') {
       res.status(400).json({ error: 'Kode sumber wajib disertakan (string).' });
+      return;
+    }
+
+    if (Buffer.byteLength(code, 'utf8') > MAX_AUDIT_FILE_SIZE) {
+      res.status(413).json({
+        error: `Ukuran kode melebihi batas maksimum ${MAX_AUDIT_FILE_SIZE} byte (1 MiB).`,
+      });
       return;
     }
 

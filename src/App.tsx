@@ -1,6 +1,7 @@
 import React, { useCallback, useMemo, useRef, useState } from 'react';
 import {
   analyzeCodeDeterministically,
+  redactSecretsPreservingLayout,
   type InlineFinding,
   type ParsedDevGuardReport,
 } from './devguardAnalyzer';
@@ -85,11 +86,220 @@ function isValidParsedReport(candidate: unknown): candidate is ParsedDevGuardRep
   );
 }
 
+interface SarifRuleDescriptor {
+  id: string;
+  name: string;
+  shortDescription: { text: string };
+  fullDescription: { text: string };
+  defaultConfiguration: { level: 'error' | 'warning' | 'note' };
+  properties: { tags: string[]; 'security-severity': string };
+}
+
+const SARIF_CORE_RULES: ReadonlyArray<SarifRuleDescriptor> = [
+  {
+    id: 'DG001',
+    name: 'AdversarialSecurityOrLogicFlaw',
+    shortDescription: {
+      text: 'Critical security vulnerability or exploitable logic flaw detected by DevGuard.',
+    },
+    fullDescription: {
+      text: 'DevGuard Hybrid Auditor identified a deterministic Single-Pass Lexical & Heuristic sink, TOCTOU race condition, type bypass, or critical security risk that violates the quality gate.',
+    },
+    defaultConfiguration: { level: 'error' },
+    properties: {
+      tags: ['security', 'adversarial-audit', 'external/cwe/cwe-693'],
+      'security-severity': '9.5',
+    },
+  },
+  {
+    id: 'DG002',
+    name: 'DefenseInDepthRecommendation',
+    shortDescription: {
+      text: 'Defense-in-Depth architectural hardening recommendation.',
+    },
+    fullDescription: {
+      text: 'Zero-Leniency audit note explaining why code does not receive a 100/100 score and how to harden against secondary edge cases.',
+    },
+    defaultConfiguration: { level: 'warning' },
+    properties: {
+      tags: ['security', 'defense-in-depth', 'maintainability'],
+      'security-severity': '5.0',
+    },
+  },
+  {
+    id: 'DG003',
+    name: 'OverallScoreBelowThreshold',
+    shortDescription: {
+      text: 'File overall DevGuard score fell below minimum CI threshold.',
+    },
+    fullDescription: {
+      text: 'The combined Security, Correctness, and Maintainability score did not meet the configured minimum threshold for this repository.',
+    },
+    defaultConfiguration: { level: 'error' },
+    properties: {
+      tags: ['quality-gate', 'security'],
+      'security-severity': '8.0',
+    },
+  },
+  {
+    id: 'DG004',
+    name: 'HallucinatedOrTyposquattedPackage',
+    shortDescription: {
+      text: 'Hallucinated, undeclared, or typosquatted package dependency detected.',
+    },
+    fullDescription: {
+      text: 'Detected a package import with a suspicious edit distance to a popular NPM package or absent from package.json.',
+    },
+    defaultConfiguration: { level: 'error' },
+    properties: {
+      tags: ['security', 'supply-chain', 'slopsquatting', 'external/cwe/cwe-829'],
+      'security-severity': '7.5',
+    },
+  },
+  {
+    id: 'DG005',
+    name: 'SwallowedExceptionInFlow',
+    shortDescription: {
+      text: 'Empty or console-only catch block swallows runtime failures.',
+    },
+    fullDescription: {
+      text: 'A catch block ignores exceptions or logs only without rethrowing, returning a failure state, or rolling back critical state.',
+    },
+    defaultConfiguration: { level: 'warning' },
+    properties: {
+      tags: ['security', 'reliability', 'error-handling', 'external/cwe/cwe-390'],
+      'security-severity': '7.0',
+    },
+  },
+  {
+    id: 'DG006',
+    name: 'NonAtomicBalanceOrStockMutation',
+    shortDescription: {
+      text: 'Non-atomic check-then-act mutation across await boundary (TOCTOU race condition).',
+    },
+    fullDescription: {
+      text: 'Reads and validates balance, stock, or quota state before mutating it across an asynchronous boundary without an atomic transaction or lock.',
+    },
+    defaultConfiguration: { level: 'error' },
+    properties: {
+      tags: ['security', 'concurrency', 'toctou', 'external/cwe/cwe-362'],
+      'security-severity': '8.5',
+    },
+  },
+  {
+    id: 'DG007',
+    name: 'HardcodedSecretOrApiKey',
+    shortDescription: {
+      text: 'Hardcoded AI, payment, or cloud API secret detected in source code.',
+    },
+    fullDescription: {
+      text: 'Detected a provider-prefixed API key or high-entropy credential literal assigned directly in source instead of loaded from environment variables.',
+    },
+    defaultConfiguration: { level: 'error' },
+    properties: {
+      tags: ['security', 'secrets', 'credentials', 'external/cwe/cwe-798'],
+      'security-severity': '9.0',
+    },
+  },
+  {
+    id: 'DG008',
+    name: 'MissingTimeoutOrUnboundedAsyncLoop',
+    shortDescription: {
+      text: 'Missing network AbortSignal timeout or unbounded async polling loop.',
+    },
+    fullDescription: {
+      text: 'Detected an external fetch() call lacking AbortSignal.timeout() or an unbounded loop containing await without break, return, throw, or bounded retry limits.',
+    },
+    defaultConfiguration: { level: 'error' },
+    properties: {
+      tags: ['security', 'reliability', 'resilience', 'external/cwe/cwe-400'],
+      'security-severity': '6.5',
+    },
+  },
+];
+
+const SARIF_DYNAMIC_RULES: Readonly<Record<string, SarifRuleDescriptor>> = {
+  'DG004-DYN-01': {
+    id: 'DG004-DYN-01',
+    name: 'UnanalyzableDynamicImportSpecifier',
+    shortDescription: {
+      text: 'Non-scoring warning: dynamic import() specifier prevents static supply-chain verification.',
+    },
+    fullDescription: {
+      text: 'Non-scoring informational warning emitted when dynamic import() uses a non-literal specifier that cannot be statically checked against package.json or known typosquatting targets. Does not penalize repository scores.',
+    },
+    defaultConfiguration: { level: 'warning' },
+    properties: {
+      tags: ['security', 'supply-chain', 'non-scoring', 'external/cwe/cwe-829'],
+      'security-severity': '3.5',
+    },
+  },
+  'DG004-DYN-02': {
+    id: 'DG004-DYN-02',
+    name: 'UnanalyzableDynamicRequireSpecifier',
+    shortDescription: {
+      text: 'Non-scoring warning: dynamic require() specifier prevents static supply-chain verification.',
+    },
+    fullDescription: {
+      text: 'Non-scoring informational warning emitted when CommonJS require() uses a non-literal specifier that cannot be statically checked against package.json or known typosquatting targets. Does not penalize repository scores.',
+    },
+    defaultConfiguration: { level: 'warning' },
+    properties: {
+      tags: ['security', 'supply-chain', 'non-scoring', 'external/cwe/cwe-829'],
+      'security-severity': '3.5',
+    },
+  },
+  'DG004-WS-NEW': {
+    id: 'DG004-WS-NEW',
+    name: 'NewWorkspacePackageInPullRequest',
+    shortDescription: {
+      text: 'Non-scoring notice: new workspace package added in pull request.',
+    },
+    fullDescription: {
+      text: 'Non-scoring informational notice emitted when a pull request adds a new workspace package not present on the base branch. Verify that the package name is intentional and not a slopsquatting bypass.',
+    },
+    defaultConfiguration: { level: 'warning' },
+    properties: {
+      tags: ['security', 'supply-chain', 'non-scoring', 'external/cwe/cwe-829'],
+      'security-severity': '3.5',
+    },
+  },
+  'DG004-WS-UNPARSED': {
+    id: 'DG004-WS-UNPARSED',
+    name: 'UnparseableWorkspaceConfiguration',
+    shortDescription: {
+      text: 'Non-scoring notice: workspace configuration could not be parsed (fail-closed per source).',
+    },
+    fullDescription: {
+      text: 'Non-scoring informational notice emitted when a workspace configuration file (package.json, pnpm-workspace.yaml, or tsconfig.json) fails to parse, exceeds the 256 KiB size limit, or uses unsupported constructs. The failed source contributes zero package names.',
+    },
+    defaultConfiguration: { level: 'warning' },
+    properties: {
+      tags: ['security', 'supply-chain', 'non-scoring', 'external/cwe/cwe-829'],
+      'security-severity': '3.5',
+    },
+  },
+};
+
 function extractFirstLineNumber(text: string): number {
-  const match = text.match(/\d+/);
-  if (!match) return 1;
-  const parsed = Number.parseInt(match[0], 10);
+  const match = text.match(/(?:line|baris)\s*[:#\s]?\s*(\d+)/i);
+  if (!match?.[1]) return 1;
+  const parsed = Number.parseInt(match[1], 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 1;
+}
+
+function extractLineFromField(lineField: string): number {
+  const explicit = lineField.match(/(?:line|baris)\s*[:#\s]?\s*(\d+)/i);
+  if (explicit?.[1]) {
+    const parsed = Number.parseInt(explicit[1], 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 1;
+  }
+  const bare = lineField.trim().match(/^(\d+)$/);
+  if (bare?.[1]) {
+    const parsed = Number.parseInt(bare[1], 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 1;
+  }
+  return 1;
 }
 
 function isNonScoringNoticeRule(ruleId: string, scoring?: boolean): boolean {
@@ -103,19 +313,33 @@ function isNonScoringNoticeRule(ruleId: string, scoring?: boolean): boolean {
 function buildSarifExport(
   fileName: string,
   findings: AuditFinding[],
-  notices: AuditNotice[]
+  notices: AuditNotice[],
+  totalLines: number
 ): Record<string, unknown> {
+  const safeUri = (fileName || 'snippet.ts').replace(/\\/g, '/').replace(/^\.\//, '');
+  const rulesMap = new Map<string, SarifRuleDescriptor>();
+  for (const rule of SARIF_CORE_RULES) {
+    rulesMap.set(rule.id, rule);
+  }
+
+  for (const notice of notices) {
+    const dynRule = SARIF_DYNAMIC_RULES[notice.code];
+    if (dynRule && !rulesMap.has(dynRule.id)) {
+      rulesMap.set(dynRule.id, dynRule);
+    }
+  }
+
   const results = [
     ...findings.map((finding) => ({
       ruleId: finding.id,
       level: finding.severity === 'info' ? 'note' : finding.severity,
-      message: { text: finding.message },
+      message: { text: redactSecretsPreservingLayout(finding.message) },
       locations: [
         {
           physicalLocation: {
-            artifactLocation: { uri: fileName || 'snippet.ts', uriBaseId: '%SRCROOT%' },
+            artifactLocation: { uri: safeUri, uriBaseId: '%SRCROOT%' },
             region: {
-              startLine: Math.max(1, finding.line),
+              startLine: clampLine(finding.line, totalLines),
               startColumn: finding.column ?? 1,
             },
           },
@@ -125,13 +349,13 @@ function buildSarifExport(
     ...notices.map((notice) => ({
       ruleId: notice.code,
       level: 'warning',
-      message: { text: notice.message },
+      message: { text: redactSecretsPreservingLayout(notice.message) },
       properties: { scoring: false },
       locations: [
         {
           physicalLocation: {
-            artifactLocation: { uri: fileName || 'snippet.ts', uriBaseId: '%SRCROOT%' },
-            region: { startLine: Math.max(1, notice.line ?? 1), startColumn: 1 },
+            artifactLocation: { uri: safeUri, uriBaseId: '%SRCROOT%' },
+            region: { startLine: clampLine(notice.line ?? 1, totalLines), startColumn: 1 },
           },
         },
       ],
@@ -147,9 +371,17 @@ function buildSarifExport(
         tool: {
           driver: {
             name: 'DevGuard Adversarial Code Auditor',
+            informationUri: 'https://github.com/OkyWoww/DevGuard',
             version: VERSION_LABEL.replace(/^v/, ''),
+            rules: Array.from(rulesMap.values()),
           },
         },
+        invocations: [
+          {
+            executionSuccessful: true,
+            toolExecutionNotifications: [],
+          },
+        ],
         results,
       },
     ],
@@ -163,6 +395,7 @@ function normalizeParsedReport(
   durationMs: number,
   engineSource: AuditEngineSource
 ): AuditReport {
+  const totalLines = Math.max(1, sourceCode.split('\n').length);
   const findings: AuditFinding[] = [];
   const notices: AuditNotice[] = [];
 
@@ -175,7 +408,7 @@ function normalizeParsedReport(
       notices.push({
         code: item.ruleId,
         message: item.message,
-        line: item.line > 0 ? item.line : undefined,
+        line: item.line > 0 ? clampLine(item.line, totalLines) : undefined,
       });
     } else {
       findings.push({
@@ -183,7 +416,7 @@ function normalizeParsedReport(
         ruleTitle: RULE_TITLES[item.ruleId] || item.ruleId,
         severity: item.severity,
         message: item.message,
-        line: Math.max(1, item.line),
+        line: clampLine(item.line, totalLines),
         blocking: item.severity === 'error',
       });
     }
@@ -201,7 +434,7 @@ function normalizeParsedReport(
       ruleTitle: RULE_TITLES.DG001,
       severity: 'error',
       message: parsed.temuanUtama.description,
-      line: extractFirstLineNumber(parsed.temuanUtama.line),
+      line: clampLine(extractLineFromField(parsed.temuanUtama.line), totalLines),
       blocking: true,
     });
   }
@@ -212,7 +445,7 @@ function normalizeParsedReport(
       ruleTitle: RULE_TITLES.DG002,
       severity: 'info',
       message: note,
-      line: extractFirstLineNumber(note),
+      line: clampLine(extractFirstLineNumber(note), totalLines),
       blocking: false,
     });
   }
@@ -262,7 +495,7 @@ function normalizeParsedReport(
     findings,
     notices,
     remediation,
-    rawSarif: buildSarifExport(fileName, findings, notices),
+    rawSarif: buildSarifExport(fileName, findings, notices, totalLines),
     durationMs,
     engineSource,
   };
@@ -516,13 +749,14 @@ export default function App() {
       if (!report) return;
       if (format === 'sarif') {
         const sarifData =
-          report.rawSarif ?? buildSarifExport(fileName, report.findings, report.notices);
+          report.rawSarif ??
+          buildSarifExport(fileName, report.findings, report.notices, totalLines);
         triggerFileDownload('devguard-results.sarif', JSON.stringify(sarifData, null, 2));
         return;
       }
       triggerFileDownload('devguard-report.json', JSON.stringify(report, null, 2));
     },
-    [fileName, report]
+    [fileName, report, totalLines]
   );
 
   const handleSelectFinding = useCallback(
