@@ -145,6 +145,12 @@ export function parseCliArgs(argv: readonly string[]): ParsedCliCommand {
       if (next === undefined || next.length === 0) {
         return { ok: false, error: `Option ${flag} requires a value.` };
       }
+      if (next.startsWith('-')) {
+        return {
+          ok: false,
+          error: `Option ${flag} requires a value, but got flag "${next}".`,
+        };
+      }
       i++;
       return { ok: true, value: next };
     };
