@@ -455,8 +455,16 @@ export function runCli(argv: readonly string[], io?: CliIo): number {
       overall: report.skor.totalScore,
       passed: passedFile,
       fatalFlaws:
-        !passedFile && report.temuanUtama.description ? [report.temuanUtama.description] : [],
-      defenseInDepth: report.temuanLain,
+        !passedFile &&
+        report.temuanUtama.description &&
+        !report.temuanUtama.description.startsWith('Mitigasi utama terverifikasi') &&
+        !report.temuanUtama.description.startsWith('Kode telah melewati')
+          ? [report.temuanUtama.description]
+          : [],
+      defenseInDepth:
+        report.residualNotes && report.residualNotes.length > 0
+          ? report.residualNotes
+          : report.temuanLain.filter((t) => t.includes('[Defense-in-Depth]')),
       inlineFindings: report.inlineFindings,
       suppressions: report.suppressions,
       layer2Status: 'Layer 2 (Gemini): Skipped [Offline]',

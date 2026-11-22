@@ -385,7 +385,12 @@ export function buildSarifReportString(
     // 4. Masukkan catatan Defense-in-Depth sebagai SARIF 'warning' (DG002)
     for (const note of summary.defenseInDepth) {
       const line = extractLineNumber(note);
-      results.push(createSarifResult('DG002', 'warning', note, normalizedUri, line));
+      const isAlreadyInline = inlineFindings.some(
+        (f) => (f.message && note.includes(f.message)) || (line !== 1 && line === f.line && f.ruleId !== 'DG002')
+      );
+      if (!isAlreadyInline) {
+        results.push(createSarifResult('DG002', 'warning', note, normalizedUri, line));
+      }
     }
 
     // 5. Stage 3a: Emit active suppressions with standard SARIF v2.1.0 suppressions metadata
