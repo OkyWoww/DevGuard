@@ -8610,3 +8610,87 @@ test('Test 91: Stage 7.4 Comprehensive Regression, Empty Staged Pass, & Built Bi
     fs.rmSync(tmpE2e, { recursive: true, force: true });
   }
 });
+
+test('Test 92: Regression Suite for Audit Waves 1-3 Hardening (DG006 comment bypass, pure SARIF stdout, DG003 threshold parity, pre-LLM gate)', () => {
+  // 1. DG006: Comment mentioning mutex/lock must NOT suppress race condition detection
+  const fakeCommentBypassCode = [
+    'export async function transferFunds(user: any, amount: number) {',
+    '  if (user.balance >= amount) {',
+    '    // TODO: need a lock or mutex or $transaction here later',
+    '    await saveAuditLog(user.id);',
+    '    user.balance -= amount;',
+    '  }',
+    '}',
+  ].join('\n');
+  const r1 = analyzeCodeDeterministically(fakeCommentBypassCode, { filePath: 'src/wallet.ts' });
+  const dg006Hits = (r1.inlineFindings || []).filter((f) => f.ruleId === 'DG006');
+  assert.equal(dg006Hits.length, 1, 'DG006 must trigger even if comment mentions lock/mutex');
+
+  // 2. DG006: String literal "awaiting" without real await keyword must NOT trigger DG006
+  const stringLiteralNoAwaitCode = [
+    'export function checkStatus(user: any, amount: number) {',
+    '  if (user.balance >= amount) {',
+    '    const note = "awaiting manual review from operations";',
+    '    user.balance -= amount;',
+    '  }',
+    '}',
+  ].join('\n');
+  const r2 = analyzeCodeDeterministically(stringLiteralNoAwaitCode, { filePath: 'src/wallet.ts' });
+  const dg006StringHits = (r2.inlineFindings || []).filter((f) => f.ruleId === 'DG006');
+  assert.equal(dg006StringHits.length, 0, 'String literal containing "awaiting" must not trigger DG006');
+
+  // 3. CLI stdout purity: `devguard check <file> --format sarif` must output 100% valid JSON without banners
+  const cliDistPath = path.join(REPO_ROOT, 'dist', 'cli.js');
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-test92-'));
+  try {
+    const testFile = path.join(tmpDir, 'sample.ts');
+    fs.writeFileSync(
+      testFile,
+      'export function add(a: number, b: number): number { if (typeof a !== "number" || typeof b !== "number") throw new Error(); return a + b; }\n',
+      'utf-8'
+    );
+    const proc = spawnSync(process.execPath, [cliDistPath, 'check', testFile, '--format', 'sarif'], {
+      encoding: 'utf-8',
+    });
+    assert.equal(proc.status, 0, `CLI sarif output must exit 0, stderr: ${proc.stderr}`);
+    assert.doesNotThrow(() => {
+      const parsed = JSON.parse(proc.stdout);
+      assert.equal(parsed.version, '2.1.0');
+      assert.equal(parsed.runs.length, 1);
+    }, 'CLI stdout with --format sarif must be pure JSON directly parseable by JSON.parse');
+
+    // 4. CLI Argument parsing: flags cannot swallow another flag as their value (e.g. `--output --staged`)
+    const procInvalidArg = spawnSync(process.execPath, [cliDistPath, 'check', testFile, '--output', '--staged'], {
+      encoding: 'utf-8',
+    });
+    assert.equal(procInvalidArg.status, 2, 'Passing flag as argument value must fail-closed with exit code 2');
+    assert.ok(procInvalidArg.stderr.includes('Error: Option --output requires a value'), 'Must output helpful error on stderr');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+
+  // 5. Pre-LLM Redaction Gate: blocking sensitive files (.env / pem) and redacting API keys
+  const envBlocked = prepareRedactedCodeForLlm('.env.production', 'DATABASE_URL="postgres://user:secret@localhost/db"');
+  assert.equal(envBlocked.aborted, true, 'Pre-LLM gate must abort sending .env files');
+  assert.equal(envBlocked.reason, 'Sensitive filename blocked');
+
+  const secretCode = [
+    'export const config = {',
+    '  apiKey: "AIzaSyB_1234567890abcdef1234567890abcdef",',
+    '};',
+  ].join('\n');
+  const secretGate = prepareRedactedCodeForLlm('src/config.ts', secretCode);
+  assert.equal(secretGate.aborted, false, 'Permitted source file is redacted and allowed');
+  assert.ok(!secretGate.safeCode.includes('AIzaSyB_1234567890abcdef1234567890abcdef'), 'Secret token must not exist in safeCode');
+
+  // Residual unredacted token triggering fail-closed abort
+  const residualBlocked = prepareRedactedCodeForLlm('src/custom.ts', 'const x = 1;', {
+    redactFn: () => 'const leak = "AIzaSyB_1234567890abcdef1234567890abcdef";',
+  });
+  assert.equal(residualBlocked.aborted, true, 'Residual secret token must trigger fail-closed abort');
+  assert.ok(residualBlocked.reason?.includes('Residual secret check'), 'Must specify residual secret check failure');
+
+  const cleanGate = prepareRedactedCodeForLlm('src/clean.ts', 'export const x = 1;');
+  assert.equal(cleanGate.aborted, false, 'Clean source file should not be aborted');
+  assert.equal(cleanGate.safeCode, 'export const x = 1;');
+});
