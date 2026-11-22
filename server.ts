@@ -24,17 +24,34 @@ app.use(express.json({ limit: '5mb' }));
 export { analyzeCodeDeterministically };
 export type { ParsedDevGuardReport, ParsedScores };
 
+function clampScore(value: unknown, fallback: number): number {
+  const numeric = typeof value === 'number' ? value : Number(value);
+  const safeFallback = Number.isFinite(fallback)
+    ? Math.min(100, Math.max(0, Math.round(fallback)))
+    : 0;
+  if (!Number.isFinite(numeric)) return safeFallback;
+  return Math.min(100, Math.max(0, Math.round(numeric)));
+}
+
 // -----------------------------------------------------------------------------
 // Hybrid Layer 1 (Deterministic AST/Heuristic) + Layer 2 (Live Gemini API)
 // Zero-Leniency Code Auditor — Never uses boolean shortcuts or blind 100/100
 // -----------------------------------------------------------------------------
-async function evaluateCodeHybrid(code: string): Promise<{
+async function evaluateCodeHybrid(
+  code: string,
+  filePath?: string
+): Promise<{
   isLiveApi: boolean;
   rawMarkdown: string;
   parsedReport: ParsedDevGuardReport;
 }> {
   // Layer 1: Always run Deterministic Static Pattern & AST Heuristic Analyzer
-  const layer1Report = analyzeCodeDeterministically(code);
+  const normalizedPath =
+    typeof filePath === 'string' && filePath.trim().length > 0 ? filePath.trim() : undefined;
+  const layer1Report = analyzeCodeDeterministically(
+    code,
+    normalizedPath ? { filePath: normalizedPath } : undefined
+  );
 
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey || apiKey === 'MY_GEMINI_API_KEY' || !apiKey.startsWith('AIzaSy')) {
@@ -46,12 +63,19 @@ async function evaluateCodeHybrid(code: string): Promise<{
   }
 
   // Layer 2: Live Gemini API Deep Adversarial Reasoning (temperature: 0.1, JSON Schema)
+  let timeoutId: ReturnType<typeof setTimeout> | null = null;
   try {
     const ai = new GoogleGenAI({ apiKey });
-    const instructionPath = path.resolve(__dirname, 'devguard_system_instructions_v2.md');
-    const systemInstruction = fs.existsSync(instructionPath)
-      ? fs.readFileSync(instructionPath, 'utf-8')
-      : 'Act as a Principal AppSec Engineer and Zero-Leniency Adversarial Code Auditor.';
+    const instructionFileName = path.basename('devguard_system_instructions_v2.md');
+    const instructionPath = path.resolve(__dirname, instructionFileName);
+    let systemInstruction =
+      'Act as a Principal AppSec Engineer and Zero-Leniency Adversarial Code Auditor.';
+    try {
+      systemInstruction = await fs.promises.readFile(instructionPath, 'utf-8');
+    } catch {
+      systemInstruction =
+        'Act as a Principal AppSec Engineer and Zero-Leniency Adversarial Code Auditor.';
+    }
 
     const prompt = [
       'Anda adalah Principal AppSec Engineer & Zero-Leniency Adversarial Code Auditor.',
@@ -69,11 +93,11 @@ async function evaluateCodeHybrid(code: string): Promise<{
       '</code_to_review>',
     ].join('\n');
 
-    const timeoutPromise = new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error('Gemini API timeout')), 4500)
-    );
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timeoutId = setTimeout(() => reject(new Error('Gemini API timeout')), 4500);
+    });
 
-    const response: any = await Promise.race([
+    const response: { text?: string } = await Promise.race([
       ai.models.generateContent({
         model: 'gemini-3.8-flash',
         contents: prompt,
@@ -112,62 +136,98 @@ async function evaluateCodeHybrid(code: string): Promise<{
       timeoutPromise,
     ]);
 
-    const jsonText = response?.text;
-    if (jsonText) {
+    const jsonText = typeof response?.text === 'string' ? response.text.trim() : '';
+    if (jsonText.length > 0) {
       const llmData = JSON.parse(jsonText);
-      // Enforce zero-leniency ceiling: take the stricter of Layer 1 and Layer 2 scores
-      const sec = Math.min(layer1Report.skor.security, Math.max(0, Number(llmData.securityScore ?? layer1Report.skor.security)));
-      const corr = Math.min(layer1Report.skor.correctness, Math.max(0, Number(llmData.correctnessScore ?? layer1Report.skor.correctness)));
-      const maint = Math.min(layer1Report.skor.maintainability, Math.max(0, Number(llmData.maintainabilityScore ?? layer1Report.skor.maintainability)));
-      const total = Math.round((sec + corr + maint) / 3);
+      if (llmData && typeof llmData === 'object') {
+        // Enforce zero-leniency ceiling with strict finite number guards (fail-closed against NaN)
+        const l1Sec = clampScore(layer1Report.skor.security, 0);
+        const l1Corr = clampScore(layer1Report.skor.correctness, 0);
+        const l1Maint = clampScore(layer1Report.skor.maintainability, 0);
 
-      const mergedReport: ParsedDevGuardReport = {
-        ...layer1Report,
-        apresiasi: llmData.apresiasi || layer1Report.apresiasi,
-        skor: {
-          security: sec,
-          securityDeductions:
-            layer1Report.skor.security <= (llmData.securityScore ?? 100)
-              ? layer1Report.skor.securityDeductions
-              : llmData.securityDeductions || layer1Report.skor.securityDeductions,
-          correctness: corr,
-          correctnessDeductions:
-            layer1Report.skor.correctness <= (llmData.correctnessScore ?? 100)
-              ? layer1Report.skor.correctnessDeductions
-              : llmData.correctnessDeductions || layer1Report.skor.correctnessDeductions,
-          maintainability: maint,
-          maintainabilityDeductions:
-            layer1Report.skor.maintainability <= (llmData.maintainabilityScore ?? 100)
-              ? layer1Report.skor.maintainabilityDeductions
-              : llmData.maintainabilityDeductions || layer1Report.skor.maintainabilityDeductions,
-          totalScore: total,
-        },
-        temuanUtama: {
-          line: layer1Report.temuanUtama.line !== '-' ? layer1Report.temuanUtama.line : (llmData.temuanUtamaLine || '-'),
-          description: llmData.temuanUtamaDescription || layer1Report.temuanUtama.description,
-        },
-        temuanLain:
-          Array.isArray(llmData.temuanLain) && llmData.temuanLain.length > 0
-            ? llmData.temuanLain.slice(0, 5)
-            : layer1Report.temuanLain,
-        verifiedMitigations:
-          Array.isArray(llmData.verifiedMitigations) && llmData.verifiedMitigations.length > 0
-            ? llmData.verifiedMitigations
-            : layer1Report.verifiedMitigations,
-        residualNotes:
-          Array.isArray(llmData.residualNotes) && llmData.residualNotes.length > 0
-            ? llmData.residualNotes
-            : layer1Report.residualNotes,
-      };
+        const llmSec = clampScore(llmData.securityScore, l1Sec);
+        const llmCorr = clampScore(llmData.correctnessScore, l1Corr);
+        const llmMaint = clampScore(llmData.maintainabilityScore, l1Maint);
 
-      return {
-        isLiveApi: true,
-        rawMarkdown: mergedReport.rawMarkdown,
-        parsedReport: mergedReport,
-      };
+        const sec = Math.min(l1Sec, llmSec);
+        const corr = Math.min(l1Corr, llmCorr);
+        const maint = Math.min(l1Maint, llmMaint);
+        const total = clampScore((sec + corr + maint) / 3, 0);
+
+        const mergedReport: ParsedDevGuardReport = {
+          ...layer1Report,
+          apresiasi:
+            typeof llmData.apresiasi === 'string' && llmData.apresiasi.trim().length > 0
+              ? llmData.apresiasi
+              : layer1Report.apresiasi,
+          skor: {
+            security: sec,
+            securityDeductions:
+              l1Sec <= llmSec
+                ? layer1Report.skor.securityDeductions
+                : Array.isArray(llmData.securityDeductions)
+                  ? llmData.securityDeductions
+                  : layer1Report.skor.securityDeductions,
+            correctness: corr,
+            correctnessDeductions:
+              l1Corr <= llmCorr
+                ? layer1Report.skor.correctnessDeductions
+                : Array.isArray(llmData.correctnessDeductions)
+                  ? llmData.correctnessDeductions
+                  : layer1Report.skor.correctnessDeductions,
+            maintainability: maint,
+            maintainabilityDeductions:
+              l1Maint <= llmMaint
+                ? layer1Report.skor.maintainabilityDeductions
+                : Array.isArray(llmData.maintainabilityDeductions)
+                  ? llmData.maintainabilityDeductions
+                  : layer1Report.skor.maintainabilityDeductions,
+            totalScore: total,
+          },
+          temuanUtama: {
+            line:
+              layer1Report.temuanUtama.line !== '-'
+                ? layer1Report.temuanUtama.line
+                : typeof llmData.temuanUtamaLine === 'string' && llmData.temuanUtamaLine.trim()
+                  ? llmData.temuanUtamaLine
+                  : '-',
+            description:
+              typeof llmData.temuanUtamaDescription === 'string' &&
+              llmData.temuanUtamaDescription.trim().length > 0
+                ? llmData.temuanUtamaDescription
+                : layer1Report.temuanUtama.description,
+          },
+          temuanLain:
+            Array.isArray(llmData.temuanLain) && llmData.temuanLain.length > 0
+              ? llmData.temuanLain.slice(0, 5)
+              : layer1Report.temuanLain,
+          verifiedMitigations:
+            Array.isArray(llmData.verifiedMitigations) && llmData.verifiedMitigations.length > 0
+              ? llmData.verifiedMitigations
+              : layer1Report.verifiedMitigations,
+          residualNotes:
+            Array.isArray(llmData.residualNotes) && llmData.residualNotes.length > 0
+              ? llmData.residualNotes
+              : layer1Report.residualNotes,
+        };
+
+        return {
+          isLiveApi: true,
+          rawMarkdown: mergedReport.rawMarkdown,
+          parsedReport: mergedReport,
+        };
+      }
     }
   } catch {
-    // Gracefully fallback to Layer 1 Deterministic AST/Heuristic Report
+    return {
+      isLiveApi: false,
+      rawMarkdown: layer1Report.rawMarkdown,
+      parsedReport: layer1Report,
+    };
+  } finally {
+    if (timeoutId !== null) {
+      clearTimeout(timeoutId);
+    }
   }
 
   return {
@@ -184,13 +244,16 @@ async function evaluateCodeHybrid(code: string): Promise<{
 // 1. POST /api/devguard/review
 app.post('/api/devguard/review', async (req: Request, res: Response) => {
   try {
-    const { code } = req.body;
+    const { code, fileName } = req.body;
     if (!code || typeof code !== 'string') {
       res.status(400).json({ error: 'Kode sumber wajib disertakan (string).' });
       return;
     }
 
-    const { isLiveApi, rawMarkdown, parsedReport } = await evaluateCodeHybrid(code);
+    const { isLiveApi, rawMarkdown, parsedReport } = await evaluateCodeHybrid(
+      code,
+      typeof fileName === 'string' ? fileName : undefined
+    );
 
     res.json({
       success: true,
@@ -198,8 +261,9 @@ app.post('/api/devguard/review', async (req: Request, res: Response) => {
       rawMarkdown,
       parsedReport,
     });
-  } catch (error: any) {
-    res.status(500).json({ error: error?.message || 'Gagal memproses audit kode DevGuard' });
+  } catch (error: unknown) {
+    const errMsg = error instanceof Error ? error.message : 'Gagal memproses audit kode DevGuard';
+    res.status(500).json({ error: errMsg });
   }
 });
 
@@ -281,7 +345,7 @@ app.all(['/api/devguard/verify'], (_req: Request, res: Response) => {
 });
 
 // 3. GET /api/devguard/files (Lists and serves all scaffolding files)
-app.get('/api/devguard/files', (_req: Request, res: Response) => {
+app.get('/api/devguard/files', async (_req: Request, res: Response) => {
   const fileNames = [
     'devguard_system_instructions_v2.md',
     'run_devguard.py',
@@ -291,21 +355,26 @@ app.get('/api/devguard/files', (_req: Request, res: Response) => {
     'README.md',
   ];
 
-  const files = fileNames.map((name) => {
-    const fullPath = path.resolve(__dirname, name);
-    let content = '';
-    let exists = false;
-    if (fs.existsSync(fullPath)) {
-      content = fs.readFileSync(fullPath, 'utf-8');
-      exists = true;
-    }
-    return {
-      name,
-      exists,
-      content,
-      size: Buffer.byteLength(content, 'utf8'),
-    };
-  });
+  const files = await Promise.all(
+    fileNames.map(async (name) => {
+      const safeName = path.basename(name);
+      const fullPath = path.resolve(__dirname, safeName);
+      let content = '';
+      let exists = false;
+      try {
+        content = await fs.promises.readFile(fullPath, 'utf-8');
+        exists = true;
+      } catch {
+        exists = false;
+      }
+      return {
+        name: safeName,
+        exists,
+        content,
+        size: Buffer.byteLength(content, 'utf8'),
+      };
+    })
+  );
 
   res.json({ files });
 });
@@ -327,8 +396,16 @@ async function startServer() {
   } else {
     const distPath = path.resolve(__dirname, 'dist');
     app.use(express.static(distPath));
-    app.get('*', (_req, res) => {
-      res.sendFile(path.resolve(distPath, 'index.html'));
+    app.get('*', async (_req, res) => {
+      try {
+        const html = await fs.promises.readFile(
+          path.resolve(distPath, path.basename('index.html')),
+          'utf-8'
+        );
+        res.type('html').send(html);
+      } catch {
+        res.status(404).send('Not Found');
+      }
     });
   }
 
