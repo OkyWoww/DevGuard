@@ -1,9 +1,9 @@
-# 🛡️ DevGuard v1.5.0 — The AI-Slop & Vibe-Coding Security Gatekeeper
+# 🛡️ DevGuard v1.6.0 — The AI-Slop & Vibe-Coding Security Gatekeeper
 
 [![Zero-Dependency Runtime](https://img.shields.io/badge/Runtime-100%25%20Zero--Dependency-emerald.svg)](#hybrid-dual-layer-architecture)
 [![OASIS SARIF v2.1.0](https://img.shields.io/badge/SARIF-v2.1.0%20Compliant-blue.svg)](#quick-start-choose-your-path)
-[![GitHub Action](https://img.shields.io/badge/GitHub%20Action-v1.5.0-black.svg)](#quick-start-choose-your-path)
-[![Tests 92/92 Passing](https://img.shields.io/badge/Tests-92%2F92%20Passing-success.svg)](#local-development--verification)
+[![GitHub Action](https://img.shields.io/badge/GitHub%20Action-v1.6.0-black.svg)](#quick-start-choose-your-path)
+[![Tests 94/94 Passing](https://img.shields.io/badge/Tests-94%2F94%20Passing-success.svg)](#local-development--verification)
 
 **DevGuard** is a deterministic CI/CD security gatekeeper engineered to catch silent failures, slopsquatting, leaked API keys, and financial race conditions hidden inside AI-generated (*Cursor, Windsurf, Copilot, Antigravity*) Pull Requests before they reach production.
 
@@ -13,13 +13,14 @@ Unlike generic LLM code reviewers that only leave probabilistic chat comments, D
 
 ## ⚡ Quick Start: Choose Your Path
 
-DevGuard supports three workflows depending on whether you are exploring in the browser, auditing locally in your terminal, or gating Pull Requests in CI:
+DevGuard supports four workflows depending on whether you are exploring in the browser, auditing locally in your terminal, connecting AI coding agents via MCP, or gating Pull Requests in CI:
 
 | Path | Best For | Monorepo `DG004` Resolver & Base-Branch `.devguard.json`? |
 | :--- | :--- | :---: |
 | **Path A: Local Browser Dashboard** | Testing a single code snippet interactively in the browser | No *(single-file mode)* |
 | **Path B: Zero-Dep CLI & Pre-Commit Hook** | Running fast pre-commit audits locally in terminal via `npx devguard` | **Yes** *(reads working tree & git index)* |
 | **Path C: GitHub Actions CI (Recommended)** | Protecting repositories, Pull Requests, & monorepos with SARIF + inline fixes | **Yes** *(requires `fetch-depth: 0`)* |
+| **Path D: Zero-Dep MCP Server (`devguard mcp`)** | Giving AI IDEs/agents read-only offline security audits over stdio JSON-RPC 2.0 | **Yes** *(for `devguard_check_files`; snippet mode is single-file)* |
 
 ### Path A: Try Quickly in the Browser Dashboard (Single-File Snippets)
 
@@ -49,7 +50,7 @@ npx devguard install-hook
 
 ### Path C: Install in GitHub Actions CI (Fork-Safe & Monorepo-Ready)
 
-Pin DevGuard by release tag or **full 40-character commit SHA** (`git rev-parse v1.5.0^{commit}`) in `.github/workflows/devguard.yml`. Always set **`fetch-depth: 0`** on `actions/checkout@v4` so DevGuard can read `origin/<baseRef>` for base-branch `.devguard.json` and monorepo workspace configs (avoiding shallow-clone `DG004-WS-SHALLOW` fallbacks):
+Pin DevGuard by release tag or **full 40-character commit SHA** (`git rev-parse v1.6.0^{commit}`) in `.github/workflows/devguard.yml`. Always set **`fetch-depth: 0`** on `actions/checkout@v4` so DevGuard can read `origin/<baseRef>` for base-branch `.devguard.json` and monorepo workspace configs (avoiding shallow-clone `DG004-WS-SHALLOW` fallbacks):
 
 ```yaml
 name: DevGuard Security Audit
@@ -75,9 +76,9 @@ jobs:
         with:
           fetch-depth: 0 # Required so base-branch .devguard.json & workspace configs are readable
 
-      - name: Run DevGuard v1.5.0
+      - name: Run DevGuard v1.6.0
         id: devguard
-        uses: OkyWoww/DevGuard@v1.5.0 # Or pin by 40-char commit SHA (git rev-parse v1.5.0^{commit})
+        uses: OkyWoww/DevGuard@v1.6.0 # Or pin by 40-char commit SHA (git rev-parse v1.6.0^{commit})
         with:
           # Optional: Omit for 100% Free Offline Single-Pass Lexical & Heuristic mode
           gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
@@ -91,6 +92,28 @@ jobs:
         with:
           sarif_file: ${{ steps.devguard.outputs.sarif_file }}
 ```
+
+### Path D: Zero-Dependency MCP Server (`devguard mcp`)
+
+Expose DevGuard's deterministic offline engine directly to MCP-compatible AI coding clients (Antigravity, Cursor, Claude Desktop, VS Code, or `@modelcontextprotocol/inspector`) over newline-delimited **stdio JSON-RPC 2.0** with **zero third-party MCP SDK dependencies** (`"dependencies": {}`):
+
+```json
+{
+  "mcpServers": {
+    "devguard": {
+      "command": "node",
+      "args": ["/path/to/devguard/dist/cli.js", "mcp", "--workspace", "/path/to/your/repo"]
+    }
+  }
+}
+```
+
+* **Supported MCP Protocol Versions:** `2025-11-25`, `2025-06-18`, `2025-03-26`, `2024-11-05` (strictly negotiated in `initialize`; unknown versions rejected with `-32602`).
+* **3 Read-Only Offline Tools** (all annotated `readOnlyHint: true`, `destructiveHint: false`, `openWorldHint: false`):
+  * `devguard_check_files` (`paths`, optional `min_score`) — audits workspace-relative files with exact CLI JSON score/finding parity (`Test 93` / `A8-1`).
+  * `devguard_check_snippet` (`language`, `code`, optional `virtual_path`, `min_score`) — audits in-memory snippets without touching disk.
+  * `devguard_explain_rule` (`rule_id`) — explains `DG001`–`DG008` and `DG004-DYN`/`DG004-WS` rules with CWE, remediation, and TP/TN examples.
+* **Security Hardening (`SPEC §8.3`):** Strict path jail rooted at `--workspace` (blocks `..`, absolute/UNC/drive-relative paths, prefix collisions, and symlink escapes), prompt-injection isolation (`quoted_source` separated from `message`/`suggestion` with `security_boundary`), automatic secret redaction (`INV-3`), pure JSON-RPC 2.0 `stdout` framing (diagnostics to `stderr`), and hard resource bounds (`1 MiB` incoming line, `25` files/call, `256 KiB` snippet, `512 KiB` bounded JSON output). Verified via official `@modelcontextprotocol/inspector@0.16.8` (`A8-5`).
 
 ### Action Inputs & Outputs ([action.yml](action.yml))
 
@@ -367,9 +390,15 @@ See also [docs/benchmarks/realworld-2026-11-16.md](docs/benchmarks/realworld-202
 
 ### Known Limitations (Path Exclusions, CLI Scope, & Monorepo `pnpm strict`)
 * **Path Exclusions by Mode (`modified` vs. `all`):** Dot-prefixed paths (`.github/`, `.husky/`), `node_modules`, `dist`, `build`, `coverage`, `remotion`, `out`, `tests`, all files inside `scripts/`, anchored self-reference files (`src/devguardAnalyzer.ts`, `scripts/devguard_verify.py`, `devguard_verify.py` when `package.json` `"name": "devguard"`), `*.d.ts`, `*.test.*`, and `*.spec.*` are excluded from code auditing. In `modified` (`git diff`) mode, touched excluded paths enter the classifier as `ignored/excluded_path` and appear in PR Coverage as `- Ignored (excluded path): N` when `N > 0` so the coverage invariant covers 100% of `git diff`. In `all` mode, excluded directories are skipped during workspace traversal so `node_modules` is never walked.
-* **Explicit CLI Arguments & `--version`:** Explicit file arguments passed on the CLI follow the coverage classifier (`.py` is analyzed with `partial` coverage; unsupported extensions like `.go` are marked `skipped`). Missing explicit CLI paths and invalid `fail_on_unanalyzable` values write `overall_score=N/A` and `audit_status=FAIL` to `GITHUB_OUTPUT` before exiting `1` rather than counting as `ignored/deleted`. Passing `--version` or `-v` prints the resolved package version (e.g. `1.5.0`) and exits `0`.
+* **Explicit CLI Arguments & `--version`:** Explicit file arguments passed on the CLI follow the coverage classifier (`.py` is analyzed with `partial` coverage; unsupported extensions like `.go` are marked `skipped`). Missing explicit CLI paths and invalid `fail_on_unanalyzable` values write `overall_score=N/A` and `audit_status=FAIL` to `GITHUB_OUTPUT` before exiting `1` rather than counting as `ignored/deleted`. Passing `--version` or `-v` prints the resolved package version (e.g. `1.6.0`) and exits `0`.
 * **Monorepo `pnpm strict` Non-Hoisting Limitation (`SPEC §6.2a`):** On `pnpm` repositories that disable dependency hoisting, importing a dependency declared only in the repository root `package.json` from a nested workspace package will fail at runtime under strict `pnpm`, whereas DevGuard resolves it as `resolvedVia: root` for cross-mode determinism (`DG004` detects fictitious/hallucinated package names, and root-declared packages are real dependencies). Intermediate ancestor manifests and sibling package dependencies are never merged (`A6-9`, `A6-12`).
 * **Shallow Clone (`fetch-depth: 1`) Base-Ref Fallback & Notice (`[DG004-WS-SHALLOW]`):** When CI runs with default `fetch-depth: 1` and `origin/<baseRef>` cannot be fetched, DevGuard fails closed to `0` admitted base workspace packages (preventing PR-injected bypasses) and surfaces an explicit non-scoring `[DG004-WS-SHALLOW]` notice in the sticky PR comment reminding developers to configure `fetch-depth: 0` on `actions/checkout@v4`.
+* **MCP Server Read-Only Scope (`SPEC §8.3`):** `devguard mcp` is intentionally read-only and offline in `v1.6.0` (no auto-fix file writes, no shell execution, no network calls). `devguard_check_snippet` runs in single-file mode (`workspacesMode: 'off'`) without monorepo workspace resolution; use `devguard_check_files` for workspace-aware audits. Core `defenseInDepth` advisory strings remain in their original Indonesian phrasing inside `files[].defenseInDepth` while MCP protocol/error/boundary metadata is English.
+
+### Behavior Changes from `v1.5.0` to `v1.6.0`
+* **Zero-Dependency MCP Server (`src/adapters/mcp/`, SPEC Stage 8):** Added `devguard mcp [--workspace <dir>]` implementing a custom stdio JSON-RPC 2.0 server with strict `initialize` protocol version negotiation (`2025-11-25`, `2025-06-18`, `2025-03-26`, `2024-11-05`) and three read-only tools (`devguard_check_files`, `devguard_check_snippet`, `devguard_explain_rule`), verified end-to-end with `@modelcontextprotocol/inspector@0.16.8` (`A8-1`–`A8-5`).
+* **MCP Security Controls (`SPEC §8.3`):** Enforces fail-closed workspace path jailing (`resolveJailedWorkspacePath`), prompt-injection isolation (`quoted_source` + `security_boundary`), secret redaction (`INV-3`), `1 MiB` streaming stdin buffer capping with mid-stream discard, and `512 KiB` structured JSON output bounding.
+* **Audit Waves 1–3 Hardening:** Enforced Pre-LLM redaction gate and `1 MiB` cap on `/api/devguard/review`, purified CLI `--format sarif` stdout, added NUL-safe git diff parsing (`-z`, `core.quotePath=false`), strict CLI flag value validation (`exit 2` on I/O & flag errors), TOCTOU comment-bypass defense (`DG006`), `DG003` threshold parity, `residualNotes` preservation, and multi-line `Pass-V` remapping (`Tests 92–93`).
 
 ### Behavior Changes from `v1.4.0` to `v1.5.0`
 * **Headless Core Engine Architecture (`src/core/`, SPEC Stage 7):** Full separation of analyzer core logic (`src/core/analyzer.ts`), rule suites (`src/core/rules/`), types (`src/core/types.ts`), and SARIF formatting (`src/core/sarif.ts`) from GitHub Action runtime, verified with byte-for-byte SARIF parity (`Test 88`).
@@ -388,7 +417,7 @@ See also [docs/benchmarks/realworld-2026-11-16.md](docs/benchmarks/realworld-202
 
 ## 🧪 Local Development & Verification
 
-DevGuard enforces a strict zero-dependency test harness using Node's built-in assertion & test runner (`node:test` compiled via `tsconfig.test.json` and executed in-process), currently verified at **92 passing test scenarios** across [tests/corpus.test.ts](tests/corpus.test.ts) (`Corpus Benchmark`) and [tests/integration.test.ts](tests/integration.test.ts) (`Tests 1–91`):
+DevGuard enforces a strict zero-dependency test harness using Node's built-in assertion & test runner (`node:test` compiled via `tsconfig.test.json` and executed in-process), currently verified at **94 passing test scenarios** across [tests/corpus.test.ts](tests/corpus.test.ts) (`Corpus Benchmark`) and [tests/integration.test.ts](tests/integration.test.ts) (`Tests 1–93`):
 
 ```bash
 # 1. Typecheck application, CLI, & tests
@@ -397,7 +426,7 @@ npm run lint
 # 2. Build standalone web UI bundle & CLI binary (dist/cli.js)
 npm run build
 
-# 3. Run zero-dependency benchmark + integration test suite (92 passing scenarios)
+# 3. Run zero-dependency benchmark + integration test suite (94 passing scenarios)
 npm test
 
 # 4. Print DevGuard CLI version cleanly
