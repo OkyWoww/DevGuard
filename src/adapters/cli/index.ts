@@ -22,6 +22,7 @@ import { getCliUsageText, parseCliArgs } from './args.ts';
 import { formatCliOutput, type CliCheckResult } from './formatters.ts';
 import { getChangedFilesSince, getStagedFiles } from './git.ts';
 import { installPreCommitHook } from './hook.ts';
+import { startMcpStdioServer } from '../mcp/index.ts';
 
 const MAX_AUDIT_FILE_SIZE = 1_048_576; // 1 MiB ReDoS safety limit
 const ALLOWED_ALLOWLIST_RULES = new Set<string>([
@@ -281,6 +282,26 @@ export function runCli(argv: readonly string[], io?: CliIo): number {
       return 2;
     }
     writeOut(`DevGuard pre-commit hook (${hookRes.status}): ${hookRes.hookPath}\n`);
+    return 0;
+  }
+  if (parsed.kind === 'mcp') {
+    const workspaceRoot = parsed.workspaceRoot ? path.resolve(cwd, parsed.workspaceRoot) : cwd;
+    try {
+      const stat = fs.statSync(workspaceRoot);
+      if (!stat.isDirectory()) {
+        writeErr(`Error: MCP workspace root is not a directory: ${workspaceRoot}\n`);
+        return 2;
+      }
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      writeErr(`Error: Unable to access MCP workspace root "${workspaceRoot}": ${reason}\n`);
+      return 2;
+    }
+    startMcpStdioServer({
+      workspaceRoot,
+      output: { write: writeOut },
+      stderr: { write: writeErr },
+    });
     return 0;
   }
 
