@@ -8,6 +8,7 @@ export interface CodeEditorPaneProps {
   fileName: string;
   language: string;
   activeLine: number | null;
+  flaggedLines?: ReadonlySet<number>;
   runState: AuditRunState;
   timeoutMs: number;
   onCodeChange: (nextCode: string) => void;
@@ -29,6 +30,7 @@ const PANE_COPY: Record<
     shortcutHint: string;
     linesLabel: string;
     activeLineLabel: string;
+    flaggedLabel: string;
     timeoutLabel: string;
     stateLabel: Record<AuditRunState, string>;
   }
@@ -41,6 +43,7 @@ const PANE_COPY: Record<
     shortcutHint: 'Ctrl/Cmd + Enter to run',
     linesLabel: 'Lines',
     activeLineLabel: 'Focus',
+    flaggedLabel: 'Flagged',
     timeoutLabel: 'Timeout',
     stateLabel: {
       idle: 'IDLE',
@@ -57,6 +60,7 @@ const PANE_COPY: Record<
     shortcutHint: 'Ctrl/Cmd + Enter untuk audit',
     linesLabel: 'Baris',
     activeLineLabel: 'Fokus',
+    flaggedLabel: 'Bermasalah',
     timeoutLabel: 'Batas Waktu',
     stateLabel: {
       idle: 'SIAGA',
@@ -72,6 +76,7 @@ export const CodeEditorPane: React.FC<CodeEditorPaneProps> = ({
   fileName,
   language,
   activeLine,
+  flaggedLines,
   runState,
   timeoutMs,
   onCodeChange,
@@ -87,6 +92,7 @@ export const CodeEditorPane: React.FC<CodeEditorPaneProps> = ({
 
   const lines = code.split('\n');
   const lineCount = Math.max(1, lines.length);
+  const flaggedCount = flaggedLines ? flaggedLines.size : 0;
 
   const syncScroll = () => {
     if (gutterRef.current && textareaRef.current) {
@@ -95,10 +101,10 @@ export const CodeEditorPane: React.FC<CodeEditorPaneProps> = ({
   };
 
   useEffect(() => {
-    if (activeLine === null || activeLine < 1 || !textareaRef.current) {
+    if (activeLine === null || !Number.isFinite(activeLine) || !textareaRef.current) {
       return;
     }
-    const clampedLine = Math.min(activeLine, lineCount);
+    const clampedLine = Math.min(Math.max(1, Math.trunc(activeLine)), lineCount);
     let charOffset = 0;
     for (let i = 0; i < clampedLine - 1; i++) {
       charOffset += lines[i].length + 1;
@@ -122,7 +128,7 @@ export const CodeEditorPane: React.FC<CodeEditorPaneProps> = ({
 
   const handleGutterClick = (lineNumber: number) => {
     if (!textareaRef.current) return;
-    const clampedLine = Math.min(lineNumber, lineCount);
+    const clampedLine = Math.min(Math.max(1, lineNumber), lineCount);
     let charOffset = 0;
     for (let i = 0; i < clampedLine - 1; i++) {
       charOffset += lines[i].length + 1;
@@ -187,18 +193,24 @@ export const CodeEditorPane: React.FC<CodeEditorPaneProps> = ({
           {Array.from({ length: lineCount }, (_, index) => {
             const lineNumber = index + 1;
             const isActive = activeLine === lineNumber;
+            const isFlagged = flaggedLines ? flaggedLines.has(lineNumber) : false;
             return (
               <div
                 key={lineNumber}
                 onClick={() => handleGutterClick(lineNumber)}
                 style={{ height: `${LINE_HEIGHT_PX}px`, lineHeight: `${LINE_HEIGHT_PX}px` }}
-                className={`cursor-pointer pr-2.5 transition-colors ${
+                className={`flex cursor-pointer items-center justify-end gap-1 pr-2 transition-colors ${
                   isActive
                     ? 'border-r-2 border-emerald-400 bg-emerald-500/15 font-semibold text-emerald-300'
-                    : 'hover:text-slate-300'
+                    : isFlagged
+                      ? 'bg-rose-500/10 text-rose-300 hover:bg-rose-500/15'
+                      : 'hover:text-slate-300'
                 }`}
               >
-                {lineNumber}
+                {isFlagged && (
+                  <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-rose-500" />
+                )}
+                <span>{lineNumber}</span>
               </div>
             );
           })}
@@ -228,6 +240,12 @@ export const CodeEditorPane: React.FC<CodeEditorPaneProps> = ({
           <span>
             {copy.linesLabel}: {lineCount}
           </span>
+          {flaggedCount > 0 && (
+            <span className="inline-flex items-center gap-1.5 text-rose-300">
+              <span className="h-1.5 w-1.5 rounded-full bg-rose-500" aria-hidden="true" />
+              {copy.flaggedLabel}: {flaggedCount}
+            </span>
+          )}
           {activeLine !== null && (
             <span className="text-emerald-400">
               {copy.activeLineLabel}: L{activeLine}

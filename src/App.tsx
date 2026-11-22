@@ -10,6 +10,7 @@ import { CommandBar } from './components/CommandBar';
 import { CodeEditorPane } from './components/CodeEditorPane';
 import { AuditResultsPane } from './components/AuditResultsPane';
 import type {
+  AuditEngineSource,
   AuditErrorInfo,
   AuditFinding,
   AuditNotice,
@@ -56,6 +57,12 @@ function inferLanguageFromFileName(fileName: string, fallback: string): string {
   }
   if (lower.endsWith('.py')) return 'Python';
   return fallback;
+}
+
+function clampLine(line: number, totalLines: number): number {
+  const safeTotal = Math.max(1, totalLines);
+  if (!Number.isFinite(line)) return 1;
+  return Math.min(Math.max(1, Math.trunc(line)), safeTotal);
 }
 
 function extractFirstLineNumber(text: string): number {
@@ -132,7 +139,8 @@ function buildSarifExport(
 function normalizeParsedReport(
   parsed: ParsedDevGuardReport,
   fileName: string,
-  durationMs: number
+  durationMs: number,
+  engineSource: AuditEngineSource
 ): AuditReport {
   const findings: AuditFinding[] = [];
   const notices: AuditNotice[] = [];
@@ -208,6 +216,7 @@ function normalizeParsedReport(
     notices,
     rawSarif: buildSarifExport(fileName, findings, notices),
     durationMs,
+    engineSource,
   };
 }
 
@@ -243,13 +252,33 @@ export default function App() {
   const [language, setLanguage] = useState<string>(initialPreset.language);
   const [runState, setRunState] = useState<AuditRunState>('idle');
   const [report, setReport] = useState<AuditReport | null>(null);
+  const [engineSource, setEngineSource] = useState<AuditEngineSource | null>(null);
   const [error, setError] = useState<AuditErrorInfo | null>(null);
   const [activeLine, setActiveLine] = useState<number | null>(null);
-  const [selectedFindingId, setSelectedFindingId] = useState<string | null>(null);
+  const [selectedFindingKey, setSelectedFindingKey] = useState<string | null>(null);
+
+  const totalLines = useMemo(() => Math.max(1, code.split('\n').length), [code]);
+
+  const flaggedLines = useMemo<ReadonlySet<number>>(() => {
+    if (!report) return new Set<number>();
+    const linesSet = new Set<number>();
+    for (const finding of report.findings) {
+      if (finding.blocking && Number.isFinite(finding.line) && finding.line >= 1) {
+        linesSet.add(clampLine(finding.line, totalLines));
+      }
+    }
+    return linesSet;
+  }, [report, totalLines]);
 
   const handleLocaleChange = useCallback((nextLocale: WorkbenchLocale) => {
     setLocale(nextLocale);
     persistLocale(nextLocale);
+  }, []);
+
+  const handleCodeChange = useCallback((nextCode: string) => {
+    setCode(nextCode);
+    setActiveLine(null);
+    setSelectedFindingKey(null);
   }, []);
 
   const handleSelectPreset = useCallback(
@@ -262,9 +291,10 @@ export default function App() {
       setLanguage(target.language);
       setRunState('idle');
       setReport(null);
+      setEngineSource(null);
       setError(null);
       setActiveLine(null);
-      setSelectedFindingId(null);
+      setSelectedFindingKey(null);
     },
     [presets]
   );
@@ -278,15 +308,19 @@ export default function App() {
     setCode('');
     setRunState('idle');
     setReport(null);
+    setEngineSource(null);
     setError(null);
     setActiveLine(null);
-    setSelectedFindingId(null);
+    setSelectedFindingKey(null);
   }, []);
 
   const handleRunAudit = useCallback(async () => {
     if (code.trim().length === 0) {
       setRunState('error');
       setReport(null);
+      setEngineSource(null);
+      setActiveLine(null);
+      setSelectedFindingKey(null);
       setError({
         code: 'INVALID_INPUT',
         message:
@@ -301,7 +335,8 @@ export default function App() {
     const startedAt = performance.now();
     setRunState('running');
     setError(null);
-    setSelectedFindingId(null);
+    setActiveLine(null);
+    setSelectedFindingKey(null);
 
     try {
       const response = await fetch('/api/devguard/review', {
@@ -314,6 +349,7 @@ export default function App() {
       if (!response.ok) {
         setRunState('error');
         setReport(null);
+        setEngineSource(null);
         setError({
           code: 'HTTP_ERROR',
           message:
@@ -326,11 +362,14 @@ export default function App() {
       }
 
       const payload = (await response.json()) as { parsedReport?: ParsedDevGuardReport };
+      const hasLiveReport = Boolean(payload.parsedReport);
+      const source: AuditEngineSource = hasLiveReport ? 'live' : 'offline';
       const parsed =
         payload.parsedReport ??
         analyzeCodeDeterministically(code, { filePath: fileName });
       const durationMs = Math.max(1, Math.round(performance.now() - startedAt));
-      setReport(normalizeParsedReport(parsed, fileName, durationMs));
+      setEngineSource(source);
+      setReport(normalizeParsedReport(parsed, fileName, durationMs, source));
       setRunState('success');
     } catch (caught: unknown) {
       const isTimeout =
@@ -340,6 +379,7 @@ export default function App() {
       if (isTimeout) {
         setRunState('error');
         setReport(null);
+        setEngineSource(null);
         setError({
           code: 'TIMEOUT',
           message:
@@ -355,11 +395,13 @@ export default function App() {
       try {
         const localParsed = analyzeCodeDeterministically(code, { filePath: fileName });
         const durationMs = Math.max(1, Math.round(performance.now() - startedAt));
-        setReport(normalizeParsedReport(localParsed, fileName, durationMs));
+        setEngineSource('offline');
+        setReport(normalizeParsedReport(localParsed, fileName, durationMs, 'offline'));
         setRunState('success');
       } catch (fallbackErr: unknown) {
         setRunState('error');
         setReport(null);
+        setEngineSource(null);
         setError({
           code: 'NETWORK',
           message:
@@ -386,16 +428,24 @@ export default function App() {
     [fileName, report]
   );
 
-  const handleSelectFinding = useCallback((finding: AuditFinding) => {
-    setSelectedFindingId(finding.id);
-    setActiveLine(finding.line);
-  }, []);
+  const handleSelectFinding = useCallback(
+    (finding: AuditFinding) => {
+      const safeLine = clampLine(finding.line, totalLines);
+      setSelectedFindingKey(`${finding.id}:${finding.line}`);
+      setActiveLine(safeLine);
+    },
+    [totalLines]
+  );
 
-  const handleSelectNoticeLine = useCallback((notice: AuditNotice) => {
-    if (typeof notice.line === 'number' && notice.line > 0) {
-      setActiveLine(notice.line);
-    }
-  }, []);
+  const handleSelectNoticeLine = useCallback(
+    (notice: AuditNotice) => {
+      if (typeof notice.line === 'number' && notice.line > 0) {
+        setSelectedFindingKey(null);
+        setActiveLine(clampLine(notice.line, totalLines));
+      }
+    },
+    [totalLines]
+  );
 
   return (
     <div className="flex min-h-screen flex-col bg-[#0A0E17] font-sans text-slate-100">
@@ -419,9 +469,10 @@ export default function App() {
             fileName={fileName}
             language={language}
             activeLine={activeLine}
+            flaggedLines={flaggedLines}
             runState={runState}
             timeoutMs={AUDIT_TIMEOUT_MS}
-            onCodeChange={setCode}
+            onCodeChange={handleCodeChange}
             onFileNameChange={handleFileNameChange}
             onClearCode={handleClearCode}
             onRunShortcut={handleRunAudit}
@@ -434,7 +485,8 @@ export default function App() {
             runState={runState}
             report={report}
             error={error}
-            selectedFindingId={selectedFindingId}
+            selectedFindingKey={selectedFindingKey}
+            engineSource={engineSource}
             onSelectFinding={handleSelectFinding}
             onSelectNoticeLine={handleSelectNoticeLine}
             onRetry={handleRunAudit}

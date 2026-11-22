@@ -9,6 +9,7 @@ import {
   ShieldAlert,
 } from 'lucide-react';
 import type {
+  AuditEngineSource,
   AuditErrorInfo,
   AuditFinding,
   AuditNotice,
@@ -23,7 +24,8 @@ export interface AuditResultsPaneProps {
   runState: AuditRunState;
   report: AuditReport | null;
   error: AuditErrorInfo | null;
-  selectedFindingId: string | null;
+  selectedFindingKey: string | null;
+  engineSource?: AuditEngineSource | null;
   onSelectFinding: (finding: AuditFinding) => void;
   onSelectNoticeLine: (notice: AuditNotice) => void;
   onRetry: () => void;
@@ -126,13 +128,15 @@ export const AuditResultsPane: React.FC<AuditResultsPaneProps> = ({
   runState,
   report,
   error,
-  selectedFindingId,
+  selectedFindingKey,
+  engineSource,
   onSelectFinding,
   onSelectNoticeLine,
   onRetry,
   locale = 'en',
 }) => {
   const copy = COPY[locale];
+  const resolvedEngineSource = engineSource ?? report?.engineSource ?? null;
 
   const renderBody = () => {
     if (runState === 'running') {
@@ -263,18 +267,18 @@ export const AuditResultsPane: React.FC<AuditResultsPaneProps> = ({
           ) : (
             <ul className="space-y-1.5">
               {blockingFindings.map((finding, index) => {
-                const selectionKey = `${finding.id}-${finding.line}-${index}`;
-                const isSelected =
-                  selectedFindingId === finding.id || selectedFindingId === selectionKey;
+                const findingKey = `${finding.id}:${finding.line}`;
+                const isSelected = selectedFindingKey === findingKey;
                 const locationText =
                   typeof finding.column === 'number'
                     ? `L${finding.line}:${finding.column}`
                     : `L${finding.line}`;
 
                 return (
-                  <li key={selectionKey}>
+                  <li key={`${findingKey}:${index}`}>
                     <button
                       type="button"
+                      aria-pressed={isSelected}
                       onClick={() => onSelectFinding(finding)}
                       title={`${copy.jumpHint} ${finding.line}`}
                       className={`w-full rounded-md border px-3 py-2.5 text-left transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-emerald-400 ${
@@ -327,37 +331,46 @@ export const AuditResultsPane: React.FC<AuditResultsPaneProps> = ({
               </span>
             </div>
             <ul className="space-y-1.5">
-              {advisoryFindings.map((finding, index) => (
-                <li key={`${finding.id}-adv-${finding.line}-${index}`}>
-                  <button
-                    type="button"
-                    onClick={() => onSelectFinding(finding)}
-                    className="w-full rounded-md border border-slate-800 bg-[#0A0E17] px-3 py-2 text-left transition-colors hover:border-slate-700 hover:bg-slate-900/70 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-emerald-400"
-                  >
-                    <div className="flex items-center justify-between gap-2">
-                      <div className="flex items-center gap-2">
-                        <span className="font-mono text-xs font-semibold text-slate-200">
-                          {finding.id}
+              {advisoryFindings.map((finding, index) => {
+                const findingKey = `${finding.id}:${finding.line}`;
+                const isSelected = selectedFindingKey === findingKey;
+                return (
+                  <li key={`${findingKey}:adv:${index}`}>
+                    <button
+                      type="button"
+                      aria-pressed={isSelected}
+                      onClick={() => onSelectFinding(finding)}
+                      className={`w-full rounded-md border px-3 py-2 text-left transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-emerald-400 ${
+                        isSelected
+                          ? 'border-emerald-500/60 bg-slate-900'
+                          : 'border-slate-800 bg-[#0A0E17] hover:border-slate-700 hover:bg-slate-900/70'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="flex items-center gap-2">
+                          <span className="font-mono text-xs font-semibold text-slate-200">
+                            {finding.id}
+                          </span>
+                          <span
+                            className={`rounded border px-1.5 py-0.5 font-mono text-[10px] uppercase ${severityBadgeClasses(
+                              finding.severity
+                            )}`}
+                          >
+                            {finding.severity}
+                          </span>
+                          <span className="text-xs text-slate-400">{finding.ruleTitle}</span>
+                        </div>
+                        <span className="font-mono text-[11px] text-slate-400">
+                          L{finding.line}
                         </span>
-                        <span
-                          className={`rounded border px-1.5 py-0.5 font-mono text-[10px] uppercase ${severityBadgeClasses(
-                            finding.severity
-                          )}`}
-                        >
-                          {finding.severity}
-                        </span>
-                        <span className="text-xs text-slate-400">{finding.ruleTitle}</span>
                       </div>
-                      <span className="font-mono text-[11px] text-slate-400">
-                        L{finding.line}
-                      </span>
-                    </div>
-                    <p className="mt-1 text-xs leading-relaxed text-slate-400">
-                      {finding.message}
-                    </p>
-                  </button>
-                </li>
-              ))}
+                      <p className="mt-1 text-xs leading-relaxed text-slate-400">
+                        {finding.message}
+                      </p>
+                    </button>
+                  </li>
+                );
+              })}
             </ul>
           </div>
         )}
@@ -430,11 +443,24 @@ export const AuditResultsPane: React.FC<AuditResultsPaneProps> = ({
       aria-label={copy.paneTitle}
       className="flex min-h-[540px] flex-col rounded-lg border border-slate-800 bg-[#0D1117]"
     >
-      <div className="flex items-center justify-between border-b border-slate-800 px-3.5 py-2.5">
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 px-3.5 py-2.5">
         <h2 className="text-xs font-semibold uppercase tracking-wider text-slate-200">
           {copy.paneTitle}
         </h2>
-        <span className="font-mono text-[11px] text-slate-500">SARIF v2.1.0</span>
+        <div className="flex items-center gap-2 font-mono text-[11px]">
+          {resolvedEngineSource && (
+            <span
+              className={`rounded border px-1.5 py-0.5 text-[10px] ${
+                resolvedEngineSource === 'live'
+                  ? 'border-emerald-500/40 bg-emerald-950/30 text-emerald-300'
+                  : 'border-slate-700 bg-slate-900 text-slate-300'
+              }`}
+            >
+              {resolvedEngineSource === 'live' ? 'Engine: Live' : 'Engine: Local Offline'}
+            </span>
+          )}
+          <span className="text-slate-500">SARIF v2.1.0</span>
+        </div>
       </div>
       {renderBody()}
     </section>

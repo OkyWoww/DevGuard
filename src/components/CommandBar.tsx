@@ -1,5 +1,5 @@
-import React from 'react';
-import { Download, Play, RefreshCw, ShieldCheck } from 'lucide-react';
+import React, { useEffect, useRef, useState } from 'react';
+import { Check, Download, Play, RefreshCw, ShieldCheck } from 'lucide-react';
 import type {
   AuditRunState,
   CodePreset,
@@ -20,6 +20,8 @@ export interface CommandBarProps {
   onExport: (format: ExportFormat) => void;
 }
 
+const EXPORT_FEEDBACK_MS = 1500;
+
 const LABELS: Record<
   WorkbenchLocale,
   {
@@ -29,6 +31,7 @@ const LABELS: Record<
     running: string;
     exportJson: string;
     exportSarif: string;
+    saved: string;
     langGroupLabel: string;
   }
 > = {
@@ -39,6 +42,7 @@ const LABELS: Record<
     running: 'Auditing...',
     exportJson: 'JSON',
     exportSarif: 'SARIF',
+    saved: 'Saved',
     langGroupLabel: 'Language switcher',
   },
   id: {
@@ -48,6 +52,7 @@ const LABELS: Record<
     running: 'Mengaudit...',
     exportJson: 'JSON',
     exportSarif: 'SARIF',
+    saved: 'Saved',
     langGroupLabel: 'Pengalih bahasa',
   },
 };
@@ -66,6 +71,29 @@ export const CommandBar: React.FC<CommandBarProps> = ({
 }) => {
   const copy = LABELS[locale];
   const isRunning = runState === 'running';
+  const [savedFormat, setSavedFormat] = useState<ExportFormat | null>(null);
+  const savedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (savedTimerRef.current !== null) {
+        clearTimeout(savedTimerRef.current);
+        savedTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  const handleExportClick = (format: ExportFormat) => {
+    onExport(format);
+    if (savedTimerRef.current !== null) {
+      clearTimeout(savedTimerRef.current);
+    }
+    setSavedFormat(format);
+    savedTimerRef.current = setTimeout(() => {
+      setSavedFormat(null);
+      savedTimerRef.current = null;
+    }, EXPORT_FEEDBACK_MS);
+  };
 
   return (
     <header className="sticky top-0 z-40 border-b border-slate-800 bg-[#0D1117] px-4 py-2.5 lg:px-6">
@@ -147,24 +175,30 @@ export const CommandBar: React.FC<CommandBarProps> = ({
 
           {/* Export Actions */}
           <div className="flex items-center gap-1">
-            <button
-              type="button"
-              disabled={!canExport || isRunning}
-              onClick={() => onExport('json')}
-              className="inline-flex h-8 items-center gap-1.5 rounded-md border border-slate-700 bg-slate-900 px-2.5 font-mono text-[11px] font-medium text-slate-200 transition-colors hover:border-slate-600 hover:bg-slate-800 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-emerald-400 disabled:cursor-not-allowed disabled:opacity-40"
-            >
-              <Download className="h-3 w-3 text-slate-400" aria-hidden="true" />
-              <span>{copy.exportJson}</span>
-            </button>
-            <button
-              type="button"
-              disabled={!canExport || isRunning}
-              onClick={() => onExport('sarif')}
-              className="inline-flex h-8 items-center gap-1.5 rounded-md border border-slate-700 bg-slate-900 px-2.5 font-mono text-[11px] font-medium text-slate-200 transition-colors hover:border-slate-600 hover:bg-slate-800 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-emerald-400 disabled:cursor-not-allowed disabled:opacity-40"
-            >
-              <Download className="h-3 w-3 text-slate-400" aria-hidden="true" />
-              <span>{copy.exportSarif}</span>
-            </button>
+            {(['json', 'sarif'] as const).map((format) => {
+              const isSaved = savedFormat === format;
+              const labelText = format === 'json' ? copy.exportJson : copy.exportSarif;
+              return (
+                <button
+                  key={format}
+                  type="button"
+                  disabled={!canExport || isRunning}
+                  onClick={() => handleExportClick(format)}
+                  className={`inline-flex h-8 items-center gap-1.5 rounded-md border px-2.5 font-mono text-[11px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-emerald-400 disabled:cursor-not-allowed disabled:opacity-40 ${
+                    isSaved
+                      ? 'border-emerald-500/50 bg-emerald-950/40 text-emerald-300'
+                      : 'border-slate-700 bg-slate-900 text-slate-200 hover:border-slate-600 hover:bg-slate-800'
+                  }`}
+                >
+                  {isSaved ? (
+                    <Check className="h-3 w-3 text-emerald-400" aria-hidden="true" />
+                  ) : (
+                    <Download className="h-3 w-3 text-slate-400" aria-hidden="true" />
+                  )}
+                  <span>{isSaved ? copy.saved : labelText}</span>
+                </button>
+              );
+            })}
           </div>
 
           {/* Primary Audit Trigger */}
