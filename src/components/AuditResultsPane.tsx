@@ -498,12 +498,18 @@ export const AuditResultsPane: React.FC<AuditResultsPaneProps> = ({
               {advisoryFindings.map((finding, index) => {
                 const findingKey = `${finding.id}:${finding.line}`;
                 const isSelected = selectedFindingKey === findingKey;
+                const locationText =
+                  typeof finding.column === 'number'
+                    ? `L${finding.line}:${finding.column}`
+                    : `L${finding.line}`;
+
                 return (
                   <li key={`${findingKey}:adv:${index}`}>
                     <button
                       type="button"
                       aria-pressed={isSelected}
                       onClick={() => onSelectFinding(finding)}
+                      title={`${copy.jumpHint} ${finding.line}`}
                       className={`w-full rounded-md border px-3 py-2 text-left transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-emerald-400 ${
                         isSelected
                           ? 'border-emerald-500/60 bg-slate-900'
@@ -527,7 +533,7 @@ export const AuditResultsPane: React.FC<AuditResultsPaneProps> = ({
                           </span>
                         </div>
                         <span className="font-mono text-[11px] text-slate-400">
-                          L{finding.line}
+                          {locationText}
                         </span>
                       </div>
                       <p className="mt-1 text-xs leading-relaxed text-slate-400">
