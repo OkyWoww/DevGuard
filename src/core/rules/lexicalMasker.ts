@@ -71,11 +71,12 @@ export interface ExtractedStringLiteral {
 }
 
 const REGEX_PRECEDING_CHARS = new Set([
-  '', '\n', '(', '[', '{', ',', ';', '=', ':', '?', '!', '&', '|', '^', '~', '+', '-', '*', '%', '<', '>',
+  '(', '[', '{', ',', ';', '=', ':', '?', '!', '&', '|', '^', '~', '+', '-', '*', '%', '<', '>',
 ]);
 const REGEX_PRECEDING_KEYWORDS = new Set([
-  'return', 'typeof', 'void', 'delete', 'await', 'throw', 'case', 'in', 'of', 'instanceof', 'new', 'else', 'do', 'yield', 'export', 'default',
+  'return', 'typeof', 'void', 'delete', 'await', 'throw', 'case', 'in', 'of', 'instanceof', 'new', 'else', 'do', 'yield', 'export', 'default', 'as', 'satisfies',
 ]);
+const CONTROL_PAREN_KEYWORDS = new Set(['if', 'while', 'for', 'with']);
 export const CRITICAL_FLOW_IDENTIFIERS = [
   'payment', 'balance', 'wallet', 'ledger', 'transfer', 'charge',
   'refund', 'deduct', 'invoice', 'auth', 'token', 'jwt', 'password',
@@ -129,7 +130,7 @@ function flushPendingSuppressions(
   }
 }
 
-function skipQuotedLiteral(
+function skipSingleOrDoubleQuotedLiteral(
   rawCode: string,
   out: string[],
   startIdx: number,
@@ -137,9 +138,10 @@ function skipQuotedLiteral(
 ): { nextIdx: number; endLine: number; literal: ExtractedStringLiteral } {
   const quote = rawCode[startIdx];
   let line = startLine;
-  let hasInterpolation = false;
   if (out[startIdx] !== '\n') out[startIdx] = ' ';
   let i = startIdx + 1;
+  let closed = false;
+
   while (i < rawCode.length) {
     const ch = rawCode[i];
     if (ch === '\\' && i + 1 < rawCode.length) {
@@ -150,24 +152,299 @@ function skipQuotedLiteral(
       i++;
       continue;
     }
-    if (quote === '`' && ch === '$' && rawCode[i + 1] === '{') hasInterpolation = true;
     if (ch === quote) {
       if (out[i] !== '\n') out[i] = ' ';
+      closed = true;
       break;
     }
     if (ch === '\n') {
-      if (quote !== '`') break;
-      line++;
-    } else if (out[i] !== '\n') out[i] = ' ';
+      // Stop BEFORE '\n' so the outer loop advances line count and resets line state cleanly
+      break;
+    }
+    if (out[i] !== '\n') out[i] = ' ';
     i++;
   }
-  const endOffset = Math.min(rawCode.length, i + 1);
+
+  const endOffset = closed ? i + 1 : i;
+  const nextIdx = closed ? i : i - 1;
   return {
-    nextIdx: i,
+    nextIdx,
     endLine: line,
     literal: {
-      value: rawCode.slice(startIdx + 1, rawCode[endOffset - 1] === quote ? endOffset - 1 : endOffset),
+      value: rawCode.slice(startIdx + 1, closed ? endOffset - 1 : endOffset),
       quote,
+      line: startLine,
+      endLine: line,
+      startOffset: startIdx,
+      endOffset,
+      hasInterpolation: false,
+    },
+  };
+}
+
+function skipRegexLiteral(
+  rawCode: string,
+  out: string[],
+  startIdx: number
+): { nextIdx: number; endOffset: number } {
+  if (out[startIdx] !== '\n') out[startIdx] = ' ';
+  let i = startIdx + 1;
+  let inClass = false;
+  let closed = false;
+
+  while (i < rawCode.length && rawCode[i] !== '\n') {
+    const ch = rawCode[i];
+    if (out[i] !== '\n') out[i] = ' ';
+    if (ch === '\\' && i + 1 < rawCode.length && rawCode[i + 1] !== '\n') {
+      i++;
+      if (out[i] !== '\n') out[i] = ' ';
+    } else if (ch === '[' && !inClass) {
+      inClass = true;
+    } else if (ch === ']' && inClass) {
+      inClass = false;
+    } else if (ch === '/' && !inClass) {
+      closed = true;
+      while (i + 1 < rawCode.length && /[a-z]/i.test(rawCode[i + 1])) {
+        i++;
+        if (out[i] !== '\n') out[i] = ' ';
+      }
+      break;
+    }
+    i++;
+  }
+
+  if (closed) {
+    return { nextIdx: i, endOffset: Math.min(rawCode.length, i + 1) };
+  }
+  // Unclosed regex hit '\n' or EOF: stop BEFORE '\n' so the outer loop handles '\n' cleanly
+  return { nextIdx: i - 1, endOffset: i };
+}
+
+type TemplateStackFrame =
+  | { kind: 'template' }
+  | {
+      kind: 'expr';
+      braceDepth: number;
+      canPrecedeRegex: boolean;
+      currentWord: string;
+      lastWord: string;
+      prevPunct: string;
+      parenIsControl: boolean[];
+    };
+
+/**
+ * Iteratively masks a template literal (including arbitrarily deep nested `${...}`
+ * expressions containing objects, strings, comments, regexes, and nested templates)
+ * without recursion, guaranteeing O(N) time and zero call-stack overflow.
+ */
+function skipTemplateLiteral(
+  rawCode: string,
+  out: string[],
+  startIdx: number,
+  startLine: number
+): { nextIdx: number; endLine: number; literal: ExtractedStringLiteral } {
+  let line = startLine;
+  let hasInterpolation = false;
+  if (out[startIdx] !== '\n') out[startIdx] = ' ';
+  let i = startIdx + 1;
+  let closed = false;
+  const stack: TemplateStackFrame[] = [{ kind: 'template' }];
+
+  while (i < rawCode.length && stack.length > 0) {
+    const top = stack[stack.length - 1];
+    const ch = rawCode[i];
+
+    if (top.kind === 'template') {
+      if (ch === '\\' && i + 1 < rawCode.length) {
+        if (out[i] !== '\n') out[i] = ' ';
+        i++;
+        if (rawCode[i] === '\n') line++;
+        else if (out[i] !== '\n') out[i] = ' ';
+        i++;
+        continue;
+      }
+      if (ch === '$' && rawCode[i + 1] === '{') {
+        hasInterpolation = true;
+        out[i] = ' ';
+        out[i + 1] = ' ';
+        i += 2;
+        stack.push({
+          kind: 'expr',
+          braceDepth: 1,
+          canPrecedeRegex: true,
+          currentWord: '',
+          lastWord: '',
+          prevPunct: '{',
+          parenIsControl: [],
+        });
+        continue;
+      }
+      if (ch === '`') {
+        out[i] = ' ';
+        stack.pop();
+        if (stack.length === 0) {
+          closed = true;
+          break;
+        }
+        const parent = stack[stack.length - 1];
+        if (parent.kind === 'expr') {
+          parent.canPrecedeRegex = false;
+          parent.currentWord = '';
+          parent.lastWord = '';
+          parent.prevPunct = '';
+        }
+        i++;
+        continue;
+      }
+      if (ch === '\n') line++;
+      else out[i] = ' ';
+      i++;
+      continue;
+    }
+
+    // Inside `${ ... }` expression frame
+    const next = rawCode[i + 1];
+    if (ch === '\n') {
+      line++;
+      if (top.currentWord) {
+        top.lastWord = top.currentWord;
+        top.canPrecedeRegex = REGEX_PRECEDING_KEYWORDS.has(top.lastWord);
+        top.currentWord = '';
+      }
+      i++;
+      continue;
+    }
+
+    if (ch === '/' && next === '/') {
+      if (top.currentWord) {
+        top.lastWord = top.currentWord;
+        top.canPrecedeRegex = REGEX_PRECEDING_KEYWORDS.has(top.lastWord);
+        top.currentWord = '';
+      }
+      while (i < rawCode.length && rawCode[i] !== '\n') {
+        out[i] = ' ';
+        i++;
+      }
+      continue;
+    }
+
+    if (ch === '/' && next === '*') {
+      if (top.currentWord) {
+        top.lastWord = top.currentWord;
+        top.canPrecedeRegex = REGEX_PRECEDING_KEYWORDS.has(top.lastWord);
+        top.currentWord = '';
+      }
+      out[i] = ' ';
+      out[i + 1] = ' ';
+      i += 2;
+      while (i < rawCode.length) {
+        if (rawCode[i] === '*' && rawCode[i + 1] === '/') {
+          out[i] = ' ';
+          out[i + 1] = ' ';
+          i += 2;
+          break;
+        }
+        if (rawCode[i] === '\n') line++;
+        else out[i] = ' ';
+        i++;
+      }
+      continue;
+    }
+
+    if (ch === '\'' || ch === '"') {
+      const innerStr = skipSingleOrDoubleQuotedLiteral(rawCode, out, i, line);
+      line = innerStr.endLine;
+      i = innerStr.nextIdx + 1;
+      top.canPrecedeRegex = false;
+      top.currentWord = '';
+      top.lastWord = '';
+      top.prevPunct = '';
+      continue;
+    }
+
+    if (ch === '`') {
+      out[i] = ' ';
+      i++;
+      stack.push({ kind: 'template' });
+      continue;
+    }
+
+    if (ch === '/') {
+      const canStartRegex = top.currentWord
+        ? REGEX_PRECEDING_KEYWORDS.has(top.currentWord)
+        : top.canPrecedeRegex;
+      if (canStartRegex) {
+        const rx = skipRegexLiteral(rawCode, out, i);
+        i = rx.nextIdx + 1;
+        top.canPrecedeRegex = false;
+        top.currentWord = '';
+        top.lastWord = '';
+        top.prevPunct = '';
+        continue;
+      }
+    }
+
+    out[i] = ' ';
+    if (ch === '{') {
+      top.braceDepth++;
+      top.currentWord = '';
+      top.lastWord = '';
+      top.canPrecedeRegex = true;
+      top.prevPunct = '{';
+    } else if (ch === '}') {
+      top.braceDepth--;
+      if (top.braceDepth === 0) {
+        stack.pop();
+      } else {
+        top.currentWord = '';
+        top.lastWord = '';
+        top.canPrecedeRegex = false;
+        top.prevPunct = '}';
+      }
+    } else if (/[A-Za-z0-9_$]/.test(ch)) {
+      top.currentWord += ch;
+      top.prevPunct = '';
+    } else if (/\s/.test(ch)) {
+      if (top.currentWord) {
+        top.lastWord = top.currentWord;
+        top.canPrecedeRegex = REGEX_PRECEDING_KEYWORDS.has(top.lastWord);
+        top.currentWord = '';
+      }
+    } else {
+      if (top.currentWord) {
+        top.lastWord = top.currentWord;
+        top.currentWord = '';
+      }
+      if (ch === '(') {
+        top.parenIsControl.push(CONTROL_PAREN_KEYWORDS.has(top.lastWord));
+        top.canPrecedeRegex = true;
+        top.prevPunct = '(';
+      } else if (ch === ')') {
+        top.canPrecedeRegex = top.parenIsControl.pop() ?? false;
+        top.prevPunct = ')';
+      } else if (
+        (ch === '+' && top.prevPunct === '+' && rawCode[i - 1] === '+') ||
+        (ch === '-' && top.prevPunct === '-' && rawCode[i - 1] === '-')
+      ) {
+        top.canPrecedeRegex = false;
+        top.prevPunct = ch + ch;
+      } else {
+        top.canPrecedeRegex = REGEX_PRECEDING_CHARS.has(ch);
+        top.prevPunct = ch;
+      }
+      top.lastWord = '';
+    }
+    i++;
+  }
+
+  const endOffset = closed ? i + 1 : i;
+  const nextIdx = closed ? i : i - 1;
+  return {
+    nextIdx,
+    endLine: line,
+    literal: {
+      value: rawCode.slice(startIdx + 1, closed ? endOffset - 1 : endOffset),
+      quote: '`',
       line: startLine,
       endLine: line,
       startOffset: startIdx,
@@ -177,29 +454,66 @@ function skipQuotedLiteral(
   };
 }
 
-function skipRegexLiteral(rawCode: string, out: string[], startIdx: number): number {
-  if (out[startIdx] !== '\n') out[startIdx] = ' ';
-  let i = startIdx + 1;
-  let inClass = false;
-  while (i < rawCode.length && rawCode[i] !== '\n') {
-    const ch = rawCode[i];
-    if (out[i] !== '\n') out[i] = ' ';
-    if (ch === '\\' && i + 1 < rawCode.length && rawCode[i + 1] !== '\n') {
-      i++;
-      if (out[i] !== '\n') out[i] = ' ';
-    } else if (ch === '[' && !inClass) inClass = true;
-    else if (ch === ']' && inClass) inClass = false;
-    else if (ch === '/' && !inClass) {
-      while (i + 1 < rawCode.length && /[a-z]/i.test(rawCode[i + 1])) {
-        i++;
-        if (out[i] !== '\n') out[i] = ' ';
-      }
-      break;
-    }
-    i++;
+const CLOSING_JSX_TAG_RE = /<\/([A-Za-z_$][\w$.:-]*)?\s*>/g;
+
+/**
+ * Collects JSX closing tag names ("" for fragments `</>`) in a single O(N) pass so
+ * JSX text tracking only activates for elements that actually have a closing tag,
+ * preventing false activation on TypeScript angle-bracket casts or generics.
+ */
+function collectClosingJsxTags(rawCode: string): Set<string> {
+  const tags = new Set<string>();
+  CLOSING_JSX_TAG_RE.lastIndex = 0;
+  let match: RegExpExecArray | null = CLOSING_JSX_TAG_RE.exec(rawCode);
+  while (match !== null) {
+    tags.add(match[1] ?? '');
+    match = CLOSING_JSX_TAG_RE.exec(rawCode);
   }
-  return i;
+  return tags;
 }
+
+function matchJsxOpeningTagName(rawCode: string, ltIdx: number): { tagName: string; nameEnd: number } | null {
+  if (rawCode[ltIdx] !== '<') return null;
+  if (rawCode[ltIdx + 1] === '>') {
+    return { tagName: '', nameEnd: ltIdx + 1 };
+  }
+  const first = rawCode[ltIdx + 1];
+  if (!first || !/[A-Za-z_$]/.test(first)) return null;
+  let j = ltIdx + 2;
+  while (j < rawCode.length && /[\w$.:-]/.test(rawCode[j])) {
+    j++;
+  }
+  const next = rawCode[j];
+  if (next === '>' || next === '/' || (next !== undefined && /\s/.test(next))) {
+    return { tagName: rawCode.slice(ltIdx + 1, j), nameEnd: j };
+  }
+  return null;
+}
+
+function matchJsxClosingTag(rawCode: string, ltIdx: number): { tagName: string; closeEnd: number } | null {
+  if (rawCode[ltIdx] !== '<' || rawCode[ltIdx + 1] !== '/') return null;
+  let j = ltIdx + 2;
+  const nameStart = j;
+  if (j < rawCode.length && /[A-Za-z_$]/.test(rawCode[j])) {
+    j++;
+    while (j < rawCode.length && /[\w$.:-]/.test(rawCode[j])) {
+      j++;
+    }
+  }
+  const tagName = rawCode.slice(nameStart, j);
+  while (j < rawCode.length && (rawCode[j] === ' ' || rawCode[j] === '\t')) {
+    j++;
+  }
+  if (rawCode[j] === '>') {
+    return { tagName, closeEnd: j };
+  }
+  return null;
+}
+
+type JsxFrame =
+  | { kind: 'jsxTag'; tagName: string }
+  | { kind: 'jsxText'; tagName: string }
+  | { kind: 'jsxExpr'; braceDepth: number };
 
 /** Returns true if and only if [start, end) falls strictly inside a single 'code' region. */
 export function isRangeStrictlyInCodeRegion(
@@ -269,78 +583,301 @@ export function analyzeLexicalStructure(
 
   let line = 1;
   let lineHadCode = false;
-  let prevNonWs = '';
+  let canPrecedeRegex = true;
   let currentWord = '';
   let lastWord = '';
+  let prevPunct = '';
+  const parenIsControl: boolean[] = [];
+  const closingJsxTags = allowHashComments ? new Set<string>() : collectClosingJsxTags(rawCode);
+  const jsxStack: JsxFrame[] = [];
 
   try {
     for (let i = 0; i < rawCode.length; i++) {
       const ch = rawCode[i];
       const next = rawCode[i + 1];
+      const jsxTop = jsxStack.length > 0 ? jsxStack[jsxStack.length - 1] : undefined;
+
+      // Inside JSX text children: apostrophes/quotes/slashes are literal UI text, not JS tokens
+      if (jsxTop && jsxTop.kind === 'jsxText') {
+        if (ch === '\n') {
+          line++;
+          lineHadCode = false;
+          continue;
+        }
+        if (ch === '{') {
+          flushPendingSuppressions(line, suppressions, pending);
+          lineHadCode = true;
+          jsxStack.push({ kind: 'jsxExpr', braceDepth: 1 });
+          canPrecedeRegex = true;
+          currentWord = '';
+          lastWord = '';
+          prevPunct = '{';
+          continue;
+        }
+        if (ch === '<') {
+          const closing = matchJsxClosingTag(rawCode, i);
+          if (closing) {
+            flushPendingSuppressions(line, suppressions, pending);
+            lineHadCode = true;
+            // Pop matching JSX text frame (or top frame on mismatched tag)
+            for (let s = jsxStack.length - 1; s >= 0; s--) {
+              const frame = jsxStack[s];
+              if (frame.kind === 'jsxText' && frame.tagName === closing.tagName) {
+                jsxStack.length = s;
+                break;
+              }
+            }
+            i = closing.closeEnd;
+            canPrecedeRegex = false;
+            currentWord = '';
+            lastWord = '';
+            prevPunct = '>';
+            continue;
+          }
+          const opening = matchJsxOpeningTagName(rawCode, i);
+          if (opening && closingJsxTags.has(opening.tagName)) {
+            flushPendingSuppressions(line, suppressions, pending);
+            lineHadCode = true;
+            jsxStack.push({ kind: 'jsxTag', tagName: opening.tagName });
+            i = opening.nameEnd - 1;
+            canPrecedeRegex = false;
+            currentWord = '';
+            lastWord = '';
+            prevPunct = '';
+            continue;
+          }
+        }
+        if (!/\s/.test(ch)) {
+          flushPendingSuppressions(line, suppressions, pending);
+          lineHadCode = true;
+        }
+        continue;
+      }
+
       if (ch === '\n') {
         line++;
         lineHadCode = false;
-        lastWord = currentWord || lastWord;
-        currentWord = '';
-        prevNonWs = '\n';
-      } else if ((ch === '/' && next === '/') || ((allowHashComments || (i === 0 && next === '!')) && ch === '#')) {
+        if (currentWord) {
+          lastWord = currentWord;
+          canPrecedeRegex = REGEX_PRECEDING_KEYWORDS.has(lastWord);
+          currentWord = '';
+        }
+        continue;
+      }
+
+      // Inside JSX opening tag header `<Tag attr="..." onClick={...}>`
+      if (jsxTop && jsxTop.kind === 'jsxTag') {
+        if (ch === '/' && next === '>') {
+          jsxStack.pop();
+          i++;
+          canPrecedeRegex = false;
+          currentWord = '';
+          lastWord = '';
+          prevPunct = '>';
+          continue;
+        }
+        if (ch === '>') {
+          jsxStack[jsxStack.length - 1] = { kind: 'jsxText', tagName: jsxTop.tagName };
+          canPrecedeRegex = false;
+          currentWord = '';
+          lastWord = '';
+          prevPunct = '>';
+          continue;
+        }
+        if (ch === '{') {
+          flushPendingSuppressions(line, suppressions, pending);
+          lineHadCode = true;
+          jsxStack.push({ kind: 'jsxExpr', braceDepth: 1 });
+          canPrecedeRegex = true;
+          currentWord = '';
+          lastWord = '';
+          prevPunct = '{';
+          continue;
+        }
+      }
+
+      // Track brace depth for `{ ... }` expressions embedded inside JSX
+      if (jsxTop && jsxTop.kind === 'jsxExpr') {
+        if (ch === '{') {
+          jsxTop.braceDepth++;
+          flushPendingSuppressions(line, suppressions, pending);
+          lineHadCode = true;
+          canPrecedeRegex = true;
+          currentWord = '';
+          lastWord = '';
+          prevPunct = '{';
+          continue;
+        }
+        if (ch === '}') {
+          jsxTop.braceDepth--;
+          flushPendingSuppressions(line, suppressions, pending);
+          lineHadCode = true;
+          if (jsxTop.braceDepth === 0) {
+            jsxStack.pop();
+          }
+          canPrecedeRegex = false;
+          currentWord = '';
+          lastWord = '';
+          prevPunct = '}';
+          continue;
+        }
+      }
+
+      if ((ch === '/' && next === '/') || ((allowHashComments || (i === 0 && next === '!')) && ch === '#')) {
+        if (currentWord) {
+          lastWord = currentWord;
+          canPrecedeRegex = REGEX_PRECEDING_KEYWORDS.has(lastWord);
+          currentWord = '';
+        }
         const commentStart = i;
         const cStart = i + (ch === '#' ? 1 : 2);
         const cLine = line;
         while (i < rawCode.length && rawCode[i] !== '\n') out[i++] = ' ';
         recordConstruct(commentStart, i, 'comment');
         parseSuppressionFromComment(rawCode.slice(cStart, i), cLine, lineHadCode, suppressions, pending);
-        if (rawCode[i] === '\n') { line++; lineHadCode = false; prevNonWs = '\n'; }
-        currentWord = '';
+        // Leave '\n' for the main loop by stepping back 1
+        i--;
       } else if (!allowHashComments && ch === '/' && next === '*') {
+        if (currentWord) {
+          lastWord = currentWord;
+          canPrecedeRegex = REGEX_PRECEDING_KEYWORDS.has(lastWord);
+          currentWord = '';
+        }
         const commentStart = i;
         const cStart = i + 2;
         const cLine = line;
         const wasTrailing = lineHadCode;
+        let sawNewline = false;
+        let closedBlock = false;
         out[i] = ' ';
         out[i + 1] = ' ';
         for (i += 2; i < rawCode.length; i++) {
-          if (rawCode[i] === '*' && rawCode[i + 1] === '/') { out[i] = ' '; out[++i] = ' '; break; }
-          if (rawCode[i] === '\n') line++; else out[i] = ' ';
+          if (rawCode[i] === '*' && rawCode[i + 1] === '/') {
+            out[i] = ' ';
+            out[++i] = ' ';
+            closedBlock = true;
+            break;
+          }
+          if (rawCode[i] === '\n') {
+            line++;
+            sawNewline = true;
+          } else {
+            out[i] = ' ';
+          }
         }
-        const commentEnd = Math.min(rawCode.length, i + 1);
+        const commentEnd = closedBlock ? i + 1 : rawCode.length;
+        const bodyEnd = closedBlock ? i - 1 : rawCode.length;
         recordConstruct(commentStart, commentEnd, 'comment');
-        parseSuppressionFromComment(rawCode.slice(cStart, i - 1), cLine, wasTrailing, suppressions, pending);
-        currentWord = '';
-      } else if (!allowHashComments && ch === '/' && (REGEX_PRECEDING_KEYWORDS.has(currentWord || lastWord) || (!currentWord && REGEX_PRECEDING_CHARS.has(prevNonWs)))) {
+        parseSuppressionFromComment(rawCode.slice(cStart, bodyEnd), cLine, wasTrailing, suppressions, pending);
+        if (sawNewline) {
+          lineHadCode = false;
+        }
+      } else if (!allowHashComments && ch === '<') {
+        flushPendingSuppressions(line, suppressions, pending);
+        lineHadCode = true;
+        // Closing JSX tag `</Tag>` or `</>` must never trigger regex on `/`
+        const closing = matchJsxClosingTag(rawCode, i);
+        if (closing) {
+          i = closing.closeEnd;
+          canPrecedeRegex = false;
+          currentWord = '';
+          lastWord = '';
+          prevPunct = '>';
+          continue;
+        }
+        // Opening JSX tag in expression position when a matching closing tag exists in file
+        const canStartExpr = currentWord ? REGEX_PRECEDING_KEYWORDS.has(currentWord) : canPrecedeRegex;
+        if (canStartExpr) {
+          const opening = matchJsxOpeningTagName(rawCode, i);
+          if (opening && closingJsxTags.has(opening.tagName)) {
+            jsxStack.push({ kind: 'jsxTag', tagName: opening.tagName });
+            i = opening.nameEnd - 1;
+            canPrecedeRegex = false;
+            currentWord = '';
+            lastWord = '';
+            prevPunct = '';
+            continue;
+          }
+        }
+        if (currentWord) {
+          lastWord = currentWord;
+          currentWord = '';
+        }
+        canPrecedeRegex = true;
+        prevPunct = '<';
+        lastWord = '';
+      } else if (
+        !allowHashComments &&
+        ch === '/' &&
+        (currentWord ? REGEX_PRECEDING_KEYWORDS.has(currentWord) : canPrecedeRegex)
+      ) {
         flushPendingSuppressions(line, suppressions, pending);
         lineHadCode = true;
         const regexStart = i;
-        i = skipRegexLiteral(rawCode, out, i);
-        const regexEnd = Math.min(rawCode.length, i + 1);
-        recordConstruct(regexStart, regexEnd, 'regex');
-        prevNonWs = ')';
+        const rx = skipRegexLiteral(rawCode, out, i);
+        recordConstruct(regexStart, rx.endOffset, 'regex');
+        i = rx.nextIdx;
+        canPrecedeRegex = false;
         currentWord = '';
         lastWord = '';
-      } else if (ch === '\'' || ch === '"' || ch === '`') {
+        prevPunct = '';
+      } else if (ch === '\'' || ch === '"') {
         flushPendingSuppressions(line, suppressions, pending);
         lineHadCode = true;
         const quoteStart = i;
-        const kind: LexicalRegionKind = ch === '`' ? 'template' : 'string';
-        const res = skipQuotedLiteral(rawCode, out, i, line);
+        const res = skipSingleOrDoubleQuotedLiteral(rawCode, out, i, line);
         stringLiterals.push(res.literal);
-        recordConstruct(quoteStart, res.literal.endOffset, kind);
+        recordConstruct(quoteStart, res.literal.endOffset, 'string');
         i = res.nextIdx;
         line = res.endLine;
-        prevNonWs = res.literal.quote;
+        canPrecedeRegex = false;
         currentWord = '';
         lastWord = '';
+        prevPunct = '';
+      } else if (ch === '`') {
+        flushPendingSuppressions(line, suppressions, pending);
+        lineHadCode = true;
+        const quoteStart = i;
+        const res = skipTemplateLiteral(rawCode, out, i, line);
+        stringLiterals.push(res.literal);
+        recordConstruct(quoteStart, res.literal.endOffset, 'template');
+        i = res.nextIdx;
+        line = res.endLine;
+        canPrecedeRegex = false;
+        currentWord = '';
+        lastWord = '';
+        prevPunct = '';
       } else if (/[A-Za-z0-9_$]/.test(ch)) {
         flushPendingSuppressions(line, suppressions, pending);
         lineHadCode = true;
         currentWord += ch;
-        prevNonWs = ch;
+        prevPunct = '';
       } else {
-        if (currentWord) { lastWord = currentWord; currentWord = ''; }
+        if (currentWord) {
+          lastWord = currentWord;
+          canPrecedeRegex = REGEX_PRECEDING_KEYWORDS.has(lastWord);
+          currentWord = '';
+        }
         if (!/\s/.test(ch)) {
           flushPendingSuppressions(line, suppressions, pending);
           lineHadCode = true;
-          prevNonWs = ch;
+          if (ch === '(') {
+            parenIsControl.push(CONTROL_PAREN_KEYWORDS.has(lastWord));
+            canPrecedeRegex = true;
+            prevPunct = '(';
+          } else if (ch === ')') {
+            canPrecedeRegex = parenIsControl.pop() ?? false;
+            prevPunct = ')';
+          } else if (
+            (ch === '+' && prevPunct === '+' && rawCode[i - 1] === '+') ||
+            (ch === '-' && prevPunct === '-' && rawCode[i - 1] === '-')
+          ) {
+            canPrecedeRegex = false;
+            prevPunct = ch + ch;
+          } else {
+            canPrecedeRegex = REGEX_PRECEDING_CHARS.has(ch);
+            prevPunct = ch;
+          }
           lastWord = '';
         }
       }
@@ -348,7 +885,9 @@ export function analyzeLexicalStructure(
     if (lastRegionEnd < rawCode.length) {
       pushRegion(lastRegionEnd, rawCode.length, 'code');
     }
-  } catch {
+  } catch (err) {
+    const safeReason = err instanceof Error ? err.message : String(err);
+    void safeReason;
     return {
       maskedCode: rawCode,
       stringLiterals: [],
