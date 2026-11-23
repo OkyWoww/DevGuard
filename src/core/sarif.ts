@@ -248,7 +248,7 @@ export function buildSarifReportString(
   });
 
   const dynRuleDescriptors: Record<
-    'DG004-DYN-01' | 'DG004-DYN-02' | 'DG004-WS-NEW' | 'DG004-WS-UNPARSED',
+    'DG001-ALIAS-01' | 'DG004-DYN-01' | 'DG004-DYN-02' | 'DG004-WS-NEW' | 'DG004-WS-UNPARSED',
     {
       id: string;
       name: string;
@@ -258,6 +258,21 @@ export function buildSarifReportString(
       properties: { tags: string[]; 'security-severity': string };
     }
   > = {
+    'DG001-ALIAS-01': {
+      id: 'DG001-ALIAS-01',
+      name: 'AliasedDynamicExecutionSink',
+      shortDescription: {
+        text: 'Non-scoring warning: invocation of an intra-procedural alias pointing to a dangerous execution sink.',
+      },
+      fullDescription: {
+        text: 'Non-scoring informational warning emitted when a local alias (max depth 2) pointing to eval, Function, or child_process.exec/execSync is invoked. Does not penalize repository scores.',
+      },
+      defaultConfiguration: { level: 'warning' },
+      properties: {
+        tags: ['security', 'alias-tracking', 'non-scoring', 'external/cwe/cwe-94', 'external/cwe/cwe-78'],
+        'security-severity': '5.5',
+      },
+    },
     'DG004-DYN-01': {
       id: 'DG004-DYN-01',
       name: 'UnanalyzableDynamicImportSpecifier',
@@ -329,7 +344,9 @@ export function buildSarifReportString(
     const inlineFindings = summary.inlineFindings || [];
     for (const finding of inlineFindings) {
       if (
-        (finding.ruleId === 'DG004-DYN-01' || finding.ruleId === 'DG004-DYN-02') &&
+        (finding.ruleId === 'DG001-ALIAS-01' ||
+          finding.ruleId === 'DG004-DYN-01' ||
+          finding.ruleId === 'DG004-DYN-02') &&
         !rulesMap.has(finding.ruleId)
       ) {
         rulesMap.set(finding.ruleId, dynRuleDescriptors[finding.ruleId]);

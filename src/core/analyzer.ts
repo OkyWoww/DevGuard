@@ -53,6 +53,12 @@ import {
   type WorkspaceResolutionResult,
 } from './rules/packageAndExceptionRules.ts';
 import {
+  MAX_ALIAS_DEPTH,
+  detectAliasedExecutionSinks,
+  type AliasFindingMetadata,
+  type AliasSinkTarget,
+} from './rules/aliasTracker.ts';
+import {
   DG007_PROVIDER_PATTERNS,
   detectHardcodedSecrets,
   detectMissingTimeoutsAndLoops,
@@ -63,6 +69,8 @@ import {
 } from './rules/secretAndResilienceRules.ts';
 
 export type {
+  AliasFindingMetadata,
+  AliasSinkTarget,
   AllowlistRuleId,
   AuditAnalyzeOptions,
   DevGuardRuleId,
@@ -85,6 +93,7 @@ export type {
 export {
   CRITICAL_FLOW_IDENTIFIERS,
   DG007_PROVIDER_PATTERNS,
+  MAX_ALIAS_DEPTH,
   MAX_BACKSCAN,
   MAX_FOLDED_LENGTH,
   MAX_FOLD_DEPTH,
@@ -101,6 +110,7 @@ export {
   composeSpanMaps,
   createIdentitySpanMap,
   damerauLevenshtein,
+  detectAliasedExecutionSinks,
   detectDynamicModuleSpecifiers,
   detectHallucinatedPackages,
   detectHardcodedSecrets,
@@ -1475,6 +1485,7 @@ export function analyzeCodeDeterministically(
     detectSwallowedExceptions(code, findings, inlineFindings, lexical.maskedCode);
     detectNonAtomicBalanceMutations(rawLines, findings, inlineFindings, lexical.maskedCode.split('\n'));
     detectMissingTimeoutsAndLoops(code, lexical.maskedCode, rawLines, findings, inlineFindings);
+    detectAliasedExecutionSinks(lexical.maskedCode, lexical.stringLiterals, inlineFindings);
   }
 
   // 3b. Additive Pass-V (runs if and only if virtualView.editsApplied > 0)
@@ -1490,6 +1501,8 @@ export function analyzeCodeDeterministically(
       switch (ruleId) {
         case 'DG001':
           return /\b(?:eval|exec|Function|system|globalThis|window|global|self)\b/;
+        case 'DG001-ALIAS-01':
+          return /[A-Za-z_$][\w$]*\s*(?:\?\.)?\(/;
         case 'DG004':
         case 'DG004-DYN-01':
         case 'DG004-DYN-02':
@@ -1597,6 +1610,7 @@ export function analyzeCodeDeterministically(
       if (/\b(?:while|for|do|fetch)\b/.test(vLex.maskedCode)) {
         detectMissingTimeoutsAndLoops(virtualView.virtualCode, vLex.maskedCode, vRawLines, vFindings, vInlineFindings);
       }
+      detectAliasedExecutionSinks(vLex.maskedCode, vLex.stringLiterals, vInlineFindings);
 
       // DG001 on V (eval/exec dynamic sinks in general code domain)
       if (!isSqlDomain && !isPingDomain && !isAuthDomain && !isFileDomain && !isCartDomain) {

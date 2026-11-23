@@ -27,6 +27,20 @@ const RULES_CATALOG: ReadonlyArray<RuleExplanation> = [
     trueNegativeExample: 'export function parseConfig(raw: string) { return JSON.parse(raw); }',
   },
   {
+    ruleId: 'DG001-ALIAS-01',
+    name: 'AliasedDynamicExecutionSink',
+    defaultSeverity: 'warning',
+    securitySeverity: '5.5',
+    cwe: ['CWE-94', 'CWE-78'],
+    shortDescription: 'Non-scoring warning: invocation of an intra-procedural alias pointing to a dangerous execution sink.',
+    fullDescription:
+      'Non-scoring informational warning emitted when a local alias (up to depth 2) bound to eval, Function, or child_process.exec/execSync is invoked. Does not penalize repository scores.',
+    remediation:
+      'Avoid aliasing or invoking dynamic code evaluation (eval, Function) and shell execution sinks (child_process.exec/execSync). Use safe structured APIs or argument arrays without shell interpolation.',
+    truePositiveExample: 'const run = eval; run(userInput);',
+    trueNegativeExample: 'const exec = /pattern/.exec; exec(input);',
+  },
+  {
     ruleId: 'DG002',
     name: 'DefenseInDepthRecommendation',
     defaultSeverity: 'warning',

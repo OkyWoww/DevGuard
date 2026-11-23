@@ -2,7 +2,8 @@ export * from './spanMap.ts';
 import type { WorkspaceContext, WorkspaceFileAccessor } from './workspaceResolver.ts';
 
 export type DevGuardRuleId =
-  | 'DG001' | 'DG002' | 'DG003' | 'DG004'
+  | 'DG001' | 'DG001-ALIAS-01'
+  | 'DG002' | 'DG003' | 'DG004'
   | 'DG004-DYN-01' | 'DG004-DYN-02'
   | 'DG004-WS-NEW' | 'DG004-WS-UNPARSED'
   | 'DG005' | 'DG006' | 'DG007' | 'DG008';

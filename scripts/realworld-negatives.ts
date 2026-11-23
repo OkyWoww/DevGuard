@@ -79,6 +79,7 @@ function main(): void {
   const files = collectTargetFiles(dirs);
   const counts: Record<DevGuardRuleId, number> = {
     DG001: 0,
+    'DG001-ALIAS-01': 0,
     DG002: 0,
     DG003: 0,
     DG004: 0,
