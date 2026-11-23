@@ -7,6 +7,7 @@ export {
   type McpSession,
   type McpStdioOptions,
   type McpToolDefinition,
+  type McpWritableLike,
 } from './protocol.ts';
 export {
   explainDevGuardRule,
@@ -15,12 +16,19 @@ export {
 } from './rulesCatalog.ts';
 export {
   MCP_LIMITS,
+  SUPPORTED_SNIPPET_LANGUAGE_EXTENSIONS,
   UNTRUSTED_SOURCE_NOTICE,
   extractSafeQuotedSource,
+  extractSafeQuotedSourceFromRedactedLines,
+  prepareRedactedSourceLines,
   redactAdvisoryText,
   resolveJailedWorkspacePath,
+  resolveSnippetLanguageExtension,
   sanitizeVirtualPath,
+  truncateUtf16Safe,
+  type PathJailErrorCode,
   type PathJailResult,
+  type VirtualPathResult,
 } from './security.ts';
 export {
   enforceOutputBudget,
