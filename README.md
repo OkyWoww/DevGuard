@@ -1,8 +1,8 @@
-# 🛡️ DevGuard v1.6.1 — The AI-Slop & Vibe-Coding Security Gatekeeper
+# 🛡️ DevGuard v1.7.0 — The AI-Slop & Vibe-Coding Security Gatekeeper
 
 [![Zero-Dependency Runtime](https://img.shields.io/badge/Runtime-100%25%20Zero--Dependency-emerald.svg)](#hybrid-dual-layer-architecture)
 [![OASIS SARIF v2.1.0](https://img.shields.io/badge/SARIF-v2.1.0%20Compliant-blue.svg)](#quick-start-choose-your-path)
-[![GitHub Action](https://img.shields.io/badge/GitHub%20Action-v1.6.1-black.svg)](#quick-start-choose-your-path)
+[![GitHub Action](https://img.shields.io/badge/GitHub%20Action-v1.7.0-black.svg)](#quick-start-choose-your-path)
 [![Tests 95/95 Passing](https://img.shields.io/badge/Tests-95%2F95%20Passing-success.svg)](#local-development--verification)
 
 **DevGuard** is a deterministic CI/CD security gatekeeper engineered to catch silent failures, slopsquatting, leaked API keys, and financial race conditions hidden inside AI-generated (*Cursor, Windsurf, Copilot, Antigravity*) Pull Requests before they reach production.
@@ -76,9 +76,9 @@ jobs:
         with:
           fetch-depth: 0 # Required so base-branch .devguard.json & workspace configs are readable
 
-      - name: Run DevGuard v1.6.1
+      - name: Run DevGuard v1.7.0
         id: devguard
-        uses: OkyWoww/DevGuard@v1.6.1 # Or pin by 40-char commit SHA (git rev-parse v1.6.1^{commit})
+        uses: OkyWoww/DevGuard@v1.7.0 # Or pin by 40-char commit SHA (git rev-parse v1.7.0^{commit})
         with:
           # Optional: Omit for 100% Free Offline Single-Pass Lexical & Heuristic mode
           gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
@@ -138,6 +138,7 @@ Not every message in a DevGuard PR comment fails your build. Use this quick glos
 | **`DG004-WS-NEW`** | **No** *(non-scoring)* | The PR introduces a new workspace package not yet on the base branch. For anti-bypass security, it is not auto-trusted until merged into the base branch. |
 | **`DG004-WS-UNPARSED`** | **No** *(non-scoring)* | A workspace config (`package.json`, `pnpm-workspace.yaml`, or `tsconfig.json`) exceeded `256 KiB` or used unsupported YAML/JSONC constructs; that source failed closed safely without blocking by itself. |
 | **`DG004-DYN-01` / `DG004-DYN-02`** | **No** *(non-scoring)* | Non-literal dynamic `import(...)` / `require(...)` specifier surfaced for supply-chain visibility (`scoring: false`). |
+| **`DG001-ALIAS-01`** | **No** *(non-scoring)* | Intra-procedural alias (max depth 2) to dynamic execution sinks (`eval`, `Function`, `child_process.exec`) surfaced for visibility (`scoring: false`). |
 
 ---
 
