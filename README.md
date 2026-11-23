@@ -1,9 +1,9 @@
-# 🛡️ DevGuard v1.6.0 — The AI-Slop & Vibe-Coding Security Gatekeeper
+# 🛡️ DevGuard v1.6.1 — The AI-Slop & Vibe-Coding Security Gatekeeper
 
 [![Zero-Dependency Runtime](https://img.shields.io/badge/Runtime-100%25%20Zero--Dependency-emerald.svg)](#hybrid-dual-layer-architecture)
 [![OASIS SARIF v2.1.0](https://img.shields.io/badge/SARIF-v2.1.0%20Compliant-blue.svg)](#quick-start-choose-your-path)
-[![GitHub Action](https://img.shields.io/badge/GitHub%20Action-v1.6.0-black.svg)](#quick-start-choose-your-path)
-[![Tests 94/94 Passing](https://img.shields.io/badge/Tests-94%2F94%20Passing-success.svg)](#local-development--verification)
+[![GitHub Action](https://img.shields.io/badge/GitHub%20Action-v1.6.1-black.svg)](#quick-start-choose-your-path)
+[![Tests 95/95 Passing](https://img.shields.io/badge/Tests-95%2F95%20Passing-success.svg)](#local-development--verification)
 
 **DevGuard** is a deterministic CI/CD security gatekeeper engineered to catch silent failures, slopsquatting, leaked API keys, and financial race conditions hidden inside AI-generated (*Cursor, Windsurf, Copilot, Antigravity*) Pull Requests before they reach production.
 
@@ -76,9 +76,9 @@ jobs:
         with:
           fetch-depth: 0 # Required so base-branch .devguard.json & workspace configs are readable
 
-      - name: Run DevGuard v1.6.0
+      - name: Run DevGuard v1.6.1
         id: devguard
-        uses: OkyWoww/DevGuard@v1.6.0 # Or pin by 40-char commit SHA (git rev-parse v1.6.0^{commit})
+        uses: OkyWoww/DevGuard@v1.6.1 # Or pin by 40-char commit SHA (git rev-parse v1.6.1^{commit})
         with:
           # Optional: Omit for 100% Free Offline Single-Pass Lexical & Heuristic mode
           gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
@@ -417,7 +417,7 @@ See also [docs/benchmarks/realworld-2026-11-16.md](docs/benchmarks/realworld-202
 
 ## 🧪 Local Development & Verification
 
-DevGuard enforces a strict zero-dependency test harness using Node's built-in assertion & test runner (`node:test` compiled via `tsconfig.test.json` and executed in-process), currently verified at **94 passing test scenarios** across [tests/corpus.test.ts](tests/corpus.test.ts) (`Corpus Benchmark`) and [tests/integration.test.ts](tests/integration.test.ts) (`Tests 1–93`):
+DevGuard enforces a strict zero-dependency test harness using Node's built-in assertion & test runner (`node:test` compiled via `tsconfig.test.json` and executed in-process), currently verified at **95 passing test scenarios** across [tests/corpus.test.ts](tests/corpus.test.ts) (`Corpus Benchmark`) and [tests/integration.test.ts](tests/integration.test.ts) (`Tests 1–94`):
 
 ```bash
 # 1. Typecheck application, CLI, & tests
