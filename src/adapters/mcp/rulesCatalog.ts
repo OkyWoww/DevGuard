@@ -125,6 +125,20 @@ const RULES_CATALOG: ReadonlyArray<RuleExplanation> = [
     trueNegativeExample: 'Standard pnpm-workspace.yaml with a block list under packages:.',
   },
   {
+    ruleId: 'DG004-WS-SHALLOW',
+    name: 'ShallowCloneBaseRefUnavailable',
+    defaultSeverity: 'warning',
+    securitySeverity: '3.5',
+    cwe: ['CWE-829'],
+    shortDescription: 'Non-scoring notice: shallow clone prevented reading base-branch workspace configuration.',
+    fullDescription:
+      'Informational notice emitted when CI runs with fetch-depth: 1 and origin/<baseRef> cannot be fetched, causing workspace resolution to fail closed to 0 admitted base packages.',
+    remediation:
+      'Configure actions/checkout@v4 with fetch-depth: 0 so DevGuard can verify base-branch workspace manifests and .devguard.json.',
+    truePositiveExample: 'actions/checkout@v4 using default fetch-depth: 1 in a monorepo pull request.',
+    trueNegativeExample: 'actions/checkout@v4 configured with fetch-depth: 0.',
+  },
+  {
     ruleId: 'DG005',
     name: 'SwallowedExceptionInFlow',
     defaultSeverity: 'warning',

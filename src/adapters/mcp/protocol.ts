@@ -1,7 +1,7 @@
 import * as path from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 import { getDevGuardVersion } from '../../core/types.ts';
-import { MCP_LIMITS } from './security.ts';
+import { MCP_LIMITS, redactAdvisoryText } from './security.ts';
 import {
   handleMcpCheckFiles,
   handleMcpCheckSnippet,
@@ -220,7 +220,7 @@ export function createMcpSession(workspaceRoot: string): McpSession {
           return makeError(id, JSONRPC_INVALID_PARAMS, `Unknown tool: "${p.name}".`);
       }
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = redactAdvisoryText(err instanceof Error ? err.message : String(err));
       return makeError(id, JSONRPC_INTERNAL_ERROR, `Internal tool execution error: ${msg}`);
     }
 
@@ -261,10 +261,19 @@ export function createMcpSession(workspaceRoot: string): McpSession {
 
       const req = parsed as Partial<JsonRpcRequest>;
       const hasId = Object.prototype.hasOwnProperty.call(req, 'id');
-      const id: string | number | null =
-        typeof req.id === 'string' || typeof req.id === 'number' || req.id === null
-          ? req.id
-          : null;
+      const isValidRequestId =
+        typeof req.id === 'string' ||
+        (typeof req.id === 'number' && Number.isInteger(req.id));
+
+      if (hasId && !isValidRequestId) {
+        return makeError(
+          null,
+          JSONRPC_INVALID_REQUEST,
+          'Invalid Request: "id" must be a string or finite integer.'
+        );
+      }
+
+      const id: string | number | null = hasId ? (req.id as string | number) : null;
 
       if (req.jsonrpc !== '2.0' || typeof req.method !== 'string' || req.method.length === 0) {
         return makeError(id, JSONRPC_INVALID_REQUEST, 'Invalid Request: missing jsonrpc "2.0" or method.');
@@ -334,10 +343,16 @@ export function createMcpSession(workspaceRoot: string): McpSession {
   };
 }
 
+export interface McpWritableLike {
+  write: (chunk: string) => unknown;
+  on?: (event: string, listener: (...args: unknown[]) => void) => unknown;
+  once?: (event: string, listener: (...args: unknown[]) => void) => unknown;
+}
+
 export interface McpStdioOptions {
   workspaceRoot?: string;
   input?: NodeJS.ReadableStream;
-  output?: { write: (chunk: string) => unknown };
+  output?: McpWritableLike;
   stderr?: { write: (chunk: string) => unknown };
 }
 
@@ -349,17 +364,57 @@ export interface McpStdioOptions {
 export function startMcpStdioServer(options?: McpStdioOptions): void {
   const workspaceRoot = path.resolve(options?.workspaceRoot ?? process.cwd());
   const input = options?.input ?? process.stdin;
-  const output = options?.output ?? process.stdout;
+  const output: McpWritableLike = options?.output ?? process.stdout;
   const stderr = options?.stderr ?? process.stderr;
 
   const session = createMcpSession(workspaceRoot);
   const decoder = new StringDecoder('utf8');
   let buffer = '';
+  let bufferBytes = 0;
   let discardingOversizedLine = false;
+  let outputClosed = false;
+  let pausedForDrain = false;
+
+  if (typeof output.on === 'function') {
+    output.on('error', (err: unknown) => {
+      const errCode = (err as { code?: string })?.code;
+      if (errCode === 'EPIPE' || errCode === 'ERR_STREAM_DESTROYED') {
+        outputClosed = true;
+        return;
+      }
+      const msg = err instanceof Error ? err.message : String(err);
+      stderr.write(`[devguard-mcp] stdout error: ${msg}\n`);
+    });
+  }
 
   const emitResponse = (res: JsonRpcResponse | null): void => {
-    if (res === null) return;
-    output.write(`${JSON.stringify(res)}\n`);
+    if (res === null || outputClosed) return;
+    try {
+      const canContinue = output.write(`${JSON.stringify(res)}\n`);
+      if (
+        canContinue === false &&
+        !pausedForDrain &&
+        typeof input.pause === 'function' &&
+        typeof output.once === 'function'
+      ) {
+        pausedForDrain = true;
+        input.pause();
+        output.once('drain', () => {
+          pausedForDrain = false;
+          if (!outputClosed && typeof input.resume === 'function') {
+            input.resume();
+          }
+        });
+      }
+    } catch (err) {
+      const errCode = (err as { code?: string })?.code;
+      if (errCode === 'EPIPE' || errCode === 'ERR_STREAM_DESTROYED') {
+        outputClosed = true;
+        return;
+      }
+      const msg = err instanceof Error ? err.message : String(err);
+      stderr.write(`[devguard-mcp] stdout write error: ${msg}\n`);
+    }
   };
 
   input.on('data', (chunk: string | Buffer) => {
@@ -379,9 +434,12 @@ export function startMcpStdioServer(options?: McpStdioOptions): void {
 
       const nl = text.indexOf('\n', offset);
       if (nl === -1) {
-        buffer += text.slice(offset);
-        if (Buffer.byteLength(buffer, 'utf8') > MCP_LIMITS.maxIncomingMessageBytes) {
+        const slice = text.slice(offset);
+        buffer += slice;
+        bufferBytes += Buffer.byteLength(slice, 'utf8');
+        if (bufferBytes > MCP_LIMITS.maxIncomingMessageBytes) {
           buffer = '';
+          bufferBytes = 0;
           discardingOversizedLine = true;
           emitResponse(
             makeError(
@@ -396,6 +454,7 @@ export function startMcpStdioServer(options?: McpStdioOptions): void {
 
       const line = buffer + text.slice(offset, nl);
       buffer = '';
+      bufferBytes = 0;
       offset = nl + 1;
       emitResponse(session.handleRawLine(line));
     }
@@ -404,12 +463,23 @@ export function startMcpStdioServer(options?: McpStdioOptions): void {
   input.on('end', () => {
     const trailing = decoder.end();
     if (!discardingOversizedLine) {
-      const finalLine = buffer + trailing;
-      if (finalLine.trim().length > 0) {
-        emitResponse(session.handleRawLine(finalLine));
+      const finalLine = (buffer + trailing).trim();
+      if (finalLine.length > 0) {
+        // Do not emit -32700 parse errors to stdout for truncated mid-line fragments on EOF
+        let isCompleteJson = false;
+        try {
+          JSON.parse(finalLine);
+          isCompleteJson = true;
+        } catch {
+          stderr.write('[devguard-mcp] ignored incomplete trailing fragment on stdin EOF.\n');
+        }
+        if (isCompleteJson) {
+          emitResponse(session.handleRawLine(finalLine));
+        }
       }
     }
     buffer = '';
+    bufferBytes = 0;
     discardingOversizedLine = false;
   });
 
