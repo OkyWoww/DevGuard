@@ -22,9 +22,21 @@ import type {
   WorkspaceFileAccessor,
   WorkspaceResolutionResult,
 } from './rules/packageAndExceptionRules.ts';
+import type {
+  AliasAnalysisResult,
+  AliasBailout,
+  AliasBailoutReason,
+  AliasFindingMetadata,
+  AliasSinkTarget,
+} from './rules/aliasTracker.ts';
 import type { PrepareLlmOptions } from './rules/secretAndResilienceRules.ts';
 
 export type {
+  AliasAnalysisResult,
+  AliasBailout,
+  AliasBailoutReason,
+  AliasFindingMetadata,
+  AliasSinkTarget,
   AllowlistRuleId,
   AuditAnalyzeOptions,
   DevGuardRuleId,
@@ -72,6 +84,7 @@ export interface FileAuditSummary {
   layer2Status?: string;
   dynScopeUncertain?: number;
   foldLimitExceeded?: boolean;
+  aliasBailouts?: AliasBailout[];
 }
 
 export const PARTIAL_COVERAGE_REASON_TEXT = 'Partial: language-agnostic rules only';

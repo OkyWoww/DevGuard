@@ -248,7 +248,7 @@ export function buildSarifReportString(
   });
 
   const dynRuleDescriptors: Record<
-    'DG001-ALIAS-01' | 'DG004-DYN-01' | 'DG004-DYN-02' | 'DG004-WS-NEW' | 'DG004-WS-UNPARSED',
+    'DG001-ALIAS-01' | 'DG004-DYN-01' | 'DG004-DYN-02' | 'DG004-WS-NEW' | 'DG004-WS-UNPARSED' | 'DG005-ALIAS-01',
     {
       id: string;
       name: string;
@@ -270,6 +270,21 @@ export function buildSarifReportString(
       defaultConfiguration: { level: 'warning' },
       properties: {
         tags: ['security', 'alias-tracking', 'non-scoring', 'external/cwe/cwe-94', 'external/cwe/cwe-78'],
+        'security-severity': '5.5',
+      },
+    },
+    'DG005-ALIAS-01': {
+      id: 'DG005-ALIAS-01',
+      name: 'AliasedSwallowedCriticalPromise',
+      shortDescription: {
+        text: 'Non-scoring warning: aliased critical-flow Promise swallows rejection via an empty .catch() callback.',
+      },
+      fullDescription: {
+        text: 'Non-scoring informational warning emitted when a local alias (max depth 2) assigned from a critical-flow call attaches an empty or no-op .catch() callback. Does not penalize repository scores.',
+      },
+      defaultConfiguration: { level: 'warning' },
+      properties: {
+        tags: ['security', 'reliability', 'alias-tracking', 'non-scoring', 'external/cwe/cwe-390'],
         'security-severity': '5.5',
       },
     },
@@ -345,6 +360,7 @@ export function buildSarifReportString(
     for (const finding of inlineFindings) {
       if (
         (finding.ruleId === 'DG001-ALIAS-01' ||
+          finding.ruleId === 'DG005-ALIAS-01' ||
           finding.ruleId === 'DG004-DYN-01' ||
           finding.ruleId === 'DG004-DYN-02') &&
         !rulesMap.has(finding.ruleId)
@@ -530,10 +546,32 @@ export function buildSarifReportString(
     }
   }
 
+  const aliasBailoutNotifications: Array<Record<string, unknown>> = [];
+  const aliasBailoutSeenKeys = new Set<string>();
+  for (const summary of summaries) {
+    if (summary.aliasBailouts && summary.aliasBailouts.length > 0) {
+      const normUri = normalizeSarifUri(summary.filePath);
+      for (const bailout of summary.aliasBailouts) {
+        const key = `${normUri}:${bailout.reason}:${bailout.identifier}:${bailout.line}`;
+        if (aliasBailoutSeenKeys.has(key)) continue;
+        aliasBailoutSeenKeys.add(key);
+        aliasBailoutNotifications.push(
+          createToolNotification(
+            'note',
+            bailout.message,
+            summary.filePath,
+            `alias_bailout_${bailout.reason}`
+          )
+        );
+      }
+    }
+  }
+
   const toolExecutionNotifications = [
     ...partialNotifications,
     ...skippedNotifications,
     ...foldLimitNotifications,
+    ...aliasBailoutNotifications,
   ];
 
   const sarifLog = {

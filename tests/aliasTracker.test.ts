@@ -2,15 +2,22 @@ import assert from 'node:assert/strict';
 import {
   MAX_ALIAS_DEPTH,
   analyzeCodeDeterministically,
+  analyzeIntraProceduralAliases,
   analyzeLexicalStructure,
   detectAliasedExecutionSinks,
 } from '../src/core/analyzer.ts';
 import { buildSarifReportString } from '../src/core/sarif.ts';
 import { explainDevGuardRule } from '../src/adapters/mcp/rulesCatalog.ts';
+import { CORPUS_CASES } from './corpus/cases.ts';
 
 function runAlias(code: string) {
   const lex = analyzeLexicalStructure(code, false);
   return detectAliasedExecutionSinks(lex.maskedCode, lex.stringLiterals);
+}
+
+function runAliasFull(code: string) {
+  const lex = analyzeLexicalStructure(code, false);
+  return analyzeIntraProceduralAliases(lex.maskedCode, lex.stringLiterals);
 }
 
 let passed = 0;
@@ -379,4 +386,268 @@ test('GUARDRAIL-3b: DG001-ALIAS-01 is registered in MCP rulesCatalog and SARIF o
   assert.equal(aliasSarifResults[0].properties?.scoring, false);
 });
 
-console.log(`PASS: All ${passed} Stage 9.2 alias tracking tests passed.`);
+// ---------------------------------------------------------------------------
+// 6. Stage 9.3: A9-1 Targets (DG001-EV-03 & DG005-ALIAS-01 p.catch(() => {}))
+// ---------------------------------------------------------------------------
+test('A9-1a: DG001-EV-03 parenthesized TS cast + split-string fold detected via DG001-ALIAS-01', () => {
+  const ev03 = CORPUS_CASES.find((c) => c.id === 'DG001-EV-03');
+  assert.ok(ev03, 'DG001-EV-03 must exist in corpus');
+  const report = analyzeCodeDeterministically(ev03.code, { filePath: ev03.filePath });
+  const aliasFindings = (report.inlineFindings ?? []).filter((f) => f.ruleId === 'DG001-ALIAS-01');
+  assert.equal(aliasFindings.length, 1);
+  assert.equal(aliasFindings[0].severity, 'warning');
+  assert.equal(aliasFindings[0].scoring, false);
+});
+
+test('A9-1b: Critical-flow Promise alias p.catch(() => {}) detected via DG005-ALIAS-01 (depth 1 & 2)', () => {
+  const res1 = runAlias(`
+    export function runOrder(orderId: string) {
+      const p = charge(orderId);
+      p.catch(() => {});
+    }
+  `);
+  assert.equal(res1.length, 1);
+  assert.equal(res1[0].ruleId, 'DG005-ALIAS-01');
+  assert.equal(res1[0].target, 'critical_promise.catch');
+  assert.equal(res1[0].depth, 1);
+
+  const res2 = runAlias(`
+    export function runOrderChained(orderId: string) {
+      const p = billing.chargePayment(orderId);
+      const p2 = p;
+      p2.catch(() => undefined);
+    }
+  `);
+  assert.equal(res2.length, 1);
+  assert.equal(res2[0].ruleId, 'DG005-ALIAS-01');
+  assert.equal(res2[0].depth, 2);
+
+  const res3 = runAlias(`
+    export function runFnCatch(id: string) {
+      const p = processInvoice(id);
+      p.catch(function() {});
+    }
+  `);
+  assert.equal(res3.length, 1);
+  assert.equal(res3[0].ruleId, 'DG005-ALIAS-01');
+});
+
+// ---------------------------------------------------------------------------
+// 7. Stage 9.3: A9-2 >= 5 TN Cases for DG005-ALIAS-01 (Anti-FP Guardrail)
+// ---------------------------------------------------------------------------
+test('A9-2-TN-1: Non-critical Promise alias with empty .catch() is NOT flagged', () => {
+  const res = runAlias(`
+    const p = loadUiTheme();
+    p.catch(() => {});
+  `);
+  assert.equal(res.length, 0);
+});
+
+test('A9-2-TN-2: Critical Promise alias with real error handler .catch(err => log(err)) or .catch(handleErr) is NOT flagged', () => {
+  const res = runAlias(`
+    const p1 = chargePayment(orderId);
+    p1.catch((err) => logError(err));
+    const p2 = transferFunds(a, b);
+    p2.catch(handleError);
+    const p3 = verifyAuth(token);
+    p3.catch((err) => { logger.error(err); throw err; });
+  `);
+  assert.equal(res.length, 0);
+});
+
+test('A9-2-TN-3: Parameter shadowing invalidates outer critical-flow Promise alias', () => {
+  const res = runAlias(`
+    const p = chargePayment(orderId);
+    function ignoreShadowed(p: Promise<void>) {
+      p.catch(() => {});
+    }
+  `);
+  assert.equal(res.length, 0);
+});
+
+test('A9-2-TN-4: Reassignment invalidates critical-flow Promise alias and records bailout', () => {
+  const full = runAliasFull(`
+    let p = chargePayment(orderId);
+    p = Promise.resolve();
+    p.catch(() => {});
+  `);
+  assert.equal(full.findings.length, 0);
+  assert.ok(full.bailouts.some((b) => b.reason === 'reassigned_binding' && b.identifier === 'p'));
+});
+
+test('A9-2-TN-5: Awaited result, cleanup method, and sibling function isolation are NOT flagged', () => {
+  const res = runAlias(`
+    async function run() {
+      const settled = await chargePayment(orderId);
+      settled.catch(() => {});
+      const c = fs.close(fd);
+      c.catch(() => {});
+    }
+    function other() {
+      const p = chargePayment(orderId);
+    }
+    function sibling() {
+      p.catch(() => {});
+    }
+  `);
+  assert.equal(res.length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// 8. Stage 9.3: SPOF #2 (Nested Generics & Malformed Unbalanced `<`)
+// ---------------------------------------------------------------------------
+test('SPOF-2: Nested generics and malformed unbalanced angle brackets in parenthesized TS cast do not hang', () => {
+  const t0 = performance.now();
+  const res1 = runAlias(`
+    const fn = (globalThis as Record<string, Record<string, (x: Map<string, number>) => unknown>>)['eval'];
+    fn('1 + 1');
+  `);
+  assert.equal(res1.length, 1);
+  assert.equal(res1[0].target, 'eval');
+
+  // Malformed unbalanced `<` inside parenthesized cast
+  const malformed = `const fn = (globalThis as Record<string, Map<a, b, Map<c, d)['eval'];\nfn('x');`;
+  runAlias(malformed);
+  const elapsedMs = performance.now() - t0;
+  assert.ok(elapsedMs < 50, `Expected linear-time <50ms, took ${elapsedMs.toFixed(2)}ms`);
+});
+
+// ---------------------------------------------------------------------------
+// 9. Stage 9.3: INV-7 Bail-Out Reporting & Anti-Spam Guarantee
+// ---------------------------------------------------------------------------
+test('INV-7a: Bail-outs fire ONLY on tracked sink/namespace/promise intersections (zero spam)', () => {
+  // Ordinary code: reassignment, nested destructuring, array destructuring, returning values
+  const ordinary = runAliasFull(`
+    let count = 0;
+    count = 1;
+    const { a: { b }, ...rest } = config;
+    const [first, second] = items;
+    function getToken() {
+      const token = createToken();
+      return token;
+    }
+  `);
+  assert.equal(ordinary.findings.length, 0);
+  assert.equal(ordinary.bailouts.length, 0, `Expected 0 bailouts on ordinary code, got: ${JSON.stringify(ordinary.bailouts)}`);
+
+  // Tracked sink bail-outs
+  const tracked = runAliasFull(`
+    const cp = require('child_process');
+    const { nested: { exec } } = cp;
+    const [arrFn] = [eval];
+    const a = eval;
+    const b = a;
+    const c = b;
+    function escapeFn() {
+      const f = eval;
+      runExternal(f);
+      return f;
+    }
+  `);
+  const reasons = new Set(tracked.bailouts.map((b) => b.reason));
+  assert.ok(reasons.has('complex_destructuring'), 'Expected complex_destructuring bailout');
+  assert.ok(reasons.has('depth_exceeded'), 'Expected depth_exceeded bailout');
+  assert.ok(reasons.has('cross_function_alias'), 'Expected cross_function_alias bailout');
+});
+
+test('INV-7b: DG005-ALIAS-01 MCP catalog + SARIF non-scoring & non-fatal bailout notification', () => {
+  const explained = explainDevGuardRule('DG005-ALIAS-01');
+  assert.equal(explained.found, true);
+  if (explained.found) {
+    assert.equal(explained.rule.defaultSeverity, 'warning');
+    assert.ok(explained.rule.remediation.length > 20);
+  }
+
+  const report = analyzeCodeDeterministically(
+    `const p = chargePayment(id);\np.catch(() => {});\nlet fn = eval;\nfn = safe;`,
+    { filePath: 'src/billing/aliased.ts' }
+  );
+  assert.ok((report.aliasBailouts ?? []).length >= 1);
+
+  const { sarifJson } = buildSarifReportString([
+    {
+      filePath: 'src/billing/aliased.ts',
+      security: report.skor.security,
+      correctness: report.skor.correctness,
+      maintainability: report.skor.maintainability,
+      overall: report.skor.totalScore,
+      passed: true,
+      fatalFlaws: [],
+      defenseInDepth: [],
+      inlineFindings: report.inlineFindings,
+      aliasBailouts: report.aliasBailouts,
+    },
+  ]);
+  const sarif = JSON.parse(sarifJson) as {
+    runs: Array<{
+      tool: { driver: { rules: Array<{ id: string }> } };
+      invocations: Array<{
+        executionSuccessful: boolean;
+        toolExecutionNotifications: Array<{ level: string; descriptor?: { id: string } }>;
+      }>;
+      results: Array<{ ruleId: string; level: string; properties?: { scoring?: boolean } }>;
+    }>;
+  };
+  assert.ok(sarif.runs[0].tool.driver.rules.some((r) => r.id === 'DG005-ALIAS-01'));
+  assert.equal(sarif.runs[0].invocations[0].executionSuccessful, true, 'Alias bailout must remain non-fatal');
+  assert.ok(
+    sarif.runs[0].invocations[0].toolExecutionNotifications.some(
+      (n) => n.level === 'note' && n.descriptor?.id === 'alias_bailout_reassigned_binding'
+    )
+  );
+  const dg005Alias = sarif.runs[0].results.filter((r) => r.ruleId === 'DG005-ALIAS-01');
+  assert.equal(dg005Alias.length, 1);
+  assert.equal(dg005Alias[0].properties?.scoring, false);
+});
+
+// ---------------------------------------------------------------------------
+// 10. Stage 9.3: A9-4 Golden SARIF Identity on Corpus Without Alias
+// ---------------------------------------------------------------------------
+test('A9-4: Non-alias corpus produces 0 alias findings, 0 bailouts, and byte-for-byte identical SARIF', () => {
+  const nonAliasCases = CORPUS_CASES.filter((c) => c.id !== 'DG001-EV-03');
+  const summariesWithAlias = [];
+  const summariesBaseline = [];
+
+  for (const c of nonAliasCases) {
+    const report = analyzeCodeDeterministically(c.code, {
+      filePath: c.filePath,
+      declaredDependencies: c.declaredDependencies,
+    });
+    const aliasInline = (report.inlineFindings ?? []).filter(
+      (f) => f.ruleId === 'DG001-ALIAS-01' || f.ruleId === 'DG005-ALIAS-01'
+    );
+    assert.equal(
+      aliasInline.length,
+      0,
+      `A9-4 violation: unexpected alias finding on non-alias corpus case ${c.id}: ${JSON.stringify(aliasInline)}`
+    );
+    assert.equal(
+      report.aliasBailouts?.length ?? 0,
+      0,
+      `A9-4 violation: unexpected alias bailout on non-alias corpus case ${c.id}: ${JSON.stringify(report.aliasBailouts)}`
+    );
+
+    const baseSummary = {
+      filePath: c.filePath,
+      security: report.skor.security,
+      correctness: report.skor.correctness,
+      maintainability: report.skor.maintainability,
+      overall: report.skor.totalScore,
+      passed: report.skor.totalScore >= 85,
+      fatalFlaws: [],
+      defenseInDepth: [],
+      inlineFindings: report.inlineFindings,
+    };
+    summariesBaseline.push(baseSummary);
+    summariesWithAlias.push({
+      ...baseSummary,
+      aliasBailouts: report.aliasBailouts,
+    });
+  }
+
+  const goldenBaseline = buildSarifReportString(summariesBaseline).sarifJson;
+  const actualWithAlias = buildSarifReportString(summariesWithAlias).sarifJson;
+  assert.equal(actualWithAlias, goldenBaseline, 'A9-4 violation: SARIF output diverged on non-alias corpus');
+});
+
+console.log(`PASS: All ${passed} Stage 9.2 + 9.3 alias tracking tests passed.`);

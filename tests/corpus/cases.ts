@@ -210,7 +210,7 @@ export const CORPUS_CASES: readonly CorpusCase[] = [
       '}',
     ].join('\n'),
     status: 'knownMiss',
-    note: 'Split string bracket lookup globalThis["ev" + "al"] obfuscation',
+    note: 'Split string bracket lookup globalThis["ev" + "al"] obfuscation (surfaced non-scoring by DG001-ALIAS-01; remains knownMiss for scoring DG001 until INV-8 promotion)',
   },
 
   // ===========================================================================

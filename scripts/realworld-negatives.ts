@@ -88,6 +88,7 @@ function main(): void {
     'DG004-WS-NEW': 0,
     'DG004-WS-UNPARSED': 0,
     DG005: 0,
+    'DG005-ALIAS-01': 0,
     DG006: 0,
     DG007: 0,
     DG008: 0,
