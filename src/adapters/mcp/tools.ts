@@ -32,6 +32,7 @@ const ALLOWED_ALLOWLIST_RULES = new Set<string>([
   'DG004',
   'DG004-DYN-01',
   'DG004-DYN-02',
+  'DG004-REG-01',
   'DG006',
 ]);
 

@@ -57,7 +57,7 @@ export interface WorkspacePackageInfo {
 }
 
 export interface WorkspaceDiagnosticNotice {
-  ruleId: 'DG004-WS-UNPARSED' | 'DG004-WS-NEW';
+  ruleId: 'DG004-WS-UNPARSED' | 'DG004-WS-NEW' | 'DG004-REG-01' | 'DG004-REG-UNREACHABLE';
   sourceFile: string;
   reason?: WorkspaceBailoutReason | string;
   message: string;

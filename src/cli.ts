@@ -324,6 +324,7 @@ export function loadVerifiedAllowlist(options?: LoadAllowlistOptions): VerifiedA
         candidate.rule !== 'DG004' &&
         candidate.rule !== 'DG004-DYN-01' &&
         candidate.rule !== 'DG004-DYN-02' &&
+        candidate.rule !== 'DG004-REG-01' &&
         candidate.rule !== 'DG006'
       ) {
         invalidAllowlistEntries.push(`Rejected disallowed allowlist rule "${String(candidate.rule)}" for "${validKey}"`);

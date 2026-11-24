@@ -5,11 +5,12 @@ export type DevGuardRuleId =
   | 'DG001' | 'DG001-ALIAS-01'
   | 'DG002' | 'DG003' | 'DG004'
   | 'DG004-DYN-01' | 'DG004-DYN-02'
+  | 'DG004-REG-01' | 'DG004-REG-UNREACHABLE'
   | 'DG004-WS-NEW' | 'DG004-WS-UNPARSED'
   | 'DG005' | 'DG005-ALIAS-01'
   | 'DG006' | 'DG007' | 'DG008';
 
-export type AllowlistRuleId = 'DG004' | 'DG004-DYN-01' | 'DG004-DYN-02' | 'DG006';
+export type AllowlistRuleId = 'DG004' | 'DG004-DYN-01' | 'DG004-DYN-02' | 'DG004-REG-01' | 'DG006';
 
 export type LexicalRegionKind = 'code' | 'string' | 'template' | 'comment' | 'regex';
 
@@ -85,8 +86,8 @@ export const CRITICAL_FLOW_IDENTIFIERS = [
   'execute', 'query', 'transaction', 'writeFileSync',
 ] as const;
 
-const SUPPRESSION_COMMENT_RE = /\bdevguard-ignore\s+(DG\d{3}(?:-DYN-0[12]|-EV-01)?)\s*:\s*([^\r\n]+)/i;
-const VALID_DG_RULE_RE = /^(?:DG00[1-8]|DG004-DYN-0[12]|DG00[58]-EV-01)$/;
+const SUPPRESSION_COMMENT_RE = /\bdevguard-ignore\s+(DG\d{3}(?:-DYN-0[12]|-REG-01|-EV-01)?)\s*:\s*([^\r\n]+)/i;
+const VALID_DG_RULE_RE = /^(?:DG00[1-8]|DG004-DYN-0[12]|DG004-REG-01|DG00[58]-EV-01)$/;
 export const MEANINGFUL_SUPPRESSION_REASON_RE = /[A-Za-z]{2,}\s+[A-Za-z]{2,}/;
 
 /** Validates that a suppression justification has >= 8 chars and at least two alphabetic words. */

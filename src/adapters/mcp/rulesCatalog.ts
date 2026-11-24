@@ -111,6 +111,36 @@ const RULES_CATALOG: ReadonlyArray<RuleExplanation> = [
     trueNegativeExample: "export function loadFs() { return require('node:fs'); }",
   },
   {
+    ruleId: 'DG004-REG-01',
+    name: 'NpmRegistryPackageIntegrityWarning',
+    defaultSeverity: 'warning',
+    securitySeverity: '5.0',
+    cwe: ['CWE-829'],
+    shortDescription:
+      'Non-scoring warning: opt-in public npm registry check flagged a missing, security-held, or recently published package.',
+    fullDescription:
+      'Opt-in CLI warning (`devguard check --verify-registry`, never executed by offline MCP tools) emitted when an external dependency returns HTTP 404 on registry.npmjs.org, is unpublished/security-held (`0.0.1-security`), or was published less than 30 days ago. Distinct from offline DG004 manifest checks; does not penalize repository scores.',
+    remediation:
+      'Verify the package name spelling, publisher identity, and release history on npmjs.com. If the package is a legitimate newly published or private-registry package, allowlist DG004-REG-01 for the path in base-branch .devguard.json.',
+    truePositiveExample: "import helper from 'ai-hallucinated-jwt-helper'; // 404 or <30 days old on npm",
+    trueNegativeExample: "import express from 'express'; // established package on registry.npmjs.org",
+  },
+  {
+    ruleId: 'DG004-REG-UNREACHABLE',
+    name: 'NpmRegistryVerificationUnreachable',
+    defaultSeverity: 'warning',
+    securitySeverity: '3.5',
+    cwe: ['CWE-829'],
+    shortDescription:
+      'Non-scoring notice: opt-in public npm registry check could not complete due to network, timeout, or HTTP error.',
+    fullDescription:
+      'Opt-in CLI operational notice (`devguard check --verify-registry`) emitted when https://registry.npmjs.org is unreachable, exceeds the 5,000 ms request or 15,000 ms total run timeout, or returns HTTP 429/5xx/401/403 (note: .npmrc credentials are never read to preserve INV-3). Non-blocking and non-scoring.',
+    remediation:
+      'Retry when network connectivity to registry.npmjs.org is available, or omit --verify-registry in air-gapped / private-registry environments.',
+    truePositiveExample: 'CLI run with --verify-registry while offline or rate-limited (HTTP 429).',
+    trueNegativeExample: 'Default offline CLI run (`devguard check`) or reachable public npm registry.',
+  },
+  {
     ruleId: 'DG004-WS-NEW',
     name: 'NewWorkspacePackageInPullRequest',
     defaultSeverity: 'warning',

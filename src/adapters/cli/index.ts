@@ -9,7 +9,12 @@ import {
   hasPartialAnalysisExtension,
   isValidSuppressionReason,
   matchLinearGlob,
+  verifyWorkspaceRegistryPackages,
   type AllowlistRuleId,
+  type AuditedRegistryFileTarget,
+  type AuditedRegistryManifestTarget,
+  type RegistryFetchFn,
+  type RegistryVerifyOptions,
   type WorkspaceContext,
   type WorkspaceFileAccessor,
 } from '../../core/analyzer.ts';
@@ -18,7 +23,7 @@ import {
   type FileAuditSummary,
   type SkippedFileReportItem,
 } from '../../core/types.ts';
-import { getCliUsageText, parseCliArgs } from './args.ts';
+import { getCliUsageText, parseCliArgs, type CliCheckOptions } from './args.ts';
 import { formatCliOutput, type CliCheckResult } from './formatters.ts';
 import { getChangedFilesSince, getStagedFiles } from './git.ts';
 import { installPreCommitHook } from './hook.ts';
@@ -29,6 +34,7 @@ const ALLOWED_ALLOWLIST_RULES = new Set<string>([
   'DG004',
   'DG004-DYN-01',
   'DG004-DYN-02',
+  'DG004-REG-01',
   'DG006',
 ]);
 const EXCLUDED_DIRS = new Set<string>([
@@ -48,6 +54,8 @@ export interface CliIo {
   cwd?: string;
   stdout?: (chunk: string) => void;
   stderr?: (chunk: string) => void;
+  fetchImpl?: RegistryFetchFn;
+  registryOptions?: Omit<RegistryVerifyOptions, 'fetchImpl'>;
 }
 
 interface ParsedLocalConfig {
@@ -250,14 +258,25 @@ function getAllowedRulesForPath(
   return matched;
 }
 
-/**
- * Executes the zero-dependency DevGuard CLI adapter (offline deterministic by default).
- * Exit codes:
- *   0 = pass
- *   1 = audit gate failed
- *   2 = operational / argument / config / git error
- */
-export function runCli(argv: readonly string[], io?: CliIo): number {
+interface PreparedCheckExecution {
+  kind: 'ready';
+  cwd: string;
+  writeOut: (chunk: string) => void;
+  writeErr: (chunk: string) => void;
+  parsed: CliCheckOptions;
+  checkResult: CliCheckResult;
+  hasOperationalError: boolean;
+  workspaceContext?: WorkspaceContext;
+  localFsAccessor: WorkspaceFileAccessor;
+  registryFileTargets: AuditedRegistryFileTarget[];
+  registryManifestTargets: AuditedRegistryManifestTarget[];
+}
+
+function prepareCliExecution(
+  argv: readonly string[],
+  io: CliIo | undefined,
+  allowAsyncVerifyRegistry: boolean
+): { kind: 'early'; exitCode: number } | PreparedCheckExecution {
   const cwd = path.resolve(io?.cwd ?? process.cwd());
   const writeOut = io?.stdout ?? ((s: string) => process.stdout.write(s));
   const writeErr = io?.stderr ?? ((s: string) => process.stderr.write(s));
@@ -265,24 +284,24 @@ export function runCli(argv: readonly string[], io?: CliIo): number {
   const parsed = parseCliArgs(argv);
   if (parsed.kind === 'help') {
     writeOut(getCliUsageText() + '\n');
-    return 0;
+    return { kind: 'early', exitCode: 0 };
   }
   if (parsed.kind === 'version') {
     writeOut(getDevGuardVersion() + '\n');
-    return 0;
+    return { kind: 'early', exitCode: 0 };
   }
   if (parsed.kind === 'error') {
     writeErr(`Error: ${parsed.message}\n`);
-    return 2;
+    return { kind: 'early', exitCode: 2 };
   }
   if (parsed.kind === 'install-hook') {
     const hookRes = installPreCommitHook(cwd);
     if (!hookRes.ok) {
       writeErr(`Error: ${hookRes.error}\n`);
-      return 2;
+      return { kind: 'early', exitCode: 2 };
     }
     writeOut(`DevGuard pre-commit hook (${hookRes.status}): ${hookRes.hookPath}\n`);
-    return 0;
+    return { kind: 'early', exitCode: 0 };
   }
   if (parsed.kind === 'mcp') {
     const workspaceRoot = parsed.workspaceRoot ? path.resolve(cwd, parsed.workspaceRoot) : cwd;
@@ -290,38 +309,46 @@ export function runCli(argv: readonly string[], io?: CliIo): number {
       const stat = fs.statSync(workspaceRoot);
       if (!stat.isDirectory()) {
         writeErr(`Error: MCP workspace root is not a directory: ${workspaceRoot}\n`);
-        return 2;
+        return { kind: 'early', exitCode: 2 };
       }
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       writeErr(`Error: Unable to access MCP workspace root "${workspaceRoot}": ${reason}\n`);
-      return 2;
+      return { kind: 'early', exitCode: 2 };
     }
     startMcpStdioServer({
       workspaceRoot,
       output: { write: writeOut },
       stderr: { write: writeErr },
     });
-    return 0;
+    return { kind: 'early', exitCode: 0 };
+  }
+
+  if (parsed.verifyRegistry && !allowAsyncVerifyRegistry) {
+    writeErr(
+      'Error: Option --verify-registry requires asynchronous execution; call await runCliAsync(argv, io) instead of synchronous runCli().\n'
+    );
+    return { kind: 'early', exitCode: 2 };
   }
 
   // 1. Load & validate local .devguard.json (strict fail-closed -> exit 2)
   const cfgRes = loadLocalConfigStrict(cwd, parsed.configPath);
   if (!cfgRes.ok) {
     writeErr(`Error: ${cfgRes.error}\n`);
-    return 2;
+    return { kind: 'early', exitCode: 2 };
   }
 
   // 2. Resolve target file list
   let baseDir = cwd;
   const candidateRelFiles: string[] = [];
   let isExplicitList = false;
+  let hasDirectoryScan = false;
 
   if (parsed.staged) {
     const gitRes = getStagedFiles(cwd);
     if (!gitRes.ok) {
       writeErr(`Error: ${gitRes.error}\n`);
-      return 2;
+      return { kind: 'early', exitCode: 2 };
     }
     baseDir = gitRes.repoRoot;
     candidateRelFiles.push(...gitRes.files);
@@ -329,7 +356,7 @@ export function runCli(argv: readonly string[], io?: CliIo): number {
     const gitRes = getChangedFilesSince(parsed.changedSince, cwd);
     if (!gitRes.ok) {
       writeErr(`Error: ${gitRes.error}\n`);
-      return 2;
+      return { kind: 'early', exitCode: 2 };
     }
     baseDir = gitRes.repoRoot;
     candidateRelFiles.push(...gitRes.files);
@@ -343,15 +370,17 @@ export function runCli(argv: readonly string[], io?: CliIo): number {
       } catch (err) {
         const reason = err instanceof Error ? err.message : String(err);
         writeErr(`Error: Target path not accessible (${rawTarget}): ${reason}\n`);
-        return 2;
+        return { kind: 'early', exitCode: 2 };
       }
       if (stat.isDirectory()) {
+        hasDirectoryScan = true;
         collectDirectoryFiles(resolvedTarget, cwd, candidateRelFiles);
       } else if (stat.isFile()) {
         candidateRelFiles.push(path.relative(cwd, resolvedTarget).replace(/\\/g, '/'));
       }
     }
   } else {
+    hasDirectoryScan = true;
     collectDirectoryFiles(cwd, cwd, candidateRelFiles);
   }
 
@@ -371,8 +400,14 @@ export function runCli(argv: readonly string[], io?: CliIo): number {
   const summaries: FileAuditSummary[] = [];
   const partialFiles: string[] = [];
   const skippedFiles: SkippedFileReportItem[] = [];
+  const registryFileTargets: AuditedRegistryFileTarget[] = [];
+  const inScopeManifestSet = new Set<string>();
   let hasBlockingFailure = false;
   let hasOperationalError = false;
+
+  if (parsed.verifyRegistry && hasDirectoryScan && localFsAccessor.fileExists('package.json')) {
+    inScopeManifestSet.add('package.json');
+  }
 
   for (const relPath of uniqueFiles) {
     const fullPath = path.resolve(baseDir, relPath);
@@ -380,7 +415,7 @@ export function runCli(argv: readonly string[], io?: CliIo): number {
       const contained = path.relative(baseDir, fullPath);
       if (contained.startsWith('..') || path.isAbsolute(contained)) {
         writeErr(`Error: Refusing path outside repository root: ${relPath}\n`);
-        return 2;
+        return { kind: 'early', exitCode: 2 };
       }
     }
 
@@ -407,7 +442,9 @@ export function runCli(argv: readonly string[], io?: CliIo): number {
     const isPy = hasPartialAnalysisExtension(relPath);
 
     if (!isJsTs && !isPy) {
-      if (isExplicitList) {
+      if (parsed.verifyRegistry && /(?:^|\/)package\.json$/.test(relPath)) {
+        inScopeManifestSet.add(relPath);
+      } else if (isExplicitList) {
         skippedFiles.push({ filePath: relPath, reason: 'unsupported_language' });
       }
       continue;
@@ -434,6 +471,14 @@ export function runCli(argv: readonly string[], io?: CliIo): number {
     }
 
     const allowlistRules = getAllowedRulesForPath(relPath, cfgRes.config.rulesByPath);
+
+    if (parsed.verifyRegistry && isJsTs) {
+      registryFileTargets.push({
+        filePath: relPath,
+        code,
+        allowlistRules: allowlistRules.length > 0 ? allowlistRules : undefined,
+      });
+    }
 
     let report: ReturnType<typeof analyzeCodeDeterministically>;
     try {
@@ -503,6 +548,16 @@ export function runCli(argv: readonly string[], io?: CliIo): number {
     !hasBlockingFailure &&
     (overallScore === null || overallScore >= parsed.minScore);
 
+  const registryManifestTargets: AuditedRegistryManifestTarget[] = Array.from(inScopeManifestSet)
+    .sort()
+    .map((manifestPath) => {
+      const rules = getAllowedRulesForPath(manifestPath, cfgRes.config.rulesByPath);
+      return {
+        manifestPath,
+        allowlistRules: rules.length > 0 ? rules : undefined,
+      };
+    });
+
   const checkResult: CliCheckResult = {
     version: getDevGuardVersion(),
     minScore: parsed.minScore,
@@ -511,36 +566,113 @@ export function runCli(argv: readonly string[], io?: CliIo): number {
     summaries,
     partialFiles,
     skippedFiles,
-    workspaceDiagnostics: workspaceContext?.diagnostics ?? [],
+    workspaceDiagnostics: [...(workspaceContext?.diagnostics ?? [])],
   };
 
+  return {
+    kind: 'ready',
+    cwd,
+    writeOut,
+    writeErr,
+    parsed,
+    checkResult,
+    hasOperationalError,
+    workspaceContext,
+    localFsAccessor,
+    registryFileTargets,
+    registryManifestTargets,
+  };
+}
+
+function finalizeCliCheckOutput(prep: PreparedCheckExecution): number {
   let formatted: string;
   try {
-    formatted = formatCliOutput(parsed.format, checkResult);
+    formatted = formatCliOutput(prep.parsed.format, prep.checkResult);
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
-    writeErr(`Error: Failed to format CLI output: ${reason}\n`);
+    prep.writeErr(`Error: Failed to format CLI output: ${reason}\n`);
     return 2;
   }
 
-  if (parsed.outputPath !== null) {
-    const resolvedOut = path.resolve(cwd, parsed.outputPath);
+  if (prep.parsed.outputPath !== null) {
+    const resolvedOut = path.resolve(prep.cwd, prep.parsed.outputPath);
     try {
       fs.writeFileSync(resolvedOut, formatted, 'utf-8');
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
-      writeErr(`Error: Unable to write output file "${parsed.outputPath}": ${reason}\n`);
+      prep.writeErr(`Error: Unable to write output file "${prep.parsed.outputPath}": ${reason}\n`);
       return 2;
     }
   } else {
-    writeOut(formatted);
+    prep.writeOut(formatted);
   }
 
-  if (hasOperationalError) {
+  if (prep.hasOperationalError) {
     return 2;
   }
 
-  return passed ? 0 : 1;
+  return prep.checkResult.passed ? 0 : 1;
+}
+
+/**
+ * Executes the zero-dependency DevGuard CLI adapter synchronously (offline deterministic).
+ * Note: `--verify-registry` requires `await runCliAsync(argv, io)`.
+ * Exit codes:
+ *   0 = pass
+ *   1 = audit gate failed
+ *   2 = operational / argument / config / git error
+ */
+export function runCli(argv: readonly string[], io?: CliIo): number {
+  const prep = prepareCliExecution(argv, io, false);
+  if (prep.kind === 'early') {
+    return prep.exitCode;
+  }
+  return finalizeCliCheckOutput(prep);
+}
+
+/**
+ * Asynchronous DevGuard CLI entrypoint supporting opt-in `--verify-registry` online verification
+ * while preserving 100% identical deterministic behavior when `--verify-registry` is omitted.
+ */
+export async function runCliAsync(argv: readonly string[], io?: CliIo): Promise<number> {
+  const prep = prepareCliExecution(argv, io, true);
+  if (prep.kind === 'early') {
+    return prep.exitCode;
+  }
+
+  if (prep.parsed.verifyRegistry) {
+    const regRes = await verifyWorkspaceRegistryPackages({
+      auditedFiles: prep.registryFileTargets,
+      inScopeManifests: prep.registryManifestTargets,
+      workspaceContext: prep.workspaceContext,
+      workspaceFileAccessor: prep.localFsAccessor,
+      options: {
+        ...io?.registryOptions,
+        ...(io?.fetchImpl ? { fetchImpl: io.fetchImpl } : {}),
+      },
+    });
+
+    for (const summary of prep.checkResult.summaries) {
+      const regInline = regRes.inlineFindingsByFile.get(summary.filePath);
+      if (regInline && regInline.length > 0) {
+        const merged = [...(summary.inlineFindings ?? []), ...regInline];
+        merged.sort((a, b) => a.line - b.line);
+        summary.inlineFindings = merged;
+      }
+      const regSup = regRes.suppressionsByFile.get(summary.filePath);
+      if (regSup && regSup.length > 0) {
+        const mergedSup = [...(summary.suppressions ?? []), ...regSup];
+        mergedSup.sort((a, b) => a.targetLine - b.targetLine);
+        summary.suppressions = mergedSup;
+      }
+    }
+
+    if (regRes.diagnostics.length > 0) {
+      prep.checkResult.workspaceDiagnostics.push(...regRes.diagnostics);
+    }
+  }
+
+  return finalizeCliCheckOutput(prep);
 }
 
 function isDirectCliInvocation(): boolean {
@@ -554,6 +686,7 @@ function isDirectCliInvocation(): boolean {
 }
 
 if (isDirectCliInvocation()) {
-  const code = runCli(process.argv.slice(2));
-  process.exitCode = code;
+  void runCliAsync(process.argv.slice(2)).then((code) => {
+    process.exitCode = code;
+  });
 }
