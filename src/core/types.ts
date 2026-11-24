@@ -30,6 +30,16 @@ import type {
   AliasSinkTarget,
 } from './rules/aliasTracker.ts';
 import type { PrepareLlmOptions } from './rules/secretAndResilienceRules.ts';
+import type {
+  AuditedRegistryFileTarget,
+  AuditedRegistryManifestTarget,
+  PackageRegistryLookupOutcome,
+  RegistryFetchFn,
+  RegistryRiskReason,
+  RegistryUnreachableReason,
+  RegistryVerificationBatchResult,
+  RegistryVerifyOptions,
+} from './rules/registryVerifier.ts';
 
 export type {
   AliasAnalysisResult,
@@ -39,14 +49,22 @@ export type {
   AliasSinkTarget,
   AllowlistRuleId,
   AuditAnalyzeOptions,
+  AuditedRegistryFileTarget,
+  AuditedRegistryManifestTarget,
   DevGuardRuleId,
   FoldTextEdit,
   InlineFinding,
   LexicalRegion,
   LexicalRegionKind,
   LineFinding,
+  PackageRegistryLookupOutcome,
   ParsedSuppression,
   PrepareLlmOptions,
+  RegistryFetchFn,
+  RegistryRiskReason,
+  RegistryUnreachableReason,
+  RegistryVerificationBatchResult,
+  RegistryVerifyOptions,
   ResolutionSource,
   SpanMap,
   SpanMapSeg,

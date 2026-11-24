@@ -71,6 +71,27 @@ import {
   redactSecretsPreservingLayout,
   type PrepareLlmOptions,
 } from './rules/secretAndResilienceRules.ts';
+import {
+  DEFAULT_MIN_PACKAGE_AGE_DAYS,
+  DEFAULT_REGISTRY_CONCURRENCY,
+  DEFAULT_REGISTRY_TIMEOUT_MS,
+  DEFAULT_TOTAL_BUDGET_MS,
+  MAX_PACKAGES_PER_RUN,
+  MAX_REGISTRY_RESPONSE_BYTES,
+  PUBLIC_NPM_REGISTRY_BASE,
+  encodeNpmPackagePath,
+  isValidNpmPackageName,
+  verifyPackageListAgainstNpm,
+  verifyWorkspaceRegistryPackages,
+  type AuditedRegistryFileTarget,
+  type AuditedRegistryManifestTarget,
+  type PackageRegistryLookupOutcome,
+  type RegistryFetchFn,
+  type RegistryRiskReason,
+  type RegistryUnreachableReason,
+  type RegistryVerificationBatchResult,
+  type RegistryVerifyOptions,
+} from './rules/registryVerifier.ts';
 
 export type {
   AliasAnalysisResult,
@@ -80,14 +101,22 @@ export type {
   AliasSinkTarget,
   AllowlistRuleId,
   AuditAnalyzeOptions,
+  AuditedRegistryFileTarget,
+  AuditedRegistryManifestTarget,
   DevGuardRuleId,
   FoldTextEdit,
   InlineFinding,
   LexicalRegion,
   LexicalRegionKind,
   LineFinding,
+  PackageRegistryLookupOutcome,
   ParsedSuppression,
   PrepareLlmOptions,
+  RegistryFetchFn,
+  RegistryRiskReason,
+  RegistryUnreachableReason,
+  RegistryVerificationBatchResult,
+  RegistryVerifyOptions,
   ResolutionSource,
   SpanMap,
   SpanMapSeg,
@@ -99,6 +128,10 @@ export type {
 };
 export {
   CRITICAL_FLOW_IDENTIFIERS,
+  DEFAULT_MIN_PACKAGE_AGE_DAYS,
+  DEFAULT_REGISTRY_CONCURRENCY,
+  DEFAULT_REGISTRY_TIMEOUT_MS,
+  DEFAULT_TOTAL_BUDGET_MS,
   DG007_PROVIDER_PATTERNS,
   MAX_ALIAS_DEPTH,
   MAX_BACKSCAN,
@@ -107,8 +140,11 @@ export {
   MAX_FOLD_EDITS,
   MAX_FOLD_OPERANDS,
   MAX_GLOB_PATTERN_LENGTH,
+  MAX_PACKAGES_PER_RUN,
+  MAX_REGISTRY_RESPONSE_BYTES,
   MEANINGFUL_SUPPRESSION_REASON_RE,
   POPULAR_NPM_PACKAGES,
+  PUBLIC_NPM_REGISTRY_BASE,
   analyzeIntraProceduralAliases,
   analyzeLexicalStructure,
   applyTextEditsWithSpanMap,
@@ -125,11 +161,13 @@ export {
   detectMissingTimeoutsAndLoops,
   detectNonAtomicBalanceMutations,
   detectSwallowedExceptions,
+  encodeNpmPackagePath,
   extractPackageManifestData,
   findNearestPackageManifest,
   findResidualSecretLikeTokens,
   isHighPriorityFoldEdit,
   isRangeStrictlyInCodeRegion,
+  isValidNpmPackageName,
   isValidSuppressionReason,
   matchLinearGlob,
   matchesCriticalFlow,
@@ -138,7 +176,9 @@ export {
   resolveWorkspaceImportSpecifier,
   toOrigLineAndCol,
   toOrigSpan,
+  verifyPackageListAgainstNpm,
   verifySpanMapInvariants,
+  verifyWorkspaceRegistryPackages,
 };
 
 export const ANALYZABLE_EXTENSIONS = [
@@ -458,6 +498,7 @@ function applySuppressionPolicy(
       (ext.rule === 'DG004' ||
         ext.rule === 'DG004-DYN-01' ||
         ext.rule === 'DG004-DYN-02' ||
+        ext.rule === 'DG004-REG-01' ||
         ext.rule === 'DG006') &&
       !externalRules.has(ext.rule)
     ) {

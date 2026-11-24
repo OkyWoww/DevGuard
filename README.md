@@ -44,6 +44,9 @@ npx devguard check --staged
 # Audit specific files or directories
 npx devguard check src/
 
+# Opt-in online check against public registry.npmjs.org (non-scoring; ignores .npmrc)
+npx devguard check --staged --verify-registry
+
 # Install idempotent Git pre-commit hook
 npx devguard install-hook
 ```
@@ -138,6 +141,8 @@ Not every message in a DevGuard PR comment fails your build. Use this quick glos
 | **`DG004-WS-NEW`** | **No** *(non-scoring)* | The PR introduces a new workspace package not yet on the base branch. For anti-bypass security, it is not auto-trusted until merged into the base branch. |
 | **`DG004-WS-UNPARSED`** | **No** *(non-scoring)* | A workspace config (`package.json`, `pnpm-workspace.yaml`, or `tsconfig.json`) exceeded `256 KiB` or used unsupported YAML/JSONC constructs; that source failed closed safely without blocking by itself. |
 | **`DG004-DYN-01` / `DG004-DYN-02`** | **No** *(non-scoring)* | Non-literal dynamic `import(...)` / `require(...)` specifier surfaced for supply-chain visibility (`scoring: false`). |
+| **`DG004-REG-01`** | **No** *(non-scoring)* | Opt-in (`--verify-registry`) supply-chain heads-up when an external package returns HTTP `404` on `registry.npmjs.org`, is held under `0.0.1-security` / `unpublished`, or was published `< 30` days ago (`scoring: false`; allowlistable in `.devguard.json`). |
+| **`DG004-REG-UNREACHABLE`** | **No** *(non-scoring)* | Opt-in (`--verify-registry`) operational notice when `registry.npmjs.org` times out (`5s` per request / `15s` run budget) or returns `429`/`5xx`/`401`/`403` (note: `.npmrc` credentials are never read to preserve `INV-3`; private-registry packages on Artifactory/Verdaccio can be allowlisted in `.devguard.json`). |
 | **`DG001-ALIAS-01`** | **No** *(non-scoring)* | Intra-procedural alias (max depth 2) to dynamic execution sinks (`eval`, `Function`, `child_process.exec`) surfaced for visibility (`scoring: false`). |
 | **`DG005-ALIAS-01`** | **No** *(non-scoring)* | Intra-procedural alias (max depth 2) to a critical-flow Promise that swallows rejection via an empty `.catch()` callback (`scoring: false`). |
 

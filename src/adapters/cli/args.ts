@@ -9,6 +9,7 @@ export interface CliCheckOptions {
   minScore: number;
   configPath: string | null;
   outputPath: string | null;
+  verifyRegistry: boolean;
 }
 
 export type ParsedCliCommand =
@@ -37,6 +38,7 @@ export function getCliUsageText(): string {
     '  --min-score <0-100>      Minimum Overall Guard score to pass (default: 85)',
     '  --config <path>          Path to .devguard.json config file',
     '  --output, -o <path>      Write report output to a file instead of stdout',
+    '  --verify-registry        Opt-in online check against public registry.npmjs.org (non-scoring)',
     '  -h, --help               Show this help message',
     '  -v, --version            Print DevGuard version',
     '',
@@ -136,6 +138,7 @@ export function parseCliArgs(argv: readonly string[]): ParsedCliCommand {
   let minScore = 85;
   let configPath: string | null = null;
   let outputPath: string | null = null;
+  let verifyRegistry = false;
   let positionalOnly = false;
 
   for (let i = 1; i < argv.length; i++) {
@@ -253,6 +256,13 @@ export function parseCliArgs(argv: readonly string[]): ParsedCliCommand {
         outputPath = res.value;
         break;
       }
+      case '--verify-registry': {
+        if (inlineValue !== null) {
+          return { kind: 'error', message: 'Option --verify-registry does not accept a value.' };
+        }
+        verifyRegistry = true;
+        break;
+      }
       default:
         return { kind: 'error', message: `Unknown option: ${flag}` };
     }
@@ -274,5 +284,6 @@ export function parseCliArgs(argv: readonly string[]): ParsedCliCommand {
     minScore,
     configPath,
     outputPath,
+    verifyRegistry,
   };
 }

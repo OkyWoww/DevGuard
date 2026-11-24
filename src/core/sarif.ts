@@ -248,7 +248,14 @@ export function buildSarifReportString(
   });
 
   const dynRuleDescriptors: Record<
-    'DG001-ALIAS-01' | 'DG004-DYN-01' | 'DG004-DYN-02' | 'DG004-WS-NEW' | 'DG004-WS-UNPARSED' | 'DG005-ALIAS-01',
+    | 'DG001-ALIAS-01'
+    | 'DG004-DYN-01'
+    | 'DG004-DYN-02'
+    | 'DG004-REG-01'
+    | 'DG004-REG-UNREACHABLE'
+    | 'DG004-WS-NEW'
+    | 'DG004-WS-UNPARSED'
+    | 'DG005-ALIAS-01',
     {
       id: string;
       name: string;
@@ -318,6 +325,36 @@ export function buildSarifReportString(
         'security-severity': '3.5',
       },
     },
+    'DG004-REG-01': {
+      id: 'DG004-REG-01',
+      name: 'NpmRegistryPackageIntegrityWarning',
+      shortDescription: {
+        text: 'Non-scoring warning: public npm registry check flagged a missing, security-held, or newly published package.',
+      },
+      fullDescription: {
+        text: 'Opt-in (--verify-registry) non-scoring supply-chain heads-up emitted when an external dependency returns HTTP 404, is unpublished or held under 0.0.1-security, or was published on registry.npmjs.org less than 30 days ago. Distinct from offline DG004 manifest checks; does not penalize repository scores.',
+      },
+      defaultConfiguration: { level: 'warning' },
+      properties: {
+        tags: ['security', 'supply-chain', 'slopsquatting', 'non-scoring', 'external/cwe/cwe-829'],
+        'security-severity': '5.0',
+      },
+    },
+    'DG004-REG-UNREACHABLE': {
+      id: 'DG004-REG-UNREACHABLE',
+      name: 'NpmRegistryVerificationUnreachable',
+      shortDescription: {
+        text: 'Non-scoring notice: public npm registry metadata could not be verified due to network, timeout, or HTTP error.',
+      },
+      fullDescription: {
+        text: 'Opt-in (--verify-registry) non-scoring operational notice emitted when registry.npmjs.org is unreachable, times out, returns HTTP 429/5xx/401/403, or exceeds response limits. Never treated silently as clean (INV-7) and never fails the build gate.',
+      },
+      defaultConfiguration: { level: 'warning' },
+      properties: {
+        tags: ['security', 'supply-chain', 'non-scoring', 'external/cwe/cwe-829'],
+        'security-severity': '3.5',
+      },
+    },
     'DG004-WS-NEW': {
       id: 'DG004-WS-NEW',
       name: 'NewWorkspacePackageInPullRequest',
@@ -362,7 +399,9 @@ export function buildSarifReportString(
         (finding.ruleId === 'DG001-ALIAS-01' ||
           finding.ruleId === 'DG005-ALIAS-01' ||
           finding.ruleId === 'DG004-DYN-01' ||
-          finding.ruleId === 'DG004-DYN-02') &&
+          finding.ruleId === 'DG004-DYN-02' ||
+          finding.ruleId === 'DG004-REG-01' ||
+          finding.ruleId === 'DG004-REG-UNREACHABLE') &&
         !rulesMap.has(finding.ruleId)
       ) {
         rulesMap.set(finding.ruleId, dynRuleDescriptors[finding.ruleId]);
@@ -429,7 +468,9 @@ export function buildSarifReportString(
     // 5. Stage 3a: Emit active suppressions with standard SARIF v2.1.0 suppressions metadata
     for (const sup of summary.suppressions || []) {
       if (
-        (sup.ruleId === 'DG004-DYN-01' || sup.ruleId === 'DG004-DYN-02') &&
+        (sup.ruleId === 'DG004-DYN-01' ||
+          sup.ruleId === 'DG004-DYN-02' ||
+          sup.ruleId === 'DG004-REG-01') &&
         !rulesMap.has(sup.ruleId)
       ) {
         rulesMap.set(sup.ruleId, dynRuleDescriptors[sup.ruleId]);
@@ -441,7 +482,11 @@ export function buildSarifReportString(
         normalizedUri,
         sup.targetLine,
         undefined,
-        sup.ruleId === 'DG004-DYN-01' || sup.ruleId === 'DG004-DYN-02' ? false : undefined
+        sup.ruleId === 'DG004-DYN-01' ||
+          sup.ruleId === 'DG004-DYN-02' ||
+          sup.ruleId === 'DG004-REG-01'
+          ? false
+          : undefined
       );
       suppressedResult.suppressions = [
         {
@@ -453,12 +498,13 @@ export function buildSarifReportString(
     }
   }
 
-  // 6. Stage 6.1.c: Emit deduplicated non-scoring DG004-WS-NEW / DG004-WS-UNPARSED notices
+  // 6. Stage 6.1.c & v1.8.0: Emit deduplicated non-scoring workspace & registry notices
   if (options?.workspaceDiagnostics && options.workspaceDiagnostics.length > 0) {
     const seenWsKeys = new Set<string>();
     for (const diag of options.workspaceDiagnostics) {
       const normDiagUri = normalizeSarifUri(diag.sourceFile);
-      const dedupKey = `${diag.ruleId}:${normDiagUri}:${diag.reason ?? ''}`;
+      const msgSuffix = diag.ruleId.startsWith('DG004-REG-') ? `:${diag.message}` : '';
+      const dedupKey = `${diag.ruleId}:${normDiagUri}:${diag.reason ?? ''}${msgSuffix}`;
       if (seenWsKeys.has(dedupKey)) continue;
       seenWsKeys.add(dedupKey);
 
