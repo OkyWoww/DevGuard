@@ -54,7 +54,11 @@ import {
 } from './rules/packageAndExceptionRules.ts';
 import {
   MAX_ALIAS_DEPTH,
+  analyzeIntraProceduralAliases,
   detectAliasedExecutionSinks,
+  type AliasAnalysisResult,
+  type AliasBailout,
+  type AliasBailoutReason,
   type AliasFindingMetadata,
   type AliasSinkTarget,
 } from './rules/aliasTracker.ts';
@@ -69,6 +73,9 @@ import {
 } from './rules/secretAndResilienceRules.ts';
 
 export type {
+  AliasAnalysisResult,
+  AliasBailout,
+  AliasBailoutReason,
   AliasFindingMetadata,
   AliasSinkTarget,
   AllowlistRuleId,
@@ -102,6 +109,7 @@ export {
   MAX_GLOB_PATTERN_LENGTH,
   MEANINGFUL_SUPPRESSION_REASON_RE,
   POPULAR_NPM_PACKAGES,
+  analyzeIntraProceduralAliases,
   analyzeLexicalStructure,
   applyTextEditsWithSpanMap,
   buildVirtualView,
@@ -205,6 +213,7 @@ export interface ParsedDevGuardReport {
   virtualView?: VirtualViewResult;
   workspaceDiagnostics?: WorkspaceDiagnosticNotice[];
   undeclaredWorkspaceImportsCount?: number;
+  aliasBailouts?: AliasBailout[];
 }
 
 export type AuditReport = ParsedDevGuardReport;
@@ -1470,6 +1479,7 @@ export function analyzeCodeDeterministically(
   // 3. v1.2.0 Deterministic AI-Slop & Vibe-Coding Detectors (DG004, DG004-DYN-01/02, DG005, DG006, DG008)
   let dynScopeUncertain = 0;
   let activeWsContext: WorkspaceContext | undefined = options?.workspaceContext;
+  const aliasBailouts: AliasBailout[] = [];
   if (!isPython) {
     activeWsContext =
       detectHallucinatedPackages(execLines, maskedLines, options, findings, inlineFindings, false) ??
@@ -1485,7 +1495,8 @@ export function analyzeCodeDeterministically(
     detectSwallowedExceptions(code, findings, inlineFindings, lexical.maskedCode);
     detectNonAtomicBalanceMutations(rawLines, findings, inlineFindings, lexical.maskedCode.split('\n'));
     detectMissingTimeoutsAndLoops(code, lexical.maskedCode, rawLines, findings, inlineFindings);
-    detectAliasedExecutionSinks(lexical.maskedCode, lexical.stringLiterals, inlineFindings);
+    const aliasRes = analyzeIntraProceduralAliases(lexical.maskedCode, lexical.stringLiterals, inlineFindings);
+    aliasBailouts.push(...aliasRes.bailouts);
   }
 
   // 3b. Additive Pass-V (runs if and only if virtualView.editsApplied > 0)
@@ -1509,6 +1520,8 @@ export function analyzeCodeDeterministically(
           return /\b(?:import|require|from)\b/;
         case 'DG005':
           return /\b(?:try|catch)\b/;
+        case 'DG005-ALIAS-01':
+          return /\.\s*catch\s*\(/;
         case 'DG006':
           return /\b(?:balance|saldo|credits?|wallet|stock|inventory|quota|points)\b/;
         case 'DG007':
@@ -1610,7 +1623,20 @@ export function analyzeCodeDeterministically(
       if (/\b(?:while|for|do|fetch)\b/.test(vLex.maskedCode)) {
         detectMissingTimeoutsAndLoops(virtualView.virtualCode, vLex.maskedCode, vRawLines, vFindings, vInlineFindings);
       }
-      detectAliasedExecutionSinks(vLex.maskedCode, vLex.stringLiterals, vInlineFindings);
+      const vAliasRes = analyzeIntraProceduralAliases(vLex.maskedCode, vLex.stringLiterals, vInlineFindings);
+      for (const b of vAliasRes.bailouts) {
+        const mappedLine = remapVirtualLineRange(b.line, undefined).line;
+        const dup = aliasBailouts.some(
+          (orig) => orig.reason === b.reason && orig.identifier === b.identifier && orig.line === mappedLine
+        );
+        if (!dup) {
+          aliasBailouts.push({
+            ...b,
+            line: mappedLine,
+            message: replaceVirtualLineInText(b.message, b.line, mappedLine),
+          });
+        }
+      }
 
       // DG001 on V (eval/exec dynamic sinks in general code domain)
       if (!isSqlDomain && !isPingDomain && !isAuthDomain && !isFileDomain && !isCartDomain) {
@@ -2026,5 +2052,6 @@ ${tesMarkdown}`;
       activeWsContext && activeWsContext.mode !== 'off' && activeWsContext.undeclaredWorkspaceImportsCount > 0
         ? activeWsContext.undeclaredWorkspaceImportsCount
         : undefined,
+    aliasBailouts: aliasBailouts.length > 0 ? aliasBailouts : undefined,
   };
 }

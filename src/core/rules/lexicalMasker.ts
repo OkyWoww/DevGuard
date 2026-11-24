@@ -6,7 +6,8 @@ export type DevGuardRuleId =
   | 'DG002' | 'DG003' | 'DG004'
   | 'DG004-DYN-01' | 'DG004-DYN-02'
   | 'DG004-WS-NEW' | 'DG004-WS-UNPARSED'
-  | 'DG005' | 'DG006' | 'DG007' | 'DG008';
+  | 'DG005' | 'DG005-ALIAS-01'
+  | 'DG006' | 'DG007' | 'DG008';
 
 export type AllowlistRuleId = 'DG004' | 'DG004-DYN-01' | 'DG004-DYN-02' | 'DG006';
 

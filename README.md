@@ -139,6 +139,7 @@ Not every message in a DevGuard PR comment fails your build. Use this quick glos
 | **`DG004-WS-UNPARSED`** | **No** *(non-scoring)* | A workspace config (`package.json`, `pnpm-workspace.yaml`, or `tsconfig.json`) exceeded `256 KiB` or used unsupported YAML/JSONC constructs; that source failed closed safely without blocking by itself. |
 | **`DG004-DYN-01` / `DG004-DYN-02`** | **No** *(non-scoring)* | Non-literal dynamic `import(...)` / `require(...)` specifier surfaced for supply-chain visibility (`scoring: false`). |
 | **`DG001-ALIAS-01`** | **No** *(non-scoring)* | Intra-procedural alias (max depth 2) to dynamic execution sinks (`eval`, `Function`, `child_process.exec`) surfaced for visibility (`scoring: false`). |
+| **`DG005-ALIAS-01`** | **No** *(non-scoring)* | Intra-procedural alias (max depth 2) to a critical-flow Promise that swallows rejection via an empty `.catch()` callback (`scoring: false`). |
 
 ---
 
@@ -360,7 +361,7 @@ DevGuard tracks detector precision, recall, and remaining evasion boundaries tra
 
 #### Remaining Documented `knownMiss` Corpus Cases (`n = 8`, `0` in `v1.3.0` Scope)
 Compared to `v1.2.1` (`14 knownMiss`), **`v1.3.0` resolved 6 documented evasion cases** (`DG004-EV-02` via `Pass-V`, `DG005-EV-01` via empty `.catch()` detector, `DG006-EV-01` via `FOLD-04`, `DG007-EV-01` & `DG007-EV-03` via `FOLD-01`/`02`, and `DG008-EV-01` via `do...while(true|1)`). The remaining `8` cases intentionally sit outside Stage 5 lexical/single-statement scope (inter-statement or inter-procedural aliasing):
-- **`DG001-EV-03`** (`DG001`, `knownMiss`): Split string bracket lookup assigned to an intermediate alias (`const fn = (globalThis as ...)['ev' + 'al']; return fn(payload);`) — direct calls `globalThis["ev" + "al"](payload)` fold and detect via `Pass-V`, while aliased `fn(payload)` requires cross-statement data-flow tracking.
+- **`DG001-EV-03`** (`DG001`, `knownMiss`): Split string bracket lookup assigned to an intermediate alias (`const fn = (globalThis as ...)['ev' + 'al']; return fn(payload);`) — now surfaced non-scoring by **`DG001-ALIAS-01`** via `Pass-V` + intra-procedural alias tracking while remaining `knownMiss` for scoring `DG001` until external corpus promotion (`INV-8`).
 - **`DG004-EV-01`** (`DG004`, `knownMiss`): Dynamic `import(variable)` is now surfaced non-scoring by **`DG004-DYN-01`** while remaining an intentional `knownMiss` for scoring `DG004` slopsquatting.
 - **`DG005-EV-02`** (`DG005`, `knownMiss`): `catch` delegates to a separate no-op helper (`ignore()`) instead of an empty block or `console.*`.
 - **`DG005-EV-03`** (`DG005`, `knownMiss`): Dead variable assignment inside `catch` suppresses empty-catch check.

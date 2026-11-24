@@ -169,6 +169,20 @@ const RULES_CATALOG: ReadonlyArray<RuleExplanation> = [
       'try { await chargeCard(order); } catch (err) { logger.error(err); throw err; }',
   },
   {
+    ruleId: 'DG005-ALIAS-01',
+    name: 'AliasedSwallowedCriticalPromise',
+    defaultSeverity: 'warning',
+    securitySeverity: '5.5',
+    cwe: ['CWE-390'],
+    shortDescription: 'Non-scoring warning: aliased critical-flow Promise swallows rejection via an empty .catch() callback.',
+    fullDescription:
+      'Non-scoring informational warning emitted when a local variable (up to alias depth 2) assigned from a critical-flow call (payment, charge, auth, query, transfer, etc.) attaches an empty or no-op .catch() handler. Does not penalize repository scores.',
+    remediation:
+      'Handle the rejected Promise explicitly (log and rethrow, return a typed failure result, or perform compensating rollback) instead of passing an empty .catch(() => {}) callback.',
+    truePositiveExample: 'const p = chargePayment(orderId); p.catch(() => {});',
+    trueNegativeExample: 'const p = chargePayment(orderId); p.catch((err) => { logger.error(err); throw err; });',
+  },
+  {
     ruleId: 'DG006',
     name: 'NonAtomicBalanceOrStockMutation',
     defaultSeverity: 'error',
